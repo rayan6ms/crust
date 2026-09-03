@@ -83,32 +83,207 @@ pub struct VoiceState {
     pub channel_id: Option<String>,
 }
 
-/// Filter update values. Built-in filter bodies remain opaque in P02; their
-/// executable semantics belong to a later phase. This still preserves exact
-/// JSON types for differential fixtures and plugin-owned payloads.
+const fn default_one_f32() -> f32 {
+    1.0
+}
+
+const fn default_one_f64() -> f64 {
+    1.0
+}
+
+const fn default_two_f32() -> f32 {
+    2.0
+}
+
+const fn default_half_f32() -> f32 {
+    0.5
+}
+
+const fn default_karaoke_band() -> f32 {
+    220.0
+}
+
+const fn default_karaoke_width() -> f32 {
+    100.0
+}
+
+const fn default_low_pass() -> f32 {
+    20.0
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EqualizerBand {
+    pub band: i32,
+    #[serde(default = "default_one_f32")]
+    pub gain: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Karaoke {
+    #[serde(default = "default_one_f32")]
+    pub level: f32,
+    #[serde(default = "default_one_f32")]
+    pub mono_level: f32,
+    #[serde(default = "default_karaoke_band")]
+    pub filter_band: f32,
+    #[serde(default = "default_karaoke_width")]
+    pub filter_width: f32,
+}
+
+impl Default for Karaoke {
+    fn default() -> Self {
+        Self {
+            level: 1.0,
+            mono_level: 1.0,
+            filter_band: 220.0,
+            filter_width: 100.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Timescale {
+    #[serde(default = "default_one_f64")]
+    pub speed: f64,
+    #[serde(default = "default_one_f64")]
+    pub pitch: f64,
+    #[serde(default = "default_one_f64")]
+    pub rate: f64,
+}
+
+impl Default for Timescale {
+    fn default() -> Self {
+        Self {
+            speed: 1.0,
+            pitch: 1.0,
+            rate: 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Tremolo {
+    #[serde(default = "default_two_f32")]
+    pub frequency: f32,
+    #[serde(default = "default_half_f32")]
+    pub depth: f32,
+}
+
+impl Default for Tremolo {
+    fn default() -> Self {
+        Self {
+            frequency: 2.0,
+            depth: 0.5,
+        }
+    }
+}
+
+pub type Vibrato = Tremolo;
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Rotation {
+    #[serde(default)]
+    pub rotation_hz: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Distortion {
+    #[serde(default)]
+    pub sin_offset: f32,
+    #[serde(default = "default_one_f32")]
+    pub sin_scale: f32,
+    #[serde(default)]
+    pub cos_offset: f32,
+    #[serde(default = "default_one_f32")]
+    pub cos_scale: f32,
+    #[serde(default)]
+    pub tan_offset: f32,
+    #[serde(default = "default_one_f32")]
+    pub tan_scale: f32,
+    #[serde(default)]
+    pub offset: f32,
+    #[serde(default = "default_one_f32")]
+    pub scale: f32,
+}
+
+impl Default for Distortion {
+    fn default() -> Self {
+        Self {
+            sin_offset: 0.0,
+            sin_scale: 1.0,
+            cos_offset: 0.0,
+            cos_scale: 1.0,
+            tan_offset: 0.0,
+            tan_scale: 1.0,
+            offset: 0.0,
+            scale: 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelMix {
+    #[serde(default = "default_one_f32")]
+    pub left_to_left: f32,
+    #[serde(default)]
+    pub left_to_right: f32,
+    #[serde(default)]
+    pub right_to_left: f32,
+    #[serde(default = "default_one_f32")]
+    pub right_to_right: f32,
+}
+
+impl Default for ChannelMix {
+    fn default() -> Self {
+        Self {
+            left_to_left: 1.0,
+            left_to_right: 0.0,
+            right_to_left: 0.0,
+            right_to_right: 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LowPass {
+    #[serde(default = "default_low_pass")]
+    pub smoothing: f32,
+}
+
+impl Default for LowPass {
+    fn default() -> Self {
+        Self { smoothing: 20.0 }
+    }
+}
+
+/// Complete Lavalink filter replacement carried by a player PATCH.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Filters {
     #[serde(default, skip_serializing_if = "PatchField::is_omitted")]
-    pub volume: PatchField<f64>,
+    pub volume: PatchField<f32>,
     #[serde(default, skip_serializing_if = "PatchField::is_omitted")]
-    pub equalizer: PatchField<Value>,
+    pub equalizer: PatchField<Vec<EqualizerBand>>,
     #[serde(default, skip_serializing_if = "PatchField::is_omitted")]
-    pub karaoke: PatchField<Value>,
+    pub karaoke: PatchField<Karaoke>,
     #[serde(default, skip_serializing_if = "PatchField::is_omitted")]
-    pub timescale: PatchField<Value>,
+    pub timescale: PatchField<Timescale>,
     #[serde(default, skip_serializing_if = "PatchField::is_omitted")]
-    pub tremolo: PatchField<Value>,
+    pub tremolo: PatchField<Tremolo>,
     #[serde(default, skip_serializing_if = "PatchField::is_omitted")]
-    pub vibrato: PatchField<Value>,
+    pub vibrato: PatchField<Vibrato>,
     #[serde(default, skip_serializing_if = "PatchField::is_omitted")]
-    pub distortion: PatchField<Value>,
+    pub distortion: PatchField<Distortion>,
     #[serde(default, skip_serializing_if = "PatchField::is_omitted")]
-    pub rotation: PatchField<Value>,
+    pub rotation: PatchField<Rotation>,
     #[serde(default, skip_serializing_if = "PatchField::is_omitted")]
-    pub channel_mix: PatchField<Value>,
+    pub channel_mix: PatchField<ChannelMix>,
     #[serde(default, skip_serializing_if = "PatchField::is_omitted")]
-    pub low_pass: PatchField<Value>,
+    pub low_pass: PatchField<LowPass>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub plugin_filters: JsonObject,
 }
@@ -228,5 +403,64 @@ mod tests {
         .unwrap();
         assert_eq!(update.resuming, PatchField::Null);
         assert_eq!(update.timeout, PatchField::Value(15));
+    }
+
+    #[test]
+    fn filter_subobjects_apply_frozen_defaults_and_serialize_them_explicitly() {
+        let update: PlayerUpdate = serde_json::from_value(json!({
+            "filters": {
+                "equalizer": [{"band": 4}],
+                "karaoke": {},
+                "timescale": {},
+                "tremolo": {},
+                "vibrato": {},
+                "rotation": {},
+                "distortion": {},
+                "channelMix": {},
+                "lowPass": {},
+                "pluginFilters": {"unknown": [1, null, true]}
+            }
+        }))
+        .unwrap();
+        let PatchField::Value(filters) = update.filters else {
+            panic!("filters missing");
+        };
+        assert_eq!(filters.karaoke, PatchField::Value(Karaoke::default()));
+        assert_eq!(filters.timescale, PatchField::Value(Timescale::default()));
+        assert_eq!(filters.distortion, PatchField::Value(Distortion::default()));
+        assert_eq!(
+            filters.channel_mix,
+            PatchField::Value(ChannelMix::default())
+        );
+        assert_eq!(filters.low_pass, PatchField::Value(LowPass::default()));
+        assert_eq!(
+            filters.equalizer,
+            PatchField::Value(vec![EqualizerBand { band: 4, gain: 1.0 }])
+        );
+        let encoded = serde_json::to_value(filters).unwrap();
+        assert_eq!(encoded["karaoke"]["filterBand"], 220.0);
+        assert_eq!(encoded["timescale"]["pitch"], 1.0);
+        assert_eq!(encoded["lowPass"]["smoothing"], 20.0);
+        assert_eq!(encoded["pluginFilters"]["unknown"], json!([1, null, true]));
+    }
+
+    #[test]
+    fn filter_patch_preserves_nullable_and_non_nullable_nulls_for_validation() {
+        let update: PlayerUpdate = serde_json::from_value(json!({
+            "filters": {
+                "volume": null,
+                "equalizer": null,
+                "karaoke": null,
+                "timescale": null
+            }
+        }))
+        .unwrap();
+        let PatchField::Value(filters) = update.filters else {
+            panic!("filters missing");
+        };
+        assert_eq!(filters.volume, PatchField::Null);
+        assert_eq!(filters.equalizer, PatchField::Null);
+        assert_eq!(filters.karaoke, PatchField::Null);
+        assert_eq!(filters.timescale, PatchField::Null);
     }
 }

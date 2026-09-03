@@ -1,8 +1,9 @@
 use std::collections::VecDeque;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crust::filters::FilterConfiguration;
 use crust::media::{
     AdapterError, AdapterErrorKind, AdapterFuture, EncodedTrack, FrameFormat, JsonObject,
     LoadOutcome, LoadRequest, MantleAdapter, MantlePlayer, MediaEvent, MediaFrame, MediaTrack,
@@ -50,8 +51,10 @@ struct FakeInner {
     event_capacity: NonZeroUsize,
     shutdown: CancellationToken,
     hold_loads: AtomicBool,
+    active_loads: AtomicUsize,
     load_release: Notify,
     last_route: Mutex<Option<SourceRoute>>,
+    last_identifier: Mutex<Option<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,8 +71,10 @@ impl FakeMantle {
                 event_capacity: config.event_capacity,
                 shutdown: CancellationToken::new(),
                 hold_loads: AtomicBool::new(false),
+                active_loads: AtomicUsize::new(0),
                 load_release: Notify::new(),
                 last_route: Mutex::new(None),
+                last_identifier: Mutex::new(None),
             }),
         }
     }
@@ -86,6 +91,20 @@ impl FakeMantle {
     pub fn release_loads(&self) {
         self.inner.hold_loads.store(false, Ordering::SeqCst);
         self.inner.load_release.notify_waiters();
+    }
+
+    #[must_use]
+    pub fn active_loads(&self) -> usize {
+        self.inner.active_loads.load(Ordering::SeqCst)
+    }
+
+    #[must_use]
+    pub fn last_identifier(&self) -> Option<String> {
+        self.inner
+            .last_identifier
+            .lock()
+            .expect("identifier lock poisoned")
+            .clone()
     }
 
     #[must_use]
@@ -108,6 +127,11 @@ impl MantleAdapter for FakeMantle {
     ) -> AdapterFuture<'_, Result<LoadOutcome, AdapterError>> {
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
+            let _active_load = ActiveLoad::new(Arc::clone(&inner));
+            *inner
+                .last_identifier
+                .lock()
+                .expect("identifier lock poisoned") = Some(request.identifier.clone());
             wait_for_load_release(&inner, &cancellation).await?;
             *inner.last_route.lock().expect("route lock poisoned") = Some(request.route);
             match request.identifier.as_str() {
@@ -130,6 +154,14 @@ impl MantleAdapter for FakeMantle {
                         track_for("fixture:playlist/one"),
                         track_for("fixture:playlist/two"),
                     ],
+                }),
+                "fixture:playlist-none" => Ok(LoadOutcome::Playlist {
+                    info: PlaylistInfo {
+                        name: "Synthetic unselected playlist".into(),
+                        selected_track: None,
+                    },
+                    plugin_info: JsonObject::new(),
+                    tracks: vec![track_for("fixture:playlist-none/one")],
                 }),
                 identifier if identifier.starts_with("fixture:") => {
                     Ok(LoadOutcome::Track(track_for(identifier)))
@@ -198,6 +230,23 @@ impl MantleAdapter for FakeMantle {
     }
 }
 
+struct ActiveLoad {
+    inner: Arc<FakeInner>,
+}
+
+impl ActiveLoad {
+    fn new(inner: Arc<FakeInner>) -> Self {
+        inner.active_loads.fetch_add(1, Ordering::SeqCst);
+        Self { inner }
+    }
+}
+
+impl Drop for ActiveLoad {
+    fn drop(&mut self) {
+        self.inner.active_loads.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 async fn wait_for_load_release(
     inner: &FakeInner,
     cancellation: &CancellationToken,
@@ -248,6 +297,9 @@ fn track_for(identifier: &str) -> MediaTrack {
             seekable: true,
             stream: false,
             source_name: "fixture".into(),
+            uri: None,
+            artwork_url: None,
+            isrc: None,
         },
         plugin_info: json_object(json!({
             "fixture": {"identifier": identifier, "nested": [1, null, true]}
@@ -274,6 +326,7 @@ struct FakePlayerState {
     base_position_ms: u64,
     anchor_ms: u64,
     processing: ProcessingMode,
+    filters: FilterConfiguration,
     next_frame_sequence: u64,
     events: VecDeque<MediaEvent>,
 }
@@ -302,6 +355,7 @@ impl FakePlayer {
                 base_position_ms: 0,
                 anchor_ms: 0,
                 processing: ProcessingMode::Passthrough,
+                filters: FilterConfiguration::default(),
                 next_frame_sequence: 0,
                 events: VecDeque::with_capacity(event_capacity.get()),
             }),
@@ -454,14 +508,20 @@ impl MantlePlayer for FakePlayer {
         })
     }
 
-    fn set_processing(
+    fn set_filters(
         &self,
-        mode: ProcessingMode,
+        configuration: FilterConfiguration,
         cancellation: CancellationToken,
     ) -> AdapterFuture<'_, Result<(), AdapterError>> {
         Box::pin(async move {
             self.check(&cancellation)?;
-            self.state.lock().expect("player lock poisoned").processing = mode;
+            let mut state = self.state.lock().expect("player lock poisoned");
+            state.processing = if configuration.is_effective() {
+                ProcessingMode::Pcm
+            } else {
+                ProcessingMode::Passthrough
+            };
+            state.filters = configuration;
             Ok(())
         })
     }
@@ -502,11 +562,9 @@ impl MantlePlayer for FakePlayer {
             let frame = MediaFrame {
                 sequence,
                 duration_ms: FRAME_DURATION_MS,
-                format: if state.processing == ProcessingMode::Passthrough {
-                    FrameFormat::OpusLike
-                } else {
-                    FrameFormat::PcmPlaceholder
-                },
+                // Mantle always returns Opus: PCM is an internal processing mode,
+                // never a second Crust-owned output pipeline.
+                format: FrameFormat::OpusLike,
                 payload,
             };
             if finishes {

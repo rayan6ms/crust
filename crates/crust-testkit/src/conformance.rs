@@ -2,7 +2,7 @@ use std::fmt;
 
 use crust::media::{
     AdapterErrorKind, EncodedTrack, FrameFormat, LoadOutcome, LoadRequest, MantleAdapter,
-    MediaEvent, MediaTrack, PlayerStatus, ProcessingMode, SourceRoute, TrackEndReason,
+    MediaEvent, MediaTrack, PlayerStatus, SourceRoute, TrackEndReason,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -169,7 +169,13 @@ pub async fn run_adapter_conformance(
 
     player.pause(false, CancellationToken::new()).await.unwrap();
     player
-        .set_processing(ProcessingMode::Pcm, CancellationToken::new())
+        .set_filters(
+            crust::filters::FilterConfiguration {
+                volume: Some(0.5),
+                ..crust::filters::FilterConfiguration::default()
+            },
+            CancellationToken::new(),
+        )
         .await
         .unwrap();
     let frame = player
@@ -177,8 +183,7 @@ pub async fn run_adapter_conformance(
         .await
         .unwrap()
         .ok_or_else(|| failure("frame", "frame missing"))?;
-    if frame.sequence != 0 || frame.duration_ms != 20 || frame.format != FrameFormat::PcmPlaceholder
-    {
+    if frame.sequence != 0 || frame.duration_ms != 20 || frame.format != FrameFormat::OpusLike {
         return Err(failure("frame", format!("unexpected {frame:?}")));
     }
     checks.push("pull-frame-processing-hook");

@@ -10,6 +10,8 @@ use std::sync::Arc;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::filters::FilterConfiguration;
+
 pub type AdapterFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub type JsonObject = BTreeMap<String, Value>;
 
@@ -37,6 +39,9 @@ pub struct TrackMetadata {
     pub seekable: bool,
     pub stream: bool,
     pub source_name: String,
+    pub uri: Option<String>,
+    pub artwork_url: Option<String>,
+    pub isrc: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -127,7 +132,6 @@ pub enum MediaEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameFormat {
     OpusLike,
-    PcmPlaceholder,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,9 +196,9 @@ pub trait MantlePlayer: Send + Sync {
 
     fn stop(&self, cancellation: CancellationToken) -> AdapterFuture<'_, Result<(), AdapterError>>;
 
-    fn set_processing(
+    fn set_filters(
         &self,
-        mode: ProcessingMode,
+        configuration: FilterConfiguration,
         cancellation: CancellationToken,
     ) -> AdapterFuture<'_, Result<(), AdapterError>>;
 
