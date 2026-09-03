@@ -10,3 +10,4 @@ pub mod media;
 pub mod overload;
 pub mod resources;
 pub mod routeplanner;
+pub mod voice;
