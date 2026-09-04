@@ -16,7 +16,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
     let (config_path, cli) = cli_options()?;
     let config = ServerConfig::load_with_cli(config_path.as_deref(), &cli)?;
-    let shutdown_timeout = config.shutdown_timeout;
+    let limits = config.resource_limits()?;
+    let shutdown_timeout = limits.shutdown_timeout();
     let route_planner = config.route_planner()?;
     let mantle_options = MantleAdapterOptions {
         allow_youtube_search: config.search.youtube_enabled,
@@ -29,8 +30,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mantle_options,
     )?);
     let voice = Arc::new(OtoVoiceBackend::with_defaults(
-        config.max_players,
-        config.max_concurrent_voice_connects,
+        limits.max_players.get(),
+        limits.max_concurrent_voice_connects.get(),
     )?);
     let server =
         CrustServer::bind_with_backends_and_route_planner(config, mantle, voice, route_planner)

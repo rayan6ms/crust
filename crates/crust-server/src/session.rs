@@ -113,6 +113,7 @@ pub enum PublishError {
 pub enum PlayerAdmissionError {
     SessionNotFound,
     Full,
+    SessionFull,
 }
 
 #[derive(Clone)]
@@ -133,6 +134,7 @@ struct RegistryCore {
     clock: Arc<dyn SessionClock>,
     max_sessions: usize,
     max_players: usize,
+    max_players_per_session: usize,
     max_concurrent_resumes: usize,
     critical_capacity: usize,
     resume_in_flight: AtomicUsize,
@@ -217,7 +219,6 @@ impl fmt::Debug for PreparedSession {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PreparedSession")
-            .field("session_id", &self.session.id)
             .field("resumed", &self.resumed)
             .finish_non_exhaustive()
     }
@@ -238,7 +239,6 @@ impl fmt::Debug for AttachedSession {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AttachedSession")
-            .field("session_id", &self.session.id)
             .field("resumed", &self.resumed)
             .finish_non_exhaustive()
     }
@@ -251,7 +251,6 @@ impl fmt::Debug for SessionHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SessionHandle")
-            .field("session_id", &self.0.id)
             .finish_non_exhaustive()
     }
 }
@@ -261,12 +260,14 @@ impl SessionRegistry {
     pub fn new(
         max_sessions: usize,
         max_players: usize,
+        max_players_per_session: usize,
         max_concurrent_resumes: usize,
         critical_capacity: usize,
         clock: Arc<dyn SessionClock>,
     ) -> Self {
         assert!(max_sessions > 0);
         assert!(max_players > 0);
+        assert!(max_players_per_session > 0);
         assert!(max_concurrent_resumes > 0);
         assert!(critical_capacity > 0);
         Self {
@@ -274,6 +275,7 @@ impl SessionRegistry {
                 clock,
                 max_sessions,
                 max_players,
+                max_players_per_session,
                 max_concurrent_resumes,
                 critical_capacity,
                 resume_in_flight: AtomicUsize::new(0),
@@ -423,6 +425,9 @@ impl SessionRegistry {
         }
         if let Some(existing) = inner.players.get(&guild_id) {
             return Ok(Arc::clone(&existing.player));
+        }
+        if inner.players.len() >= self.core.max_players_per_session {
+            return Err(PlayerAdmissionError::SessionFull);
         }
         self.acquire_player_slot()?;
         inner.players.insert(
@@ -1071,7 +1076,7 @@ mod tests {
     }
 
     fn registry(clock: Arc<ManualClock>) -> SessionRegistry {
-        SessionRegistry::new(2, 1, 1, 2, clock)
+        SessionRegistry::new(2, 1, 1, 1, 2, clock)
     }
 
     #[test]
@@ -1182,6 +1187,80 @@ mod tests {
     }
 
     #[test]
+    fn per_session_player_admission_recovers_without_consuming_global_capacity() {
+        let registry = SessionRegistry::new(2, 2, 1, 1, 2, Arc::new(ManualClock::default()));
+        let first = registry.prepare("one", None, None).unwrap();
+        let first_id = first.id().to_owned();
+        let first = first.attach().unwrap();
+        let second = registry.prepare("two", None, None).unwrap();
+        let second_id = second.id().to_owned();
+        let _second = second.attach().unwrap();
+        let player = || {
+            Arc::new(FakePlayer {
+                shutdown: Arc::new(AtomicBool::new(false)),
+            }) as Arc<dyn SessionPlayer>
+        };
+
+        registry
+            .get_or_add_player(&first_id, "1", player())
+            .unwrap();
+        assert!(matches!(
+            registry.get_or_add_player(&first_id, "2", player()),
+            Err(PlayerAdmissionError::SessionFull)
+        ));
+        registry
+            .get_or_add_player(&second_id, "3", player())
+            .unwrap();
+        assert_eq!(registry.counts().players, 2);
+
+        registry.remove_player(&first_id, "1").unwrap();
+        registry
+            .get_or_add_player(&first_id, "2", player())
+            .unwrap();
+        assert_eq!(registry.counts().players, 2);
+        drop(first);
+    }
+
+    #[test]
+    fn session_debug_representations_never_disclose_session_ids() {
+        let registry = registry(Arc::new(ManualClock::default()));
+        let prepared = registry.prepare("user", None, None).unwrap();
+        let id = prepared.id().to_owned();
+        assert!(!format!("{prepared:?}").contains(&id));
+        let attached = prepared.attach().unwrap();
+        assert!(!format!("{attached:?}").contains(&id));
+        assert!(!format!("{:?}", attached.handle()).contains(&id));
+    }
+
+    #[test]
+    fn thousand_slow_session_backlogs_saturate_at_fixed_bounds_and_recover() {
+        const SESSIONS: usize = 1_024;
+        let registry =
+            SessionRegistry::new(SESSIONS, 1, 1, 64, 1, Arc::new(ManualClock::default()));
+        let mut attached = Vec::with_capacity(SESSIONS);
+        for index in 0..SESSIONS {
+            let prepared = registry
+                .prepare(&format!("user-{index}"), None, None)
+                .unwrap();
+            let connection = prepared.attach().unwrap();
+            let handle = connection.handle();
+            assert!(handle.publish_critical(Arc::from("one")).is_ok());
+            assert!(matches!(
+                handle.publish_critical(Arc::from("two")),
+                Err(PublishError::Full(_))
+            ));
+            attached.push(connection);
+        }
+        assert_eq!(
+            registry.prepare("overflow", None, None).unwrap_err(),
+            PrepareError::Full
+        );
+
+        drop(attached.pop());
+        assert!(registry.prepare("recovered", None, None).is_ok());
+    }
+
+    #[test]
     fn critical_backlog_is_bounded_and_state_updates_coalesce() {
         let clock = Arc::new(ManualClock::default());
         let registry = registry(clock);
@@ -1247,7 +1326,7 @@ mod tests {
     #[test]
     fn concurrent_resume_admission_is_bounded_without_mutating_the_second_session() {
         let clock = Arc::new(ManualClock::default());
-        let registry = SessionRegistry::new(3, 1, 1, 2, clock);
+        let registry = SessionRegistry::new(3, 1, 1, 1, 2, clock);
         let mut ids = Vec::new();
         for user in ["one", "two"] {
             let prepared = registry.prepare(user, None, None).unwrap();

@@ -69,6 +69,7 @@ pub(crate) struct MetricsRegistry {
     load_latency_micros_total: AtomicU64,
     load_latency_samples: AtomicU64,
     load_shed_total: AtomicU64,
+    websocket_slow_consumer_disconnects_total: AtomicU64,
     mantle_errors_total: AtomicU64,
     events_dropped_total: AtomicU64,
     events_coalesced_total: AtomicU64,
@@ -119,6 +120,11 @@ impl MetricsRegistry {
 
     pub(crate) fn mantle_error(&self) {
         self.mantle_errors_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn websocket_slow_consumer(&self) {
+        self.websocket_slow_consumer_disconnects_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn render_prometheus(
@@ -244,6 +250,11 @@ impl MetricsRegistry {
         counter!(
             "crust_load_shed_total",
             self.load_shed_total.load(Ordering::Relaxed)
+        );
+        counter!(
+            "crust_websocket_slow_consumer_disconnects_total",
+            self.websocket_slow_consumer_disconnects_total
+                .load(Ordering::Relaxed)
         );
         output
     }

@@ -1449,6 +1449,14 @@ mod tests {
     }
 
     #[test]
+    fn production_source_http_defaults_to_mantles_public_internet_policy() {
+        assert_eq!(
+            RemoteHttpOptions::default().network_access,
+            HttpNetworkAccess::PublicInternetOnly
+        );
+    }
+
+    #[test]
     fn outbound_policy_preserves_identity_and_rejects_known_family_mismatch() {
         let planner = RoutePlanner::configured(crust::routeplanner::RoutePlannerConfig::new(
             crust::routeplanner::RoutePlannerStrategy::RotateOnBan,

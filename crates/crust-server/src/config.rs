@@ -5,11 +5,15 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::Duration;
 
+use crust::resources::{ResourceLimitConfig, ResourceLimits};
 use crust::routeplanner::{RoutePlanner, RoutePlannerConfig, RoutePlannerStrategy};
+use crust::voice::MAX_OPUS_PACKET_BYTES;
 use serde::Deserialize;
 
 const MAX_PASSWORD_BYTES: usize = 16 * 1024;
 const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_WEBSOCKET_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_WEBSOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_PLAYER_UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_STATS_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -19,6 +23,10 @@ const MAX_CONCURRENT_LOADS: usize = 1_048_576;
 const MAX_BATCH_DECODE_TRACKS: usize = 1_048_576;
 const MAX_CONCURRENT_SOURCE_REQUESTS: usize = 1_048_576;
 const MAX_CONCURRENT_VOICE_CONNECTS: usize = 1_048_576;
+const MAX_RETAINED_JSON_BYTES: usize = 1024 * 1024;
+const MAX_JSON_DEPTH: usize = 128;
+const MAX_JSON_ELEMENTS: usize = 1_048_576;
+const MAX_ROUTE_PLANNER_FAILURES: usize = 4_096;
 const MAX_BUFFER_DURATION_MS: u64 = 60_000;
 const MAX_FRAME_BUFFER_DURATION_MS: u64 = 120_000;
 // Mantle's bounded YouTube source contract accepts at most 64 playlist pages.
@@ -307,16 +315,24 @@ pub struct ServerConfig {
     pub metrics: MetricsConfig,
     pub logging: LoggingConfig,
     pub max_request_body_bytes: usize,
+    pub max_websocket_message_bytes: usize,
+    pub websocket_send_timeout: Duration,
     pub websocket_critical_capacity: usize,
     pub max_sessions: usize,
     pub max_players: usize,
+    pub max_players_per_session: usize,
     pub max_concurrent_session_resumes: usize,
     pub player_executor_shards: usize,
     pub player_command_capacity: usize,
     pub max_concurrent_loads: usize,
     pub max_batch_decode_tracks: usize,
     pub max_concurrent_source_requests: usize,
+    pub max_outbound_connections: usize,
     pub max_concurrent_voice_connects: usize,
+    pub max_retained_json_bytes: usize,
+    pub max_json_depth: usize,
+    pub max_json_elements: usize,
+    pub max_route_planner_failures: usize,
     pub player_update_interval: Duration,
     pub stats_interval: Duration,
     pub shutdown_timeout: Duration,
@@ -338,9 +354,12 @@ impl Default for ServerConfig {
             metrics: MetricsConfig::default(),
             logging: LoggingConfig::default(),
             max_request_body_bytes: 1024 * 1024,
+            max_websocket_message_bytes: 64 * 1024,
+            websocket_send_timeout: Duration::from_secs(5),
             websocket_critical_capacity: 64,
             max_sessions: 1024,
             max_players: 4096,
+            max_players_per_session: 1024,
             max_concurrent_session_resumes: 64,
             player_executor_shards: std::thread::available_parallelism()
                 .map_or(1, usize::from)
@@ -349,7 +368,12 @@ impl Default for ServerConfig {
             max_concurrent_loads: 64,
             max_batch_decode_tracks: 1_000,
             max_concurrent_source_requests: 64,
+            max_outbound_connections: 64,
             max_concurrent_voice_connects: 16,
+            max_retained_json_bytes: 64 * 1024,
+            max_json_depth: 64,
+            max_json_elements: 16 * 1024,
+            max_route_planner_failures: MAX_ROUTE_PLANNER_FAILURES,
             player_update_interval: Duration::from_secs(5),
             stats_interval: Duration::from_secs(60),
             shutdown_timeout: Duration::from_secs(30),
@@ -378,11 +402,17 @@ impl fmt::Debug for ServerConfig {
             .field("logging", &self.logging)
             .field("max_request_body_bytes", &self.max_request_body_bytes)
             .field(
+                "max_websocket_message_bytes",
+                &self.max_websocket_message_bytes,
+            )
+            .field("websocket_send_timeout", &self.websocket_send_timeout)
+            .field(
                 "websocket_critical_capacity",
                 &self.websocket_critical_capacity,
             )
             .field("max_sessions", &self.max_sessions)
             .field("max_players", &self.max_players)
+            .field("max_players_per_session", &self.max_players_per_session)
             .field(
                 "max_concurrent_session_resumes",
                 &self.max_concurrent_session_resumes,
@@ -395,9 +425,17 @@ impl fmt::Debug for ServerConfig {
                 "max_concurrent_source_requests",
                 &self.max_concurrent_source_requests,
             )
+            .field("max_outbound_connections", &self.max_outbound_connections)
             .field(
                 "max_concurrent_voice_connects",
                 &self.max_concurrent_voice_connects,
+            )
+            .field("max_retained_json_bytes", &self.max_retained_json_bytes)
+            .field("max_json_depth", &self.max_json_depth)
+            .field("max_json_elements", &self.max_json_elements)
+            .field(
+                "max_route_planner_failures",
+                &self.max_route_planner_failures,
             )
             .field("player_update_interval", &self.player_update_interval)
             .field("stats_interval", &self.stats_interval)
@@ -414,6 +452,57 @@ impl ServerConfig {
     #[must_use]
     pub fn password(&self) -> &str {
         &self.password
+    }
+
+    /// Validates and converts the operator-facing fields into the one typed
+    /// resource policy consumed by production server wiring.
+    pub fn resource_limits(&self) -> Result<ResourceLimits, ConfigError> {
+        // Programmatic test/server owners use port zero to request an
+        // ephemeral listener. Operator-loaded configuration still rejects it
+        // in `validate`; it is unrelated to resource-policy construction.
+        let mut validated = self.clone();
+        if validated.port == 0 {
+            validated.port = 1;
+        }
+        validated.validate()?;
+        let websocket_send_timeout_ms = self
+            .websocket_send_timeout
+            .as_millis()
+            .try_into()
+            .map_err(|_| ConfigError::Invalid("websocket_send_timeout is too large"))?;
+        let shutdown_timeout_ms = self
+            .shutdown_timeout
+            .as_millis()
+            .try_into()
+            .map_err(|_| ConfigError::Invalid("shutdown_timeout is too large"))?;
+        ResourceLimits::try_from(ResourceLimitConfig {
+            max_request_body_bytes: self.max_request_body_bytes,
+            max_websocket_message_bytes: self.max_websocket_message_bytes,
+            max_sessions: self.max_sessions,
+            max_players: self.max_players,
+            max_players_per_session: self.max_players_per_session,
+            max_concurrent_loads: self.max_concurrent_loads,
+            max_batch_decode_tracks: self.max_batch_decode_tracks,
+            player_command_capacity: self.player_command_capacity,
+            websocket_critical_capacity: self.websocket_critical_capacity,
+            websocket_send_timeout_ms,
+            max_concurrent_session_resumes: self.max_concurrent_session_resumes,
+            max_concurrent_source_requests: self.max_concurrent_source_requests,
+            max_outbound_connections: self.max_outbound_connections,
+            max_concurrent_voice_connects: self.max_concurrent_voice_connects,
+            max_retained_json_bytes: self.max_retained_json_bytes,
+            max_json_depth: self.max_json_depth,
+            max_json_elements: self.max_json_elements,
+            max_route_planner_failures: self.max_route_planner_failures,
+            // These limits describe existing lower-level bounded contracts;
+            // Crust does not create a second media event queue or task runtime.
+            media_event_capacity: 32,
+            max_media_frame_bytes: MAX_OPUS_PACKET_BYTES,
+            best_effort_telemetry_capacity: 256,
+            max_owned_tasks: self.max_players.saturating_add(self.player_executor_shards),
+            shutdown_timeout_ms,
+        })
+        .map_err(|_| ConfigError::Invalid("all resource limits must be non-zero"))
     }
     pub fn with_password(mut self, password: impl Into<String>) -> Result<Self, ConfigError> {
         self.password = password.into();
@@ -585,6 +674,9 @@ impl ServerConfig {
         if let Some(value) = parse_environment::<u64>("CRUST_SHUTDOWN_TIMEOUT_MS")? {
             self.shutdown_timeout = Duration::from_millis(value);
         }
+        if let Some(value) = parse_environment::<u64>("CRUST_WEBSOCKET_SEND_TIMEOUT_MS")? {
+            self.websocket_send_timeout = Duration::from_millis(value);
+        }
         macro_rules! env_field {
             ($name:literal, $field:expr, $type:ty) => {
                 if let Some(value) = parse_environment::<$type>($name)? {
@@ -598,12 +690,22 @@ impl ServerConfig {
             usize
         );
         env_field!(
+            "CRUST_MAX_WEBSOCKET_MESSAGE_BYTES",
+            self.max_websocket_message_bytes,
+            usize
+        );
+        env_field!(
             "CRUST_WEBSOCKET_CRITICAL_CAPACITY",
             self.websocket_critical_capacity,
             usize
         );
         env_field!("CRUST_MAX_SESSIONS", self.max_sessions, usize);
         env_field!("CRUST_MAX_PLAYERS", self.max_players, usize);
+        env_field!(
+            "CRUST_MAX_PLAYERS_PER_SESSION",
+            self.max_players_per_session,
+            usize
+        );
         env_field!(
             "CRUST_MAX_CONCURRENT_SESSION_RESUMES",
             self.max_concurrent_session_resumes,
@@ -635,8 +737,25 @@ impl ServerConfig {
             usize
         );
         env_field!(
+            "CRUST_MAX_OUTBOUND_CONNECTIONS",
+            self.max_outbound_connections,
+            usize
+        );
+        env_field!(
             "CRUST_MAX_CONCURRENT_VOICE_CONNECTS",
             self.max_concurrent_voice_connects,
+            usize
+        );
+        env_field!(
+            "CRUST_MAX_RETAINED_JSON_BYTES",
+            self.max_retained_json_bytes,
+            usize
+        );
+        env_field!("CRUST_MAX_JSON_DEPTH", self.max_json_depth, usize);
+        env_field!("CRUST_MAX_JSON_ELEMENTS", self.max_json_elements, usize);
+        env_field!(
+            "CRUST_MAX_ROUTE_PLANNER_FAILURES",
+            self.max_route_planner_failures,
             usize
         );
         env_field!(
@@ -939,6 +1058,20 @@ impl ServerConfig {
                 "max_request_body_bytes must be 1..=16777216",
             ));
         }
+        if self.max_websocket_message_bytes == 0
+            || self.max_websocket_message_bytes > MAX_WEBSOCKET_MESSAGE_BYTES
+        {
+            return Err(ConfigError::Invalid(
+                "max_websocket_message_bytes must be 1..=16777216",
+            ));
+        }
+        if self.websocket_send_timeout.is_zero()
+            || self.websocket_send_timeout > MAX_WEBSOCKET_SEND_TIMEOUT
+        {
+            return Err(ConfigError::Invalid(
+                "websocket_send_timeout must be between 1 ms and 5 minutes",
+            ));
+        }
         if self.websocket_critical_capacity == 0 {
             return Err(ConfigError::Invalid(
                 "websocket_critical_capacity must be non-zero",
@@ -949,6 +1082,11 @@ impl ServerConfig {
         }
         if self.max_players == 0 {
             return Err(ConfigError::Invalid("max_players must be non-zero"));
+        }
+        if self.max_players_per_session == 0 {
+            return Err(ConfigError::Invalid(
+                "max_players_per_session must be non-zero",
+            ));
         }
         if self.max_concurrent_session_resumes == 0 {
             return Err(ConfigError::Invalid(
@@ -988,11 +1126,40 @@ impl ServerConfig {
                 "max_concurrent_source_requests must be 1..=1048576",
             ));
         }
+        if self.max_outbound_connections == 0
+            || self.max_outbound_connections > MAX_CONCURRENT_SOURCE_REQUESTS
+        {
+            return Err(ConfigError::Invalid(
+                "max_outbound_connections must be 1..=1048576",
+            ));
+        }
         if self.max_concurrent_voice_connects == 0
             || self.max_concurrent_voice_connects > MAX_CONCURRENT_VOICE_CONNECTS
         {
             return Err(ConfigError::Invalid(
                 "max_concurrent_voice_connects must be 1..=1048576",
+            ));
+        }
+        if self.max_retained_json_bytes == 0
+            || self.max_retained_json_bytes > MAX_RETAINED_JSON_BYTES
+        {
+            return Err(ConfigError::Invalid(
+                "max_retained_json_bytes must be 1..=1048576",
+            ));
+        }
+        if self.max_json_depth == 0 || self.max_json_depth > MAX_JSON_DEPTH {
+            return Err(ConfigError::Invalid("max_json_depth must be 1..=128"));
+        }
+        if self.max_json_elements == 0 || self.max_json_elements > MAX_JSON_ELEMENTS {
+            return Err(ConfigError::Invalid(
+                "max_json_elements must be 1..=1048576",
+            ));
+        }
+        if self.max_route_planner_failures == 0
+            || self.max_route_planner_failures > MAX_ROUTE_PLANNER_FAILURES
+        {
+            return Err(ConfigError::Invalid(
+                "max_route_planner_failures must be 1..=4096",
             ));
         }
         if self.player_update_interval.is_zero()
@@ -1069,6 +1236,11 @@ impl ServerConfig {
             if route.retry_limit.is_some_and(|value| value < -1) {
                 return Err(ConfigError::Invalid(
                     "RoutePlanner retry_limit must be -1 or non-negative",
+                ));
+            }
+            if route.max_failures > self.max_route_planner_failures {
+                return Err(ConfigError::Invalid(
+                    "RoutePlanner max_failures exceeds the central resource limit",
                 ));
             }
         }
@@ -1423,16 +1595,24 @@ struct FileSentry {
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 struct FileCrust {
     max_request_body_bytes: Option<usize>,
+    max_websocket_message_bytes: Option<usize>,
+    websocket_send_timeout_ms: Option<u64>,
     websocket_critical_capacity: Option<usize>,
     max_sessions: Option<usize>,
     max_players: Option<usize>,
+    max_players_per_session: Option<usize>,
     max_concurrent_session_resumes: Option<usize>,
     player_executor_shards: Option<usize>,
     player_command_capacity: Option<usize>,
     max_concurrent_loads: Option<usize>,
     max_batch_decode_tracks: Option<usize>,
     max_concurrent_source_requests: Option<usize>,
+    max_outbound_connections: Option<usize>,
     max_concurrent_voice_connects: Option<usize>,
+    max_retained_json_bytes: Option<usize>,
+    max_json_depth: Option<usize>,
+    max_json_elements: Option<usize>,
+    max_route_planner_failures: Option<usize>,
     player_update_interval_ms: Option<u64>,
     stats_interval_ms: Option<u64>,
     shutdown_timeout_ms: Option<u64>,
@@ -1442,6 +1622,12 @@ impl FileCrust {
         if let Some(value) = self.max_request_body_bytes {
             target.max_request_body_bytes = value;
         }
+        if let Some(value) = self.max_websocket_message_bytes {
+            target.max_websocket_message_bytes = value;
+        }
+        if let Some(value) = self.websocket_send_timeout_ms {
+            target.websocket_send_timeout = Duration::from_millis(value);
+        }
         if let Some(value) = self.websocket_critical_capacity {
             target.websocket_critical_capacity = value;
         }
@@ -1450,6 +1636,9 @@ impl FileCrust {
         }
         if let Some(value) = self.max_players {
             target.max_players = value;
+        }
+        if let Some(value) = self.max_players_per_session {
+            target.max_players_per_session = value;
         }
         if let Some(value) = self.max_concurrent_session_resumes {
             target.max_concurrent_session_resumes = value;
@@ -1469,8 +1658,23 @@ impl FileCrust {
         if let Some(value) = self.max_concurrent_source_requests {
             target.max_concurrent_source_requests = value;
         }
+        if let Some(value) = self.max_outbound_connections {
+            target.max_outbound_connections = value;
+        }
         if let Some(value) = self.max_concurrent_voice_connects {
             target.max_concurrent_voice_connects = value;
+        }
+        if let Some(value) = self.max_retained_json_bytes {
+            target.max_retained_json_bytes = value;
+        }
+        if let Some(value) = self.max_json_depth {
+            target.max_json_depth = value;
+        }
+        if let Some(value) = self.max_json_elements {
+            target.max_json_elements = value;
+        }
+        if let Some(value) = self.max_route_planner_failures {
+            target.max_route_planner_failures = value;
         }
         if let Some(value) = self.player_update_interval_ms {
             target.player_update_interval = Duration::from_millis(value);
@@ -1487,6 +1691,36 @@ impl FileCrust {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn production_resource_policy_is_validated_and_centralized() {
+        let mut config = ServerConfig {
+            max_request_body_bytes: 1234,
+            max_websocket_message_bytes: 2345,
+            max_players: 17,
+            max_players_per_session: 3,
+            max_outbound_connections: 5,
+            max_retained_json_bytes: 3456,
+            max_json_depth: 7,
+            max_json_elements: 89,
+            websocket_send_timeout: Duration::from_millis(321),
+            ..ServerConfig::default()
+        };
+        let limits = config.resource_limits().unwrap();
+        assert_eq!(limits.max_request_body_bytes.get(), 1234);
+        assert_eq!(limits.max_websocket_message_bytes.get(), 2345);
+        assert_eq!(limits.max_players.get(), 17);
+        assert_eq!(limits.max_players_per_session.get(), 3);
+        assert_eq!(limits.max_outbound_connections.get(), 5);
+        assert_eq!(limits.max_retained_json_bytes.get(), 3456);
+        assert_eq!(limits.max_json_depth.get(), 7);
+        assert_eq!(limits.max_json_elements.get(), 89);
+        assert_eq!(limits.websocket_send_timeout(), Duration::from_millis(321));
+
+        config.max_json_depth = 0;
+        assert!(config.resource_limits().is_err());
+    }
+
     #[test]
     fn debug_redacts_password_and_proxy_secret() {
         let mut config = ServerConfig::default()

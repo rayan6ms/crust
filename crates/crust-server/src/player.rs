@@ -25,11 +25,12 @@ use crust_protocol::{Filters, JsonObject, PatchField, PlayerUpdate, VoiceState};
 use futures_util::future::BoxFuture;
 use futures_util::{FutureExt, StreamExt};
 use serde_json::{Value, json};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::FilterConfig;
+use crate::json_limits::{JsonPolicy, validate_media_track};
 use crate::session::{
     PublishError, SessionHandle, SessionPlayer, SessionPlayerRefresh, SessionPlayerStats,
 };
@@ -75,6 +76,75 @@ struct ExecutorInner {
     voice: Option<Arc<dyn VoiceBackend>>,
     cancellation: CancellationToken,
     workers: Mutex<Option<Vec<JoinHandle<()>>>>,
+}
+
+/// Shared admission for the deprecated player-identifier load path. It uses
+/// the same semaphores as `/v4/loadtracks`, so player commands cannot bypass
+/// global Mantle/outbound-work limits.
+#[derive(Clone)]
+pub(crate) struct PlayerLoadAdmission {
+    loads: Arc<Semaphore>,
+    source_requests: Arc<Semaphore>,
+    outbound_connections: Arc<Semaphore>,
+}
+
+impl PlayerLoadAdmission {
+    pub(crate) const fn new(
+        loads: Arc<Semaphore>,
+        source_requests: Arc<Semaphore>,
+        outbound_connections: Arc<Semaphore>,
+    ) -> Self {
+        Self {
+            loads,
+            source_requests,
+            outbound_connections,
+        }
+    }
+
+    fn try_acquire(&self) -> Result<PlayerLoadPermits, PlayerError> {
+        let load = Arc::clone(&self.loads)
+            .try_acquire_owned()
+            .map_err(|_| PlayerError::Overloaded)?;
+        let source = Arc::clone(&self.source_requests)
+            .try_acquire_owned()
+            .map_err(|_| PlayerError::Overloaded)?;
+        let outbound = Arc::clone(&self.outbound_connections)
+            .try_acquire_owned()
+            .map_err(|_| PlayerError::Overloaded)?;
+        Ok(PlayerLoadPermits {
+            _load: load,
+            _source: source,
+            outbound: Some(outbound),
+        })
+    }
+
+    fn try_acquire_outbound(&self) -> Result<OwnedSemaphorePermit, PlayerError> {
+        Arc::clone(&self.outbound_connections)
+            .try_acquire_owned()
+            .map_err(|_| PlayerError::Overloaded)
+    }
+}
+
+struct PlayerLoadPermits {
+    _load: OwnedSemaphorePermit,
+    _source: OwnedSemaphorePermit,
+    outbound: Option<OwnedSemaphorePermit>,
+}
+
+impl PlayerLoadPermits {
+    fn take_outbound(&mut self) -> OwnedSemaphorePermit {
+        self.outbound
+            .take()
+            .expect("load admission always owns an outbound permit")
+    }
+}
+
+#[derive(Clone)]
+struct PlayerServices {
+    adapter: Option<Arc<dyn MantleAdapter>>,
+    voice: Option<Arc<dyn VoiceBackend>>,
+    json_policy: JsonPolicy,
+    load_admission: PlayerLoadAdmission,
 }
 
 impl Drop for ExecutorInner {
@@ -136,6 +206,7 @@ impl Drop for VoiceMonitor {
 
 struct PlayerState {
     mantle: Option<Arc<dyn MantlePlayer>>,
+    outbound_connection: Option<OwnedSemaphorePermit>,
     voice_connection: Option<Arc<dyn VoiceConnection>>,
     audio_generation: u64,
     track: Option<ActiveTrack>,
@@ -194,10 +265,12 @@ enum PlayerCommand {
 
 impl PlayerExecutor {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         shard_count: usize,
         command_capacity: usize,
         max_players: usize,
+        json_policy: JsonPolicy,
+        load_admission: PlayerLoadAdmission,
         adapter: Option<Arc<dyn MantleAdapter>>,
         voice: Option<Arc<dyn VoiceBackend>>,
     ) -> Self {
@@ -205,6 +278,12 @@ impl PlayerExecutor {
         assert!(command_capacity > 0);
         assert!(max_players > 0);
         let cancellation = CancellationToken::new();
+        let services = PlayerServices {
+            adapter: adapter.clone(),
+            voice: voice.clone(),
+            json_policy,
+            load_admission,
+        };
         let mut senders = Vec::with_capacity(shard_count);
         let mut workers = Vec::with_capacity(shard_count);
         for _ in 0..shard_count {
@@ -214,16 +293,14 @@ impl PlayerExecutor {
             // even when ordinary player commands saturate their queue.
             let (shutdown_sender, shutdown_receiver) = mpsc::channel(max_players);
             let worker_cancellation = cancellation.clone();
-            let worker_adapter = adapter.clone();
-            let worker_voice = voice.clone();
+            let worker_services = services.clone();
             senders.push((sender, shutdown_sender));
             workers.push(tokio::spawn(run_shard(
                 receiver,
                 shutdown_receiver,
-                worker_adapter,
-                worker_voice,
                 worker_cancellation,
                 command_capacity,
+                worker_services,
             )));
         }
         Self {
@@ -525,6 +602,7 @@ impl Default for PlayerState {
     fn default() -> Self {
         Self {
             mantle: None,
+            outbound_connection: None,
             voice_connection: None,
             audio_generation: 0,
             track: None,
@@ -547,10 +625,9 @@ impl Default for PlayerState {
 async fn run_shard(
     mut receiver: mpsc::Receiver<PlayerCommand>,
     mut shutdown_receiver: mpsc::Receiver<PlayerHandle>,
-    adapter: Option<Arc<dyn MantleAdapter>>,
-    voice: Option<Arc<dyn VoiceBackend>>,
     cancellation: CancellationToken,
     max_queued: usize,
+    services: PlayerServices,
 ) {
     let mut active = HashSet::<String>::new();
     let mut queued = HashMap::<String, VecDeque<PlayerCommand>>::new();
@@ -577,7 +654,7 @@ async fn run_shard(
                     && let Some(command) = commands.pop_front()
                 {
                     queued_count -= 1;
-                    executing.push(execute_command(command, adapter.clone(), voice.clone()));
+                    executing.push(execute_command(command, services.clone()));
                     if commands.is_empty() {
                         queued.remove(&execution_key);
                     }
@@ -599,7 +676,7 @@ async fn run_shard(
                 };
                 let execution_key = command.execution_key().to_owned();
                 if active.insert(execution_key.clone()) {
-                    executing.push(execute_command(command, adapter.clone(), voice.clone()));
+                    executing.push(execute_command(command, services.clone()));
                 } else {
                     queued.entry(execution_key).or_default().push_back(command);
                     queued_count += 1;
@@ -610,7 +687,7 @@ async fn run_shard(
                 let command = PlayerCommand::Shutdown { handle };
                 let execution_key = command.execution_key().to_owned();
                 if active.insert(execution_key.clone()) {
-                    executing.push(execute_command(command, adapter.clone(), voice.clone()));
+                    executing.push(execute_command(command, services.clone()));
                 } else {
                     queued.entry(execution_key).or_default().push_back(command);
                     queued_count += 1;
@@ -634,14 +711,10 @@ impl PlayerCommand {
     }
 }
 
-fn execute_command(
-    command: PlayerCommand,
-    adapter: Option<Arc<dyn MantleAdapter>>,
-    voice: Option<Arc<dyn VoiceBackend>>,
-) -> BoxFuture<'static, String> {
+fn execute_command(command: PlayerCommand, services: PlayerServices) -> BoxFuture<'static, String> {
     let execution_key = command.execution_key().to_owned();
     async move {
-        execute(command, adapter, voice).await;
+        execute(command, services).await;
         execution_key
     }
     .boxed()
@@ -662,11 +735,7 @@ fn reject_command(command: PlayerCommand) {
     }
 }
 
-async fn execute(
-    command: PlayerCommand,
-    adapter: Option<Arc<dyn MantleAdapter>>,
-    voice: Option<Arc<dyn VoiceBackend>>,
-) {
+async fn execute(command: PlayerCommand, services: PlayerServices) {
     match command {
         PlayerCommand::Apply {
             handle,
@@ -675,15 +744,7 @@ async fn execute(
             no_replace,
             reply,
         } => {
-            let result = apply_update(
-                &handle,
-                &session,
-                *update,
-                no_replace,
-                adapter.as_ref(),
-                voice.as_ref(),
-            )
-            .await;
+            let result = apply_update(&handle, &session, *update, no_replace, &services).await;
             let _ = reply.send(result);
         }
         PlayerCommand::Snapshot { handle, reply } => {
@@ -861,8 +922,7 @@ async fn apply_update(
     session: &SessionHandle,
     update: PlayerUpdate,
     no_replace: bool,
-    adapter: Option<&Arc<dyn MantleAdapter>>,
-    voice_backend: Option<&Arc<dyn VoiceBackend>>,
+    services: &PlayerServices,
 ) -> Result<Value, PlayerError> {
     validate_update(&update)?;
     let voice_changed = matches!(update.voice, PatchField::Value(_));
@@ -870,7 +930,7 @@ async fn apply_update(
     let pause_changed = matches!(update.paused, PatchField::Value(_));
     let position_changed = matches!(update.position, PatchField::Value(_));
     let updated_voice = if let PatchField::Value(voice) = &update.voice {
-        prepare_voice_connection(handle, session, voice, voice_backend).await?
+        prepare_voice_connection(handle, session, voice, services.voice.as_ref()).await?
     } else {
         None
     };
@@ -879,7 +939,7 @@ async fn apply_update(
         return Err(PlayerError::NotFound);
     }
     if state.mantle.is_none()
-        && let Some(adapter) = adapter
+        && let Some(adapter) = &services.adapter
     {
         state.mantle = Some(
             adapter
@@ -968,13 +1028,22 @@ async fn apply_update(
                         .map_err(map_adapter_error)?;
                 }
                 state.track = None;
+                state.outbound_connection = None;
                 state.position_ms = 0;
                 state.end_time_ms = None;
                 state.paused = false;
                 drain_events(handle, session, &state.mantle, &user_data, None, None).await?;
             }
             TrackRequest::Encoded(encoded) => {
-                let adapter = adapter.ok_or(PlayerError::Invalid("invalid encoded track"))?;
+                let outbound = if state.outbound_connection.is_none() {
+                    Some(services.load_admission.try_acquire_outbound()?)
+                } else {
+                    None
+                };
+                let adapter = services
+                    .adapter
+                    .as_ref()
+                    .ok_or(PlayerError::Invalid("invalid encoded track"))?;
                 let track = adapter
                     .decode(
                         EncodedTrack::new(encoded),
@@ -982,11 +1051,19 @@ async fn apply_update(
                     )
                     .await
                     .map_err(map_adapter_error)?;
+                validate_media_track(&track, services.json_policy)
+                    .map_err(|_| PlayerError::Media("source pluginInfo exceeds resource limits"))?;
                 play_track(handle, session, &mut state, track, user_data, &update).await?;
+                if let Some(outbound) = outbound {
+                    state.outbound_connection = Some(outbound);
+                }
             }
             TrackRequest::Identifier(identifier) => {
-                let adapter =
-                    adapter.ok_or(PlayerError::Invalid("identifier loading is not configured"))?;
+                let adapter = services
+                    .adapter
+                    .as_ref()
+                    .ok_or(PlayerError::Invalid("identifier loading is not configured"))?;
+                let mut load_permits = services.load_admission.try_acquire()?;
                 let loaded = adapter
                     .load(
                         LoadRequest {
@@ -1008,7 +1085,12 @@ async fn apply_update(
                         ));
                     }
                 };
+                validate_media_track(&track, services.json_policy)
+                    .map_err(|_| PlayerError::Media("source pluginInfo exceeds resource limits"))?;
                 play_track(handle, session, &mut state, track, user_data, &update).await?;
+                if state.outbound_connection.is_none() {
+                    state.outbound_connection = Some(load_permits.take_outbound());
+                }
             }
         }
     }
@@ -1752,6 +1834,7 @@ async fn destroy(
         handle.inner.cancellation.cancel();
         state.destroyed = true;
         state.track = None;
+        state.outbound_connection = None;
         handle
             .inner
             .stats
@@ -1789,6 +1872,7 @@ fn apply_mantle_snapshot(state: &mut PlayerState, snapshot: crust::media::Player
         && matches!(snapshot.status, PlayerStatus::Idle | PlayerStatus::Stopped)
     {
         state.track = None;
+        state.outbound_connection = None;
     }
 }
 

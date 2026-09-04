@@ -1,4 +1,5 @@
 pub mod config;
+mod json_limits;
 pub mod player;
 pub mod session;
 mod stats;
@@ -27,12 +28,14 @@ use crust::media::{
     AdapterError, AdapterErrorKind, EncodedTrack, LoadOutcome, LoadRequest, MantleAdapter,
     SourceRoute,
 };
+use crust::resources::ResourceLimits;
 use crust::routeplanner::{RoutePlanner, RoutePlannerDetails, RoutePlannerSnapshot};
 use crust::voice::VoiceBackend;
 use crust_protocol::{PatchField, PlayerUpdate, SessionUpdate};
-use futures_util::{SinkExt, StreamExt, stream::FuturesUnordered};
+use futures_util::{Sink, SinkExt, StreamExt, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -44,7 +47,14 @@ use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 
 use config::ServerConfig;
-use player::{PlayerError, PlayerExecutor, PlayerHandle, disabled_filter_names, validate_update};
+use json_limits::{
+    JsonPolicy, parse_bounded_json, validate_json_object, validate_load_outcome,
+    validate_media_track,
+};
+use player::{
+    PlayerError, PlayerExecutor, PlayerHandle, PlayerLoadAdmission, disabled_filter_names,
+    validate_update,
+};
 use session::{
     PlayerAdmissionError, PrepareError, PreparedSession, SessionClock, SessionPlayer,
     SessionRegistry, SessionSettingsUpdate, SystemSessionClock,
@@ -59,12 +69,15 @@ const MAX_ROUTE_PLANNER_BODY_BYTES: usize = 4 * 1024;
 
 struct AppState {
     config: ServerConfig,
+    limits: ResourceLimits,
+    password_verifier: PasswordVerifier,
     next_request_id: AtomicU64,
     sessions: SessionRegistry,
     players: PlayerExecutor,
     adapter: Option<Arc<dyn MantleAdapter>>,
     load_requests: Arc<Semaphore>,
     source_requests: Arc<Semaphore>,
+    outbound_connections: Arc<Semaphore>,
     stats: StatsCollector,
     metrics: MetricsRegistry,
     extensions: ExtensionRegistry,
@@ -75,37 +88,50 @@ struct AppState {
 impl AppState {
     fn new(
         config: ServerConfig,
+        limits: ResourceLimits,
         clock: Arc<dyn SessionClock>,
         adapter: Option<Arc<dyn MantleAdapter>>,
         voice: Option<Arc<dyn VoiceBackend>>,
         route_planner: RoutePlanner,
     ) -> Self {
         let has_voice = voice.is_some();
+        let password_verifier = PasswordVerifier::new(config.password());
         let sessions = SessionRegistry::new(
-            config.max_sessions,
-            config.max_players,
-            config.max_concurrent_session_resumes,
-            config.websocket_critical_capacity,
+            limits.max_sessions.get(),
+            limits.max_players.get(),
+            limits.max_players_per_session.get(),
+            limits.max_concurrent_session_resumes.get(),
+            limits.websocket_critical_capacity.get(),
             clock,
         );
+        let load_requests = Arc::new(Semaphore::new(limits.max_concurrent_loads.get()));
+        let source_requests = Arc::new(Semaphore::new(limits.max_concurrent_source_requests.get()));
+        let outbound_connections = Arc::new(Semaphore::new(limits.max_outbound_connections.get()));
         let players = PlayerExecutor::new(
             config.player_executor_shards,
-            config.player_command_capacity,
-            config.max_players,
+            limits.player_command_capacity.get(),
+            limits.max_players.get(),
+            JsonPolicy::from(&limits),
+            PlayerLoadAdmission::new(
+                Arc::clone(&load_requests),
+                Arc::clone(&source_requests),
+                Arc::clone(&outbound_connections),
+            ),
             adapter.clone(),
             voice,
         );
-        let load_requests = Arc::new(Semaphore::new(config.max_concurrent_loads));
-        let source_requests = Arc::new(Semaphore::new(config.max_concurrent_source_requests));
         let extensions = registered_extensions(adapter.is_some(), has_voice);
         Self {
             config,
+            limits,
+            password_verifier,
             next_request_id: AtomicU64::new(1),
             sessions,
             players,
             adapter,
             load_requests,
             source_requests,
+            outbound_connections,
             stats: StatsCollector::new(),
             metrics: MetricsRegistry::default(),
             extensions,
@@ -213,10 +239,29 @@ impl CrustServer {
         voice: Option<Arc<dyn VoiceBackend>>,
         route_planner: RoutePlanner,
     ) -> io::Result<Self> {
+        let limits = config
+            .resource_limits()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        if route_planner
+            .failure_capacity()
+            .is_some_and(|capacity| capacity > limits.max_route_planner_failures.get())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "RoutePlanner failure capacity exceeds the central resource limit",
+            ));
+        }
         let listener = TcpListener::bind(config.socket_address()).await?;
         Ok(Self {
             listener: Arc::new(listener),
-            state: Arc::new(AppState::new(config, clock, adapter, voice, route_planner)),
+            state: Arc::new(AppState::new(
+                config,
+                limits,
+                clock,
+                adapter,
+                voice,
+                route_planner,
+            )),
         })
     }
 
@@ -252,7 +297,7 @@ impl CrustServer {
             result = &mut shutdown_sequence => result,
             () = async {
                 shutdown.cancelled().await;
-                tokio::time::sleep(self.state.config.shutdown_timeout).await;
+                tokio::time::sleep(self.state.limits.shutdown_timeout()).await;
             } => Err(io::Error::new(io::ErrorKind::TimedOut, "server shutdown deadline elapsed")),
         }
     }
@@ -343,7 +388,7 @@ fn router(state: Arc<AppState>) -> Router {
     router
         .fallback(fallback)
         .layer(axum::extract::DefaultBodyLimit::max(
-            state.config.max_request_body_bytes,
+            state.limits.max_request_body_bytes.get(),
         ))
         .layer(
             TraceLayer::new_for_http().make_span_with(|request: &Request| {
@@ -473,7 +518,7 @@ async fn authorize(State(state): State<Arc<AppState>>, request: Request, next: N
     let valid = supplied
         .to_str()
         .ok()
-        .is_some_and(|supplied| constant_time_equal(supplied, state.config.password()));
+        .is_some_and(|supplied| state.password_verifier.verify(supplied));
     if !valid {
         return if websocket {
             StatusCode::UNAUTHORIZED
@@ -485,8 +530,17 @@ async fn authorize(State(state): State<Arc<AppState>>, request: Request, next: N
     next.run(request).await
 }
 
-fn constant_time_equal(left: &str, right: &str) -> bool {
-    left.len() == right.len() && bool::from(left.as_bytes().ct_eq(right.as_bytes()))
+struct PasswordVerifier([u8; 32]);
+
+impl PasswordVerifier {
+    fn new(password: &str) -> Self {
+        Self(Sha256::digest(password.as_bytes()).into())
+    }
+
+    fn verify(&self, supplied: &str) -> bool {
+        let supplied: [u8; 32] = Sha256::digest(supplied.as_bytes()).into();
+        bool::from(supplied.ct_eq(&self.0))
+    }
 }
 
 async fn version() -> Response {
@@ -570,10 +624,24 @@ async fn crust_info(State(state): State<Arc<AppState>>) -> Json<Value> {
         },
         "extensions": extension_values(&state.extensions),
         "limits": {
-            "requestBodyBytes": state.config.max_request_body_bytes,
-            "sessions": state.config.max_sessions,
-            "players": state.config.max_players,
-            "playerCommandCapacity": state.config.player_command_capacity,
+            "requestBodyBytes": state.limits.max_request_body_bytes.get(),
+            "websocketMessageBytes": state.limits.max_websocket_message_bytes.get(),
+            "websocketSendTimeoutMs": u64::try_from(
+                state.limits.websocket_send_timeout().as_millis()
+            ).unwrap_or(u64::MAX),
+            "sessions": state.limits.max_sessions.get(),
+            "players": state.limits.max_players.get(),
+            "playersPerSession": state.limits.max_players_per_session.get(),
+            "playerCommandCapacity": state.limits.player_command_capacity.get(),
+            "websocketCriticalCapacity": state.limits.websocket_critical_capacity.get(),
+            "concurrentLoads": state.limits.max_concurrent_loads.get(),
+            "batchDecodeTracks": state.limits.max_batch_decode_tracks.get(),
+            "sourceRequests": state.limits.max_concurrent_source_requests.get(),
+            "outboundConnections": state.limits.max_outbound_connections.get(),
+            "retainedJsonBytes": state.limits.max_retained_json_bytes.get(),
+            "jsonDepth": state.limits.max_json_depth.get(),
+            "jsonElements": state.limits.max_json_elements.get(),
+            "routePlannerFailures": state.limits.max_route_planner_failures.get(),
         }
     }))
 }
@@ -705,8 +773,16 @@ async fn route_planner_free_address(
     uri: Uri,
     request: Request,
 ) -> Response {
-    let bytes = match axum::body::to_bytes(request.into_body(), MAX_ROUTE_PLANNER_BODY_BYTES).await
-    {
+    if !request_has_json_content_type(&request) {
+        return protocol_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Content-Type must be application/json",
+            uri.path(),
+            false,
+        );
+    }
+    let body_limit = MAX_ROUTE_PLANNER_BODY_BYTES.min(state.limits.max_request_body_bytes.get());
+    let bytes = match axum::body::to_bytes(request.into_body(), body_limit).await {
         Ok(bytes) => bytes,
         Err(_) => {
             return protocol_error(
@@ -717,7 +793,10 @@ async fn route_planner_free_address(
             );
         }
     };
-    let body = match serde_json::from_slice::<RoutePlannerFreeAddress>(&bytes) {
+    let body = match parse_bounded_json::<RoutePlannerFreeAddress>(
+        &bytes,
+        JsonPolicy::from(&state.limits),
+    ) {
         Ok(body) => body,
         Err(_) => {
             return protocol_error(
@@ -920,13 +999,14 @@ async fn load_tracks(
     if !state.config.sources.youtube {
         return Json(json!({"loadType": "empty", "data": null})).into_response();
     }
-    let (adapter, _load_permit, _source_permit) = match acquire_load_request(&state) {
-        Ok(admission) => admission,
-        Err(error) => {
-            state.metrics.load_shed();
-            return load_admission_error(error, uri.path());
-        }
-    };
+    let (adapter, _load_permit, _source_permit, _outbound_permit) =
+        match acquire_load_request(&state) {
+            Ok(admission) => admission,
+            Err(error) => {
+                state.metrics.load_shed();
+                return load_admission_error(error, uri.path());
+            }
+        };
     let cancellation = RequestCancellation::new();
     let started = Instant::now();
     state.metrics.load_started();
@@ -943,7 +1023,13 @@ async fn load_tracks(
         .metrics
         .load_finished(started.elapsed(), result.is_err());
     match result {
-        Ok(outcome) => Json(load_result_value(outcome)).into_response(),
+        Ok(outcome) => {
+            if validate_load_outcome(&outcome, JsonPolicy::from(&state.limits)).is_err() {
+                state.metrics.mantle_error();
+                return adapter_json_limit_error(uri.path());
+            }
+            Json(load_result_value(outcome)).into_response()
+        }
         Err(error) if error.kind == AdapterErrorKind::LoadFailed => {
             state.metrics.mantle_error();
             Json(load_failed_value(error)).into_response()
@@ -987,7 +1073,13 @@ async fn decode_track(
         .decode(EncodedTrack::new(encoded), cancellation.token())
         .await
     {
-        Ok(track) => Json(track::loaded_track_value(&track)).into_response(),
+        Ok(track) => {
+            if validate_media_track(&track, JsonPolicy::from(&state.limits)).is_err() {
+                state.metrics.mantle_error();
+                return adapter_json_limit_error(uri.path());
+            }
+            Json(track::loaded_track_value(&track)).into_response()
+        }
         Err(error) => {
             state.metrics.mantle_error();
             media_adapter_error(error, uri.path())
@@ -998,8 +1090,19 @@ async fn decode_track(
 async fn decode_tracks(State(state): State<Arc<AppState>>, request: Request) -> Response {
     let path = request.uri().path().to_owned();
     let trace = trace_requested(request.uri());
-    let bytes = match axum::body::to_bytes(request.into_body(), state.config.max_request_body_bytes)
-        .await
+    if !request_has_json_content_type(&request) {
+        return protocol_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Content-Type must be application/json",
+            &path,
+            trace,
+        );
+    }
+    let bytes = match axum::body::to_bytes(
+        request.into_body(),
+        state.limits.max_request_body_bytes.get(),
+    )
+    .await
     {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -1011,17 +1114,18 @@ async fn decode_tracks(State(state): State<Arc<AppState>>, request: Request) -> 
             );
         }
     };
-    let encoded_tracks: Vec<String> = match serde_json::from_slice(&bytes) {
-        Ok(tracks) => tracks,
-        Err(_) => {
-            return protocol_error(
-                StatusCode::BAD_REQUEST,
-                "Invalid encoded tracks",
-                &path,
-                trace,
-            );
-        }
-    };
+    let encoded_tracks: Vec<String> =
+        match parse_bounded_json(&bytes, JsonPolicy::from(&state.limits)) {
+            Ok(tracks) => tracks,
+            Err(_) => {
+                return protocol_error(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid encoded tracks",
+                    &path,
+                    trace,
+                );
+            }
+        };
     if encoded_tracks.is_empty() {
         return protocol_error(
             StatusCode::BAD_REQUEST,
@@ -1030,7 +1134,7 @@ async fn decode_tracks(State(state): State<Arc<AppState>>, request: Request) -> 
             trace,
         );
     }
-    if encoded_tracks.len() > state.config.max_batch_decode_tracks {
+    if encoded_tracks.len() > state.limits.max_batch_decode_tracks.get() {
         return protocol_error(
             StatusCode::BAD_REQUEST,
             "Too many tracks to decode",
@@ -1048,7 +1152,13 @@ async fn decode_tracks(State(state): State<Arc<AppState>>, request: Request) -> 
             .decode(EncodedTrack::new(encoded), cancellation.token())
             .await
         {
-            Ok(track) => tracks.push(track::loaded_track_value(&track)),
+            Ok(track) => {
+                if validate_media_track(&track, JsonPolicy::from(&state.limits)).is_err() {
+                    state.metrics.mantle_error();
+                    return adapter_json_limit_error(&path);
+                }
+                tracks.push(track::loaded_track_value(&track));
+            }
             Err(error) => {
                 state.metrics.mantle_error();
                 return media_adapter_error(error, &path);
@@ -1065,6 +1175,7 @@ fn acquire_load_request(
         Arc<dyn MantleAdapter>,
         OwnedSemaphorePermit,
         OwnedSemaphorePermit,
+        OwnedSemaphorePermit,
     ),
     LoadAdmissionError,
 > {
@@ -1078,7 +1189,10 @@ fn acquire_load_request(
     let source_permit = Arc::clone(&state.source_requests)
         .try_acquire_owned()
         .map_err(|_| LoadAdmissionError::SourceRequests)?;
-    Ok((adapter, load_permit, source_permit))
+    let outbound_permit = Arc::clone(&state.outbound_connections)
+        .try_acquire_owned()
+        .map_err(|_| LoadAdmissionError::OutboundConnections)?;
+    Ok((adapter, load_permit, source_permit, outbound_permit))
 }
 
 #[derive(Clone, Copy)]
@@ -1086,6 +1200,7 @@ enum LoadAdmissionError {
     AdapterUnavailable,
     ConcurrentLoads,
     SourceRequests,
+    OutboundConnections,
 }
 
 fn load_admission_error(error: LoadAdmissionError, path: &str) -> Response {
@@ -1093,6 +1208,7 @@ fn load_admission_error(error: LoadAdmissionError, path: &str) -> Response {
         LoadAdmissionError::AdapterUnavailable => "Mantle adapter unavailable",
         LoadAdmissionError::ConcurrentLoads => "Concurrent load capacity reached",
         LoadAdmissionError::SourceRequests => "Source request capacity reached",
+        LoadAdmissionError::OutboundConnections => "Outbound connection capacity reached",
     };
     protocol_error(StatusCode::SERVICE_UNAVAILABLE, message, path, false)
 }
@@ -1105,6 +1221,15 @@ fn adapter_unavailable(path: &str) -> Response {
     protocol_error(
         StatusCode::SERVICE_UNAVAILABLE,
         "Mantle adapter unavailable",
+        path,
+        false,
+    )
+}
+
+fn adapter_json_limit_error(path: &str) -> Response {
+    protocol_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Mantle returned JSON outside the configured retention policy",
         path,
         false,
     )
@@ -1239,20 +1364,19 @@ async fn websocket(
         }
     };
     let resumed = prepared.resumed();
-    let session_id = prepared.id();
     let player_update_interval = state.config.player_update_interval;
     let stats_interval = state.config.stats_interval;
+    let websocket_message_bytes = state.limits.max_websocket_message_bytes.get();
     let websocket_state = Arc::clone(&state);
     tracing::info!(
         user_id,
         client_name = ?client_name,
-        requested_session_id = ?requested_session_id,
-        session_id = %session_id,
+        resumed,
         "WebSocket session admitted"
     );
     let mut response = upgrade
-        .max_message_size(64 * 1024)
-        .max_frame_size(64 * 1024)
+        .max_message_size(websocket_message_bytes)
+        .max_frame_size(websocket_message_bytes)
         .on_upgrade(move |socket| {
             websocket_session(
                 socket,
@@ -1294,24 +1418,37 @@ async fn websocket_session(
         session_id: &session_id,
     })
     .expect("ready serialization");
-    if sink.send(Message::Text(ready.into())).await.is_err() {
+    if !send_websocket(
+        &mut sink,
+        Message::Text(ready.into()),
+        &state,
+        &cancellation,
+    )
+    .await
+    {
         return;
     }
     for payload in initial_critical.into_iter().chain(initial_state) {
-        if sink
-            .send(Message::Text(payload.to_string().into()))
-            .await
-            .is_err()
+        if !send_websocket(
+            &mut sink,
+            Message::Text(payload.to_string().into()),
+            &state,
+            &cancellation,
+        )
+        .await
         {
             return;
         }
     }
     if !resumed {
         let initial_stats = stats_value(state.stats.websocket(&state.sessions, &handle), true);
-        if sink
-            .send(Message::Text(initial_stats.to_string().into()))
-            .await
-            .is_err()
+        if !send_websocket(
+            &mut sink,
+            Message::Text(initial_stats.to_string().into()),
+            &state,
+            &cancellation,
+        )
+        .await
         {
             return;
         }
@@ -1333,7 +1470,12 @@ async fn websocket_session(
         tokio::select! {
             outgoing_message = outgoing.recv() => {
                 let Some(message) = outgoing_message else { break };
-                if sink.send(Message::Text(message.payload.to_string().into())).await.is_err() {
+                if !send_websocket(
+                    &mut sink,
+                    Message::Text(message.payload.to_string().into()),
+                    &state,
+                    &cancellation,
+                ).await {
                     break;
                 }
                 if let Some(delivered) = message.delivered {
@@ -1342,7 +1484,12 @@ async fn websocket_session(
             }
             () = handle.coalesced_notified() => {
                 for payload in handle.take_coalesced() {
-                    if sink.send(Message::Text(payload.to_string().into())).await.is_err() {
+                    if !send_websocket(
+                        &mut sink,
+                        Message::Text(payload.to_string().into()),
+                        &state,
+                        &cancellation,
+                    ).await {
                         return;
                     }
                 }
@@ -1372,13 +1519,18 @@ async fn websocket_session(
                 let _ = handle.publish_player_update(&guild_id, payload);
             }
             () = cancellation.cancelled() => {
-                let _ = sink.send(Message::Close(None)).await;
+                close_websocket(&mut sink, &state).await;
                 break;
             }
             incoming = stream.next() => match incoming {
                 Some(Ok(Message::Text(_))) => {}
                 Some(Ok(Message::Ping(payload))) => {
-                    if sink.send(Message::Pong(payload)).await.is_err() {
+                    if !send_websocket(
+                        &mut sink,
+                        Message::Pong(payload),
+                        &state,
+                        &cancellation,
+                    ).await {
                         break;
                     }
                 }
@@ -1390,14 +1542,96 @@ async fn websocket_session(
     }
 }
 
+async fn send_websocket<S>(
+    sink: &mut S,
+    message: Message,
+    state: &AppState,
+    cancellation: &CancellationToken,
+) -> bool
+where
+    S: Sink<Message> + Unpin,
+{
+    match bounded_websocket_send(
+        sink,
+        message,
+        state.limits.websocket_send_timeout(),
+        cancellation,
+    )
+    .await
+    {
+        WebSocketSendOutcome::Delivered => true,
+        WebSocketSendOutcome::TimedOut => {
+            state.metrics.websocket_slow_consumer();
+            tracing::warn!("slow WebSocket consumer disconnected");
+            cancellation.cancel();
+            false
+        }
+        WebSocketSendOutcome::Cancelled | WebSocketSendOutcome::Closed => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WebSocketSendOutcome {
+    Delivered,
+    Cancelled,
+    Closed,
+    TimedOut,
+}
+
+async fn bounded_websocket_send<S>(
+    sink: &mut S,
+    message: Message,
+    deadline: Duration,
+    cancellation: &CancellationToken,
+) -> WebSocketSendOutcome
+where
+    S: Sink<Message> + Unpin,
+{
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => WebSocketSendOutcome::Cancelled,
+        result = timeout(deadline, sink.send(message)) => match result {
+            Ok(Ok(())) => WebSocketSendOutcome::Delivered,
+            Ok(Err(_)) => WebSocketSendOutcome::Closed,
+            Err(_) => WebSocketSendOutcome::TimedOut,
+        },
+    }
+}
+
+async fn close_websocket<S>(sink: &mut S, state: &AppState)
+where
+    S: Sink<Message> + Unpin,
+{
+    if timeout(
+        state.limits.websocket_send_timeout(),
+        sink.send(Message::Close(None)),
+    )
+    .await
+    .is_err()
+    {
+        state.metrics.websocket_slow_consumer();
+    }
+}
+
 async fn patch_session(
     State(state): State<Arc<AppState>>,
     Path(session_id): Path<String>,
     request: Request,
 ) -> Response {
     let path = request.uri().path().to_owned();
-    let bytes = match axum::body::to_bytes(request.into_body(), state.config.max_request_body_bytes)
-        .await
+    if !request_has_json_content_type(&request) {
+        return protocol_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Content-Type must be application/json",
+            &path,
+            false,
+        );
+    }
+    let bytes = match axum::body::to_bytes(
+        request.into_body(),
+        state.limits.max_request_body_bytes.get(),
+    )
+    .await
     {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -1409,7 +1643,7 @@ async fn patch_session(
             );
         }
     };
-    let update: SessionUpdate = match serde_json::from_slice(&bytes) {
+    let update: SessionUpdate = match parse_bounded_json(&bytes, JsonPolicy::from(&state.limits)) {
         Ok(update) => update,
         Err(_) => {
             return protocol_error(
@@ -1547,12 +1781,23 @@ async fn patch_player(
         Ok(value) => value,
         Err(message) => return protocol_error(StatusCode::BAD_REQUEST, message, &path, false),
     };
+    if !request_has_json_content_type(&request) {
+        return protocol_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Content-Type must be application/json",
+            &path,
+            false,
+        );
+    }
     state.sessions.cleanup_expired();
     let Some(session) = state.sessions.session(&session_id) else {
         return protocol_error(StatusCode::NOT_FOUND, "Session not found", &path, false);
     };
-    let bytes = match axum::body::to_bytes(request.into_body(), state.config.max_request_body_bytes)
-        .await
+    let bytes = match axum::body::to_bytes(
+        request.into_body(),
+        state.limits.max_request_body_bytes.get(),
+    )
+    .await
     {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -1564,7 +1809,7 @@ async fn patch_player(
             );
         }
     };
-    let update: PlayerUpdate = match serde_json::from_slice(&bytes) {
+    let update: PlayerUpdate = match parse_bounded_json(&bytes, JsonPolicy::from(&state.limits)) {
         Ok(update) => update,
         Err(_) => {
             return protocol_error(
@@ -1577,6 +1822,14 @@ async fn patch_player(
     };
     if let Err(error) = validate_update(&update) {
         return player_error(error, &path);
+    }
+    if validate_player_update_retention(&update, JsonPolicy::from(&state.limits)).is_err() {
+        return protocol_error(
+            StatusCode::BAD_REQUEST,
+            "Player JSON exceeds the configured retention limit",
+            &path,
+            false,
+        );
     }
     if let PatchField::Value(filters) = &update.filters {
         let disabled = disabled_filter_names(filters, &state.config.filters);
@@ -1602,7 +1855,7 @@ async fn patch_player(
             Err(PlayerAdmissionError::SessionNotFound) => {
                 return protocol_error(StatusCode::NOT_FOUND, "Session not found", &path, false);
             }
-            Err(PlayerAdmissionError::Full) => {
+            Err(PlayerAdmissionError::Full | PlayerAdmissionError::SessionFull) => {
                 return protocol_error(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Player capacity reached",
@@ -1624,6 +1877,21 @@ async fn patch_player(
         Ok(value) => Json(value).into_response(),
         Err(error) => player_error(error, &path),
     }
+}
+
+fn validate_player_update_retention(
+    update: &PlayerUpdate,
+    policy: JsonPolicy,
+) -> Result<(), json_limits::JsonLimitError> {
+    if let PatchField::Value(track) = &update.track
+        && let PatchField::Value(user_data) = &track.user_data
+    {
+        validate_json_object(user_data, policy)?;
+    }
+    if let PatchField::Value(filters) = &update.filters {
+        validate_json_object(&filters.plugin_filters, policy)?;
+    }
+    Ok(())
 }
 
 async fn delete_player(
@@ -1665,7 +1933,7 @@ async fn delete_player(
             uri.path(),
             false,
         ),
-        Err(PlayerAdmissionError::Full) => protocol_error(
+        Err(PlayerAdmissionError::Full | PlayerAdmissionError::SessionFull) => protocol_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "Player capacity reached",
             uri.path(),
@@ -1707,6 +1975,22 @@ fn parse_no_replace(uri: &Uri) -> Result<bool, &'static str> {
         };
     }
     Ok(no_replace)
+}
+
+fn request_has_json_content_type(request: &Request) -> bool {
+    request
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .and_then(|media_type| media_type.trim().split_once('/'))
+        .is_some_and(|(kind, subtype)| {
+            kind.eq_ignore_ascii_case("application")
+                && (subtype.eq_ignore_ascii_case("json")
+                    || subtype.rsplit_once('+').is_some_and(|(name, suffix)| {
+                        !name.is_empty() && suffix.eq_ignore_ascii_case("json")
+                    }))
+        })
 }
 
 fn player_error(error: PlayerError, path: &str) -> Response {
@@ -1763,4 +2047,78 @@ fn timestamp_ms() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod security_tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use super::*;
+
+    struct PendingSink;
+
+    impl Sink<Message> for PendingSink {
+        type Error = ();
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
+            unreachable!("pending sink never admits a message")
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_sink_writes_are_deadline_and_cancellation_bounded() {
+        let cancellation = CancellationToken::new();
+        assert_eq!(
+            bounded_websocket_send(
+                &mut PendingSink,
+                Message::Text("blocked".into()),
+                Duration::from_millis(1),
+                &cancellation,
+            )
+            .await,
+            WebSocketSendOutcome::TimedOut
+        );
+
+        cancellation.cancel();
+        assert_eq!(
+            bounded_websocket_send(
+                &mut PendingSink,
+                Message::Text("cancelled".into()),
+                Duration::from_secs(60),
+                &cancellation,
+            )
+            .await,
+            WebSocketSendOutcome::Cancelled
+        );
+    }
+
+    #[test]
+    fn password_verifier_compares_fixed_length_digests() {
+        let verifier = PasswordVerifier::new("correct-horse-battery-staple");
+        assert!(verifier.verify("correct-horse-battery-staple"));
+        assert!(!verifier.verify("short"));
+        assert!(!verifier.verify("correct-horse-battery-staplef"));
+    }
 }

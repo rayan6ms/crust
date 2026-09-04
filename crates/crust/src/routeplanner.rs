@@ -459,6 +459,17 @@ impl RoutePlanner {
         self.inner.definition.is_some()
     }
 
+    /// Maximum retained failure records for this planner, or `None` while
+    /// disabled. Server wiring uses this to enforce its central resource
+    /// policy even when a caller supplies a pre-built planner.
+    #[must_use]
+    pub fn failure_capacity(&self) -> Option<usize> {
+        self.inner
+            .definition
+            .as_ref()
+            .map(|definition| definition.max_failures)
+    }
+
     /// Selects a compatible local route. Enabled planners never silently fall back to an
     /// unbound same-family connection, even if every usable address is temporarily failing.
     #[must_use]

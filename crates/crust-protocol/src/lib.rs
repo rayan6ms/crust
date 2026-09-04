@@ -5,6 +5,7 @@
 //! are retained.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -74,13 +75,25 @@ pub struct PlayerUpdateTrack {
 }
 
 /// Discord voice state accepted by a player PATCH.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoiceState {
     pub token: String,
     pub endpoint: String,
     pub session_id: String,
     pub channel_id: Option<String>,
+}
+
+impl fmt::Debug for VoiceState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VoiceState")
+            .field("token", &"<redacted>")
+            .field("endpoint", &"<redacted>")
+            .field("session_id", &"<redacted>")
+            .field("channel_id", &self.channel_id)
+            .finish()
+    }
 }
 
 const fn default_one_f32() -> f32 {
@@ -374,6 +387,25 @@ mod tests {
         });
         let update: PlayerUpdate = serde_json::from_value(input.clone()).unwrap();
         assert_eq!(serde_json::to_value(update).unwrap(), input);
+    }
+
+    #[test]
+    fn voice_state_debug_redacts_transport_credentials() {
+        let voice = VoiceState {
+            token: "voice-token-secret".to_owned(),
+            endpoint: "voice-endpoint-secret".to_owned(),
+            session_id: "voice-session-secret".to_owned(),
+            channel_id: Some("7".to_owned()),
+        };
+        let debug = format!("{voice:?}");
+        for secret in [
+            "voice-token-secret",
+            "voice-endpoint-secret",
+            "voice-session-secret",
+        ] {
+            assert!(!debug.contains(secret));
+        }
+        assert_eq!(debug.matches("<redacted>").count(), 3);
     }
 
     #[test]
