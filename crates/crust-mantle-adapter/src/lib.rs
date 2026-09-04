@@ -24,8 +24,8 @@ use mantle_core::{
 };
 use mantle_media::{
     HttpRangeOptions, MediaCancellation, MediaLimits, OutboundRoute, OutboundRouteContext,
-    OutboundRouteOutcome, OutboundRoutePolicy, YoutubeAudioSourceManager, YoutubeAuthentication,
-    YoutubeErrorKind, YoutubeLivePlaybackOptions, YoutubeLivePlaybackPoll,
+    OutboundRouteOutcome, OutboundRoutePolicy, RemoteHttpOptions, YoutubeAudioSourceManager,
+    YoutubeAuthentication, YoutubeErrorKind, YoutubeLivePlaybackOptions, YoutubeLivePlaybackPoll,
     YoutubeLivePlaybackSession, YoutubePlaybackError, YoutubePlaybackErrorKind,
     YoutubePlaybackFormatKind, YoutubePlaybackMode, YoutubePlaybackSession, YoutubeSourceItem,
     YoutubeSourceOptions, YoutubeSourceTrack,
@@ -41,6 +41,27 @@ use filters::CrustFilterFactory;
 const PLAYER_COMMAND_CAPACITY: usize = 32;
 const PLAYER_EVENT_CAPACITY: usize = 32;
 const FRAME_DURATION_MS: u16 = 20;
+
+/// Operator-facing source options mapped by the Crust server into Mantle's
+/// validated YouTube and HTTP policy. Codec and DSP settings remain Mantle-owned.
+#[derive(Clone, Copy, Debug)]
+pub struct MantleAdapterOptions {
+    pub allow_youtube_search: bool,
+    pub max_playlist_pages: usize,
+    pub connect_timeout: Duration,
+    pub request_timeout: Duration,
+}
+
+impl Default for MantleAdapterOptions {
+    fn default() -> Self {
+        Self {
+            allow_youtube_search: true,
+            max_playlist_pages: 6,
+            connect_timeout: Duration::from_secs(10),
+            request_timeout: Duration::from_secs(30),
+        }
+    }
+}
 
 thread_local! {
     static THREAD_ROUTE: Cell<Option<RouteEntry>> = const { Cell::new(None) };
@@ -170,11 +191,27 @@ pub struct RealMantleAdapter {
 impl RealMantleAdapter {
     /// Creates the production adapter with Mantle's default YouTube options.
     pub fn with_defaults(planner: RoutePlanner) -> Result<Self, AdapterError> {
-        Self::new(
-            planner,
-            YoutubeSourceOptions::default(),
-            YoutubeAuthentication::default(),
-        )
+        Self::with_options(planner, MantleAdapterOptions::default())
+    }
+
+    /// Creates the production adapter with the bounded, typed source policy
+    /// selected by Crust configuration. Mantle remains the owner of codecs,
+    /// resampling, filters, and playback state.
+    pub fn with_options(
+        planner: RoutePlanner,
+        settings: MantleAdapterOptions,
+    ) -> Result<Self, AdapterError> {
+        let options = YoutubeSourceOptions {
+            allow_search: settings.allow_youtube_search,
+            max_playlist_pages: settings.max_playlist_pages,
+            http: RemoteHttpOptions {
+                connect_timeout: settings.connect_timeout,
+                request_timeout: settings.request_timeout,
+                ..RemoteHttpOptions::default()
+            },
+            ..YoutubeSourceOptions::default()
+        };
+        Self::new(planner, options, YoutubeAuthentication::default())
     }
 
     /// Creates a routed YouTube manager and registers it for Mantle track serialization.

@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fs;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -51,6 +52,205 @@ pub(crate) struct StatsSnapshot {
 pub(crate) struct StatsCollector {
     started: Instant,
     runtime: Mutex<RuntimeSampler>,
+}
+
+/// Low-cardinality operational counters. This intentionally stays a small
+/// atomic registry instead of adding a second async telemetry pipeline: the
+/// Prometheus endpoint renders a bounded snapshot on demand.
+#[derive(Debug, Default)]
+pub(crate) struct MetricsRegistry {
+    rest_requests_total: AtomicU64,
+    rest_errors_total: AtomicU64,
+    rest_latency_micros_total: AtomicU64,
+    rest_latency_samples: AtomicU64,
+    loads_in_flight: AtomicU64,
+    loads_total: AtomicU64,
+    load_failures_total: AtomicU64,
+    load_latency_micros_total: AtomicU64,
+    load_latency_samples: AtomicU64,
+    load_shed_total: AtomicU64,
+    mantle_errors_total: AtomicU64,
+    events_dropped_total: AtomicU64,
+    events_coalesced_total: AtomicU64,
+    dave_transitions_total: AtomicU64,
+    dave_failures_total: AtomicU64,
+    voice_connections: AtomicU64,
+    voice_reconnects_total: AtomicU64,
+    voice_ping_micros: AtomicU64,
+    websocket_out_queue_depth: AtomicU64,
+    critical_event_backlog: AtomicU64,
+    player_command_queue_depth: AtomicU64,
+    tasks_tracked: AtomicU64,
+}
+
+impl MetricsRegistry {
+    pub(crate) fn observe_rest(&self, elapsed: Duration, status: u16) {
+        self.rest_requests_total.fetch_add(1, Ordering::Relaxed);
+        if status >= 400 {
+            self.rest_errors_total.fetch_add(1, Ordering::Relaxed);
+        }
+        self.rest_latency_micros_total.fetch_add(
+            elapsed.as_micros().try_into().unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.rest_latency_samples.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn load_started(&self) {
+        self.loads_in_flight.fetch_add(1, Ordering::Relaxed);
+        self.loads_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn load_finished(&self, elapsed: Duration, failed: bool) {
+        self.loads_in_flight.fetch_sub(1, Ordering::Relaxed);
+        if failed {
+            self.load_failures_total.fetch_add(1, Ordering::Relaxed);
+        }
+        self.load_latency_micros_total.fetch_add(
+            elapsed.as_micros().try_into().unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        self.load_latency_samples.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn load_shed(&self) {
+        self.load_shed_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn mantle_error(&self) {
+        self.mantle_errors_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn render_prometheus(
+        &self,
+        sessions: &SessionRegistry,
+        stats: &StatsCollector,
+        routeplanner_enabled: bool,
+        routeplanner_failures: usize,
+    ) -> String {
+        let counts = sessions.counts();
+        let snapshot = stats.rest(sessions);
+        let player_stats = sessions.player_stats();
+        let frames_sent = player_stats.iter().map(|player| player.sent).sum::<u64>();
+        let frames_nulled = player_stats.iter().map(|player| player.nulled).sum::<u64>();
+        let frames_deficit = player_stats
+            .iter()
+            .map(|player| player.deficit)
+            .sum::<u64>();
+        let avg_rest_latency = average(
+            self.rest_latency_micros_total.load(Ordering::Relaxed),
+            self.rest_latency_samples.load(Ordering::Relaxed),
+        );
+        let avg_load_latency = average(
+            self.load_latency_micros_total.load(Ordering::Relaxed),
+            self.load_latency_samples.load(Ordering::Relaxed),
+        );
+        let route_failures = u64::try_from(routeplanner_failures).unwrap_or(u64::MAX);
+        let route_enabled = u64::from(routeplanner_enabled);
+        let mut output = String::with_capacity(3_000);
+        macro_rules! gauge {
+            ($name:literal, $value:expr) => {
+                output.push_str(concat!("# TYPE ", $name, " gauge\n", $name, " "));
+                output.push_str(&$value.to_string());
+                output.push('\n');
+            };
+        }
+        macro_rules! counter {
+            ($name:literal, $value:expr) => {
+                output.push_str(concat!("# TYPE ", $name, " counter\n", $name, " "));
+                output.push_str(&$value.to_string());
+                output.push('\n');
+            };
+        }
+        gauge!("crust_sessions_active", counts.connected);
+        gauge!("crust_sessions_resumable", counts.resumable);
+        gauge!("crust_players_active", counts.players);
+        gauge!("crust_players_playing", snapshot.playing_players);
+        gauge!(
+            "crust_loads_in_flight",
+            self.loads_in_flight.load(Ordering::Relaxed)
+        );
+        counter!(
+            "crust_loads_total",
+            self.loads_total.load(Ordering::Relaxed)
+        );
+        counter!(
+            "crust_load_failures_total",
+            self.load_failures_total.load(Ordering::Relaxed)
+        );
+        gauge!("crust_load_latency_average_microseconds", avg_load_latency);
+        gauge!("crust_rest_latency_average_microseconds", avg_rest_latency);
+        counter!(
+            "crust_rest_requests_total",
+            self.rest_requests_total.load(Ordering::Relaxed)
+        );
+        counter!(
+            "crust_rest_errors_total",
+            self.rest_errors_total.load(Ordering::Relaxed)
+        );
+        gauge!(
+            "crust_websocket_out_queue_depth",
+            self.websocket_out_queue_depth.load(Ordering::Relaxed)
+        );
+        gauge!(
+            "crust_critical_event_backlog",
+            self.critical_event_backlog.load(Ordering::Relaxed)
+        );
+        gauge!(
+            "crust_player_command_queue_depth",
+            self.player_command_queue_depth.load(Ordering::Relaxed)
+        );
+        counter!(
+            "crust_events_dropped_or_coalesced_total",
+            self.events_dropped_total.load(Ordering::Relaxed)
+                + self.events_coalesced_total.load(Ordering::Relaxed)
+        );
+        gauge!(
+            "crust_voice_connections",
+            self.voice_connections.load(Ordering::Relaxed)
+        );
+        counter!(
+            "crust_voice_reconnects_total",
+            self.voice_reconnects_total.load(Ordering::Relaxed)
+        );
+        gauge!(
+            "crust_voice_ping_microseconds",
+            self.voice_ping_micros.load(Ordering::Relaxed)
+        );
+        counter!("crust_frames_sent_total", frames_sent);
+        counter!("crust_frames_nulled_total", frames_nulled);
+        counter!("crust_frames_deficit_total", frames_deficit);
+        counter!(
+            "crust_dave_transitions_total",
+            self.dave_transitions_total.load(Ordering::Relaxed)
+        );
+        counter!(
+            "crust_dave_failures_total",
+            self.dave_failures_total.load(Ordering::Relaxed)
+        );
+        gauge!("crust_routeplanner_enabled", route_enabled);
+        gauge!("crust_routeplanner_failures", route_failures);
+        gauge!("crust_routeplanner_selected_address_count", 0_u64);
+        counter!(
+            "crust_mantle_errors_total",
+            self.mantle_errors_total.load(Ordering::Relaxed)
+        );
+        gauge!("crust_process_rss_bytes", snapshot.memory.used);
+        gauge!("crust_process_cpu_ratio", snapshot.cpu.lavalink_load);
+        gauge!(
+            "crust_tasks_tracked",
+            self.tasks_tracked.load(Ordering::Relaxed)
+        );
+        counter!(
+            "crust_load_shed_total",
+            self.load_shed_total.load(Ordering::Relaxed)
+        );
+        output
+    }
+}
+
+fn average(total: u64, samples: u64) -> u64 {
+    total.checked_div(samples.max(1)).unwrap_or(0)
 }
 
 impl std::fmt::Debug for StatsCollector {

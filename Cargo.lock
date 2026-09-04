@@ -1977,7 +1977,7 @@ dependencies = [
 
 [[package]]
 name = "oto"
-version = "0.0.0"
+version = "1.0.0"
 dependencies = [
  "aes-gcm 0.11.1",
  "chacha20poly1305 0.11.0",
@@ -1993,7 +1993,7 @@ dependencies = [
 
 [[package]]
 name = "oto-testkit"
-version = "0.0.0"
+version = "1.0.0"
 dependencies = [
  "aes-gcm 0.11.1",
  "chacha20poly1305 0.11.0",

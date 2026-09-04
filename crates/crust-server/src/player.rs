@@ -29,6 +29,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::config::FilterConfig;
 use crate::session::{
     PublishError, SessionHandle, SessionPlayer, SessionPlayerRefresh, SessionPlayerStats,
 };
@@ -790,6 +791,69 @@ pub fn validate_update(update: &PlayerUpdate) -> Result<(), PlayerError> {
         ));
     }
     Ok(())
+}
+
+/// Returns the protocol names of filters present in a request but disabled by
+/// server configuration. The caller owns formatting the reference-compatible
+/// error message.
+#[must_use]
+pub fn disabled_filter_names(filters: &Filters, enabled: &FilterConfig) -> Vec<&'static str> {
+    let disabled = [
+        (
+            "volume",
+            enabled.volume,
+            matches!(filters.volume, PatchField::Value(_)),
+        ),
+        (
+            "equalizer",
+            enabled.equalizer,
+            matches!(filters.equalizer, PatchField::Value(_)),
+        ),
+        (
+            "karaoke",
+            enabled.karaoke,
+            matches!(filters.karaoke, PatchField::Value(_)),
+        ),
+        (
+            "timescale",
+            enabled.timescale,
+            matches!(filters.timescale, PatchField::Value(_)),
+        ),
+        (
+            "tremolo",
+            enabled.tremolo,
+            matches!(filters.tremolo, PatchField::Value(_)),
+        ),
+        (
+            "vibrato",
+            enabled.vibrato,
+            matches!(filters.vibrato, PatchField::Value(_)),
+        ),
+        (
+            "distortion",
+            enabled.distortion,
+            matches!(filters.distortion, PatchField::Value(_)),
+        ),
+        (
+            "rotation",
+            enabled.rotation,
+            matches!(filters.rotation, PatchField::Value(_)),
+        ),
+        (
+            "channelMix",
+            enabled.channel_mix,
+            matches!(filters.channel_mix, PatchField::Value(_)),
+        ),
+        (
+            "lowPass",
+            enabled.low_pass,
+            matches!(filters.low_pass, PatchField::Value(_)),
+        ),
+    ];
+    disabled
+        .into_iter()
+        .filter_map(|(name, is_enabled, present)| (!is_enabled && present).then_some(name))
+        .collect()
 }
 
 async fn apply_update(

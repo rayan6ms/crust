@@ -9,7 +9,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::rejection::QueryRejection;
@@ -43,17 +43,17 @@ use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 
 use config::ServerConfig;
-use player::{PlayerError, PlayerExecutor, PlayerHandle, validate_update};
+use player::{PlayerError, PlayerExecutor, PlayerHandle, disabled_filter_names, validate_update};
 use session::{
     PlayerAdmissionError, PrepareError, PreparedSession, SessionClock, SessionPlayer,
     SessionRegistry, SessionSettingsUpdate, SystemSessionClock,
 };
-use stats::{StatsCollector, StatsSnapshot};
+use stats::{MetricsRegistry, StatsCollector, StatsSnapshot};
 
 pub const LAVALINK_VERSION: &str = "4.2.2";
 pub const MANTLE_REVISION: &str = "55b718058a36731e1c757b5edf53f432dc01ce3e";
 pub const CRUST_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const OTO_VERSION: &str = "0.0.0";
+pub const OTO_VERSION: &str = "1.0.0";
 const MAX_ROUTE_PLANNER_BODY_BYTES: usize = 4 * 1024;
 
 struct AppState {
@@ -65,7 +65,9 @@ struct AppState {
     load_requests: Arc<Semaphore>,
     source_requests: Arc<Semaphore>,
     stats: StatsCollector,
+    metrics: MetricsRegistry,
     route_planner: RoutePlanner,
+    accepting: std::sync::atomic::AtomicBool,
 }
 
 impl AppState {
@@ -101,7 +103,9 @@ impl AppState {
             load_requests,
             source_requests,
             stats: StatsCollector::new(),
+            metrics: MetricsRegistry::default(),
             route_planner,
+            accepting: std::sync::atomic::AtomicBool::new(true),
         }
     }
 }
@@ -226,9 +230,11 @@ impl CrustServer {
         let shutdown_for_server = shutdown.clone();
         let sessions = self.state.sessions.clone();
         let players = self.state.players.clone();
+        let state_for_shutdown = Arc::clone(&self.state);
         let graceful = axum::serve(listener, application.into_make_service())
             .with_graceful_shutdown(async move {
                 shutdown_for_server.cancelled().await;
+                state_for_shutdown.accepting.store(false, Ordering::Release);
                 sessions.shutdown();
             });
         let shutdown_sequence = async move {
@@ -301,7 +307,11 @@ impl Drop for RunningServer {
 }
 
 fn router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let metrics_path = state.config.metrics.endpoint.clone();
+    let metrics_enabled = state.config.metrics.prometheus.enabled;
+    let mut router = Router::new()
+        .route("/health/live", get(liveness))
+        .route("/health/ready", get(readiness))
         .route("/version", get(version))
         .route("/v4/info", get(info))
         .route("/v4/stats", get(stats))
@@ -321,12 +331,28 @@ fn router(state: Arc<AppState>) -> Router {
         .route(
             "/v4/sessions/{session_id}/players/{guild_id}",
             get(get_player).patch(patch_player).delete(delete_player),
-        )
+        );
+    if metrics_enabled {
+        router = router.route(&metrics_path, get(prometheus_metrics));
+    }
+    router
         .fallback(fallback)
         .layer(axum::extract::DefaultBodyLimit::max(
             state.config.max_request_body_bytes,
         ))
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &Request| {
+                tracing::info_span!(
+                    "http_request",
+                    method = %request.method(),
+                    path = %request.uri().path(),
+                )
+            }),
+        )
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            observe_request,
+        ))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             authorize,
@@ -336,6 +362,68 @@ fn router(state: Arc<AppState>) -> Router {
             response_headers,
         ))
         .with_state(state)
+}
+
+async fn liveness() -> Response {
+    (StatusCode::OK, "ok").into_response()
+}
+
+async fn readiness(State(state): State<Arc<AppState>>) -> Response {
+    if state.accepting.load(Ordering::Acquire) {
+        (StatusCode::OK, "ready").into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "shutting down").into_response()
+    }
+}
+
+async fn prometheus_metrics(State(state): State<Arc<AppState>>) -> Response {
+    let failures = state
+        .route_planner
+        .snapshot()
+        .map_or(0, |snapshot| snapshot.failing_addresses.len());
+    let body = state.metrics.render_prometheus(
+        &state.sessions,
+        &state.stats,
+        state.route_planner.is_enabled(),
+        failures,
+    );
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
+        .into_response()
+}
+
+async fn observe_request(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let started = Instant::now();
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let client = request
+        .headers()
+        .get("user-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let response = next.run(request).await;
+    let status = response.status();
+    state
+        .metrics
+        .observe_rest(started.elapsed(), status.as_u16());
+    if state.config.logging.request.enabled {
+        tracing::info!(
+            %method,
+            %path,
+            status = status.as_u16(),
+            latency_ms = started.elapsed().as_secs_f64() * 1_000.0,
+            user_id = ?client,
+            "request completed"
+        );
+    }
+    response
 }
 
 async fn response_headers(
@@ -361,8 +449,19 @@ async fn response_headers(
 }
 
 async fn authorize(State(state): State<Arc<AppState>>, request: Request, next: Next) -> Response {
+    let path = request.uri().path();
+    // Health probes and an explicitly enabled Prometheus scrape endpoint are
+    // intentionally unauthenticated so orchestrators can observe a node
+    // before Lavalink clients are configured. All protocol routes retain the
+    // exact Authorization behavior below.
+    if path == "/health/live"
+        || path == "/health/ready"
+        || (state.config.metrics.prometheus.enabled && path == state.config.metrics.endpoint)
+    {
+        return next.run(request).await;
+    }
     let supplied = request.headers().get(AUTHORIZATION);
-    let websocket = request.uri().path() == "/v4/websocket";
+    let websocket = path == "/v4/websocket";
     let Some(supplied) = supplied else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
@@ -394,7 +493,9 @@ async fn version() -> Response {
     response
 }
 
-async fn info() -> Json<Value> {
+async fn info(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let source_managers = enabled_source_managers(&state.config);
+    let filters = enabled_filters(&state.config);
     Json(json!({
         "version": {
             "semver": LAVALINK_VERSION,
@@ -411,16 +512,15 @@ async fn info() -> Json<Value> {
         },
         "jvm": format!("Rust {}", env!("CARGO_PKG_RUST_VERSION")),
         "lavaplayer": format!("Mantle {}", &MANTLE_REVISION[..12]),
-        "sourceManagers": ["youtube"],
-        "filters": [
-            "volume", "equalizer", "karaoke", "timescale", "tremolo", "vibrato",
-            "distortion", "rotation", "channelMix", "lowPass"
-        ],
+        "sourceManagers": source_managers,
+        "filters": filters,
         "plugins": []
     }))
 }
 
 async fn crust_info(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let source_managers = enabled_source_managers(&state.config);
+    let filters = enabled_filters(&state.config);
     Json(json!({
         "name": "Crust",
         "version": CRUST_VERSION,
@@ -458,8 +558,49 @@ async fn crust_info(State(state): State<Arc<AppState>>) -> Json<Value> {
             "runtimeRefreshIntervalMs": 30_000,
             "websocketIntervalMs": u64::try_from(state.config.stats_interval.as_millis())
                 .unwrap_or(u64::MAX),
+        },
+        "enabled": {
+            "sourceManagers": source_managers,
+            "filters": filters,
+        },
+        "limits": {
+            "requestBodyBytes": state.config.max_request_body_bytes,
+            "sessions": state.config.max_sessions,
+            "players": state.config.max_players,
+            "playerCommandCapacity": state.config.player_command_capacity,
         }
     }))
+}
+
+/// Return only source managers that Crust actually implements. Mantle owns
+/// the Youtube source; the other Lavalink names remain accepted configuration
+/// keys for migration but are not advertised until a corresponding adapter is
+/// admitted.
+fn enabled_source_managers(config: &ServerConfig) -> Vec<&'static str> {
+    config
+        .sources
+        .youtube
+        .then_some("youtube")
+        .into_iter()
+        .collect()
+}
+
+fn enabled_filters(config: &ServerConfig) -> Vec<&'static str> {
+    [
+        ("volume", config.filters.volume),
+        ("equalizer", config.filters.equalizer),
+        ("karaoke", config.filters.karaoke),
+        ("timescale", config.filters.timescale),
+        ("tremolo", config.filters.tremolo),
+        ("vibrato", config.filters.vibrato),
+        ("distortion", config.filters.distortion),
+        ("rotation", config.filters.rotation),
+        ("channelMix", config.filters.channel_mix),
+        ("lowPass", config.filters.low_pass),
+    ]
+    .into_iter()
+    .filter_map(|(name, enabled)| enabled.then_some(name))
+    .collect()
 }
 
 const fn runtime_stats_provider() -> &'static str {
@@ -719,12 +860,24 @@ async fn load_tracks(
             trace,
         );
     };
+    // Mantle is Crust's only admitted source manager. Preserve Lavalink's
+    // disabled-manager behavior (a load that has no matching manager yields an
+    // empty result) without trying to classify identifiers or duplicating
+    // source loading in Crust.
+    if !state.config.sources.youtube {
+        return Json(json!({"loadType": "empty", "data": null})).into_response();
+    }
     let (adapter, _load_permit, _source_permit) = match acquire_load_request(&state) {
         Ok(admission) => admission,
-        Err(error) => return load_admission_error(error, uri.path()),
+        Err(error) => {
+            state.metrics.load_shed();
+            return load_admission_error(error, uri.path());
+        }
     };
     let cancellation = RequestCancellation::new();
-    match adapter
+    let started = Instant::now();
+    state.metrics.load_started();
+    let result = adapter
         .load(
             LoadRequest {
                 identifier,
@@ -732,13 +885,20 @@ async fn load_tracks(
             },
             cancellation.token(),
         )
-        .await
-    {
+        .await;
+    state
+        .metrics
+        .load_finished(started.elapsed(), result.is_err());
+    match result {
         Ok(outcome) => Json(load_result_value(outcome)).into_response(),
         Err(error) if error.kind == AdapterErrorKind::LoadFailed => {
+            state.metrics.mantle_error();
             Json(load_failed_value(error)).into_response()
         }
-        Err(error) => media_adapter_error(error, uri.path()),
+        Err(error) => {
+            state.metrics.mantle_error();
+            media_adapter_error(error, uri.path())
+        }
     }
 }
 
@@ -775,7 +935,10 @@ async fn decode_track(
         .await
     {
         Ok(track) => Json(track::loaded_track_value(&track)).into_response(),
-        Err(error) => media_adapter_error(error, uri.path()),
+        Err(error) => {
+            state.metrics.mantle_error();
+            media_adapter_error(error, uri.path())
+        }
     }
 }
 
@@ -833,7 +996,10 @@ async fn decode_tracks(State(state): State<Arc<AppState>>, request: Request) -> 
             .await
         {
             Ok(track) => tracks.push(track::loaded_track_value(&track)),
-            Err(error) => return media_adapter_error(error, &path),
+            Err(error) => {
+                state.metrics.mantle_error();
+                return media_adapter_error(error, &path);
+            }
         }
     }
     Json(Value::Array(tracks)).into_response()
@@ -1358,6 +1524,16 @@ async fn patch_player(
     };
     if let Err(error) = validate_update(&update) {
         return player_error(error, &path);
+    }
+    if let PatchField::Value(filters) = &update.filters {
+        let disabled = disabled_filter_names(filters, &state.config.filters);
+        if !disabled.is_empty() {
+            let message = format!(
+                "Following filters are disabled in the config: {}",
+                disabled.join(", ")
+            );
+            return protocol_error(StatusCode::BAD_REQUEST, &message, &path, false);
+        }
     }
 
     let owned = if let Some(existing) = session.player(&guild_id) {
