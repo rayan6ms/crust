@@ -1429,10 +1429,15 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::path::PathBuf;
+    use std::sync::Barrier;
     use std::thread;
+    use std::time::Instant;
 
     use crust_testkit::{ADAPTER_CONFORMANCE_CHECKS, run_adapter_conformance};
-    use mantle_media::{HttpNetworkAccess, RemoteHttpClient, RemoteHttpOptions, RemoteHttpRequest};
+    use mantle_media::{
+        HttpNetworkAccess, MediaSession, RemoteHttpClient, RemoteHttpOptions, RemoteHttpRequest,
+    };
 
     use super::*;
 
@@ -1522,5 +1527,287 @@ mod tests {
                 IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3)),
             ]
         );
+    }
+
+    struct P18MediaWorkerResult {
+        frames: usize,
+        deficits: usize,
+        tracks_advancing: usize,
+        passthrough_sessions: usize,
+        transcode_sessions: usize,
+        pacing_jitter_nanos: Vec<u64>,
+    }
+
+    fn p18_process_pss_kib() -> u64 {
+        std::fs::read_to_string("/proc/self/smaps_rollup")
+            .expect("process PSS is readable")
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Pss:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .expect("PSS is present")
+    }
+
+    fn p18_process_threads() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .expect("process status is readable")
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Threads:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .expect("thread count is present")
+    }
+
+    fn p18_process_cpu_ticks() -> u64 {
+        let stat = std::fs::read_to_string("/proc/self/stat").expect("process stat is readable");
+        let fields = stat
+            .rsplit_once(") ")
+            .expect("process command terminator is present")
+            .1
+            .split_whitespace()
+            .collect::<Vec<_>>();
+        let user: u64 = fields[11].parse().expect("user CPU ticks");
+        let system: u64 = fields[12].parse().expect("system CPU ticks");
+        user + system
+    }
+
+    fn p18_percentile(samples: &mut [u64], permille: usize) -> u64 {
+        if samples.is_empty() {
+            return 0;
+        }
+        samples.sort_unstable();
+        samples[(samples.len() - 1).saturating_mul(permille) / 1_000]
+    }
+
+    fn p18_sleep_until(target: Instant) {
+        if let Some(remaining) = target.checked_duration_since(Instant::now()) {
+            thread::sleep(remaining);
+        }
+    }
+
+    fn p18_run_media_ticks(
+        sessions: &mut [YoutubePlaybackSession],
+        outputs: &mut [EncodedFrameSlot],
+        ticks: usize,
+        seek: bool,
+    ) -> (usize, usize, Vec<u64>) {
+        let frame_duration = Duration::from_millis(20);
+        let mut target = Instant::now();
+        let mut frames = 0;
+        let mut deficits = 0;
+        let mut jitter = Vec::with_capacity(ticks);
+        for tick in 0..ticks {
+            target += frame_duration;
+            p18_sleep_until(target);
+            let actual = Instant::now();
+            let error = if actual >= target {
+                actual.duration_since(target)
+            } else {
+                target.duration_since(actual)
+            };
+            jitter.push(u64::try_from(error.as_nanos()).unwrap_or(u64::MAX));
+            if seek && tick.is_multiple_of(50) {
+                let position = Duration::from_secs(30 + u64::try_from(tick / 50).unwrap());
+                for session in &mut *sessions {
+                    session
+                        .seek(position)
+                        .expect("offline fixture seek succeeds");
+                }
+            }
+            for (session, output) in sessions.iter_mut().zip(outputs.iter_mut()) {
+                if session
+                    .read_frame(output)
+                    .expect("Mantle offline playback produces a bounded result")
+                {
+                    frames += 1;
+                } else {
+                    deficits += 1;
+                }
+            }
+        }
+        (frames, deficits, jitter)
+    }
+
+    #[test]
+    #[ignore = "release-only P18 Mantle full-playback performance gate"]
+    #[allow(clippy::too_many_lines)]
+    fn p18_offline_mantle_playback_benchmark_report() {
+        let fixture = PathBuf::from(
+            std::env::var_os("CRUST_P18_MEDIA_FIXTURE").expect("fixture path is configured"),
+        );
+        let codec = std::env::var("CRUST_P18_MEDIA_CODEC").expect("codec is configured");
+        let mode = std::env::var("CRUST_P18_MEDIA_MODE").expect("mode is configured");
+        let players: usize = std::env::var("CRUST_P18_MEDIA_PLAYERS")
+            .expect("player count is configured")
+            .parse()
+            .expect("player count is numeric");
+        assert!(matches!(codec.as_str(), "opus" | "mp3" | "aac" | "flac"));
+        assert!(matches!(mode.as_str(), "plain" | "filter" | "seek"));
+        assert!((1..=100).contains(&players));
+
+        let workers = players.min(4);
+        let barrier = Arc::new(Barrier::new(workers + 1));
+        let baseline_pss_kib = p18_process_pss_kib();
+        let baseline_threads = p18_process_threads();
+        let mut handles = Vec::with_capacity(workers);
+        for worker in 0..workers {
+            let assigned = players / workers + usize::from(worker < players % workers);
+            let fixture = fixture.clone();
+            let mode = mode.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                let factory = CrustFilterFactory(FilterConfiguration {
+                    timescale: Some(crust::filters::Timescale {
+                        speed: 1.10,
+                        pitch: 1.0,
+                        rate: 1.0,
+                    }),
+                    ..FilterConfiguration::default()
+                });
+                let mut sessions = Vec::with_capacity(assigned);
+                let mut outputs = Vec::with_capacity(assigned);
+                for _ in 0..assigned {
+                    let media = MediaSession::open_file(&fixture, MediaLimits::default())
+                        .expect("fixture probes through Mantle");
+                    let mut playback = YoutubePlaybackSession::from_probed_media_session(media)
+                        .expect("fixture enters Mantle's complete playback pipeline");
+                    if mode == "filter" {
+                        playback
+                            .set_filter_factory(Some(&factory))
+                            .expect("Crust filter factory installs through Mantle");
+                    }
+                    sessions.push(playback);
+                    outputs.push(EncodedFrameSlot::new());
+                }
+                let passthrough_sessions = sessions
+                    .iter()
+                    .filter(|session| session.mode() == YoutubePlaybackMode::OpusPassthrough)
+                    .count();
+                let transcode_sessions = assigned - passthrough_sessions;
+
+                barrier.wait();
+                barrier.wait();
+                let _ = p18_run_media_ticks(&mut sessions, &mut outputs, 250, false);
+                barrier.wait();
+                barrier.wait();
+                let (frames, deficits, pacing_jitter_nanos) =
+                    p18_run_media_ticks(&mut sessions, &mut outputs, 500, mode == "seek");
+                barrier.wait();
+
+                P18MediaWorkerResult {
+                    frames,
+                    deficits,
+                    tracks_advancing: sessions
+                        .iter()
+                        .filter(|session| {
+                            session
+                                .source_media_position()
+                                .is_some_and(|position| !position.is_zero())
+                        })
+                        .count(),
+                    passthrough_sessions,
+                    transcode_sessions,
+                    pacing_jitter_nanos,
+                }
+            }));
+        }
+
+        barrier.wait();
+        let staged_pss_kib = p18_process_pss_kib();
+        let staged_threads = p18_process_threads();
+        barrier.wait();
+        barrier.wait();
+        let warmed_pss_kib = p18_process_pss_kib();
+        let warmed_threads = p18_process_threads();
+        let cpu_before = p18_process_cpu_ticks();
+        let measurement_started = Instant::now();
+        barrier.wait();
+        barrier.wait();
+        let measurement_elapsed = measurement_started.elapsed();
+        let cpu_ticks = p18_process_cpu_ticks().saturating_sub(cpu_before);
+        let active_pss_kib = p18_process_pss_kib();
+        let active_threads = p18_process_threads();
+
+        let mut frames = 0;
+        let mut deficits = 0;
+        let mut tracks_advancing = 0;
+        let mut passthrough_sessions = 0;
+        let mut transcode_sessions = 0;
+        let mut pacing_jitter_nanos = Vec::with_capacity(workers * 500);
+        for handle in handles {
+            let result = handle.join().expect("media worker does not panic");
+            frames += result.frames;
+            deficits += result.deficits;
+            tracks_advancing += result.tracks_advancing;
+            passthrough_sessions += result.passthrough_sessions;
+            transcode_sessions += result.transcode_sessions;
+            pacing_jitter_nanos.extend(result.pacing_jitter_nanos);
+        }
+        let after_join_threads = p18_process_threads();
+        let p50_jitter = p18_percentile(&mut pacing_jitter_nanos, 500);
+        let p95_jitter = p18_percentile(&mut pacing_jitter_nanos, 950);
+        let p99_jitter = p18_percentile(&mut pacing_jitter_nanos, 990);
+        let expected_frames = players * 500;
+        assert_eq!(frames, expected_frames, "all paced frames are produced");
+        assert_eq!(deficits, 0, "no active track has a frame deficit");
+        assert_eq!(tracks_advancing, players, "every source position advances");
+        if codec == "opus" && mode != "filter" {
+            assert_eq!(passthrough_sessions, players);
+        } else {
+            assert_eq!(transcode_sessions, players);
+        }
+
+        let elapsed_seconds = measurement_elapsed.as_secs_f64();
+        let report = serde_json::json!({
+            "schemaVersion": 1,
+            "benchmarkId": "mantle-offline-complete-playback",
+            "scope": "Mantle-owned finite playback through YoutubePlaybackSession::read_frame",
+            "codec": codec,
+            "mode": mode,
+            "players": players,
+            "workers": workers,
+            "warmupSeconds": 5,
+            "measurementSeconds": elapsed_seconds,
+            "frames": frames,
+            "expectedFrames": expected_frames,
+            "deficits": deficits,
+            "tracksAdvancing": tracks_advancing,
+            "modes": {
+                "opusPassthrough": passthrough_sessions,
+                "transcode": transcode_sessions
+            },
+            "cpu": {
+                "processTicks": cpu_ticks,
+                "clockTicksPerSecond": 100,
+                "processCpuCoreEquivalent": cpu_ticks as f64 / 100.0 / elapsed_seconds
+            },
+            "memoryKiB": {
+                "baselinePss": baseline_pss_kib,
+                "stagedPss": staged_pss_kib,
+                "warmedPss": warmed_pss_kib,
+                "activePss": active_pss_kib
+            },
+            "threads": {
+                "baseline": baseline_threads,
+                "staged": staged_threads,
+                "warmed": warmed_threads,
+                "active": active_threads,
+                "afterJoin": after_join_threads
+            },
+            "pacingJitterNanos": {
+                "p50": p50_jitter,
+                "p95": p95_jitter,
+                "p99": p99_jitter
+            }
+        });
+        println!("P18_MANTLE_MEDIA={report}");
     }
 }

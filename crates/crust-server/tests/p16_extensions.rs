@@ -62,7 +62,7 @@ async fn in_tree_extensions_are_bounded_sorted_and_reported_separately() {
         serde_json::json!([
             {
                 "id": "crust.mantle",
-                "version": "55b718058a36731e1c757b5edf53f432dc01ce3e",
+                "version": "29aee076d294856d39b03e6dccdadf5672f0250a",
                 "kind": "media",
                 "capabilities": ["source:youtube", "media:opus", "media:pcm-filters"]
             },

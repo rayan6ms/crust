@@ -62,7 +62,7 @@ use session::{
 use stats::{MetricsRegistry, StatsCollector, StatsSnapshot};
 
 pub const LAVALINK_VERSION: &str = "4.2.2";
-pub const MANTLE_REVISION: &str = "55b718058a36731e1c757b5edf53f432dc01ce3e";
+pub const MANTLE_REVISION: &str = "29aee076d294856d39b03e6dccdadf5672f0250a";
 pub const CRUST_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const OTO_VERSION: &str = "1.0.0";
 const MAX_ROUTE_PLANNER_BODY_BYTES: usize = 4 * 1024;
