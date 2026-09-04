@@ -15,6 +15,7 @@ use crust::media::{
     PlayerStatus, PlaylistInfo, ProcessingMode, TrackEndReason, TrackMetadata,
 };
 use crust::routeplanner::{RouteOutcome, RoutePlanner};
+use crust::voice::OpusPacket;
 use mantle_audio::EncodedFrameSlot;
 use mantle_core::{
     DecodedSourceTrack, LoadedSourceItem, SerializationLimits, SourceCancellation, SourceLoad,
@@ -463,7 +464,17 @@ enum PlaybackSession {
     Fixture(Box<FixtureSession>),
 }
 
-type EncodedPlaybackFrame = (Arc<[u8]>, Duration);
+type EncodedPlaybackFrame = (OpusPacket, Duration);
+
+// The frame is an inline bounded Opus packet. Boxing this variant would add a
+// heap allocation to every Mantle-to-Crust frame, so the intentional size
+// tradeoff is retained and covered by the P13 allocation benchmark.
+#[allow(clippy::large_enum_variant)]
+enum PlaybackFramePoll {
+    Frame(EncodedPlaybackFrame),
+    Wait(Duration),
+    Ended,
+}
 
 impl PlaybackSession {
     fn mode(&self) -> ProcessingMode {
@@ -524,35 +535,63 @@ impl PlaybackSession {
         }
     }
 
-    fn read_frame(&mut self) -> Result<Option<EncodedPlaybackFrame>, AdapterError> {
+    fn read_frame(&mut self) -> Result<PlaybackFramePoll, AdapterError> {
         let mut output = EncodedFrameSlot::new();
-        let produced = match self {
-            Self::Finite(session) => session
-                .read_frame(&mut output)
-                .map_err(map_playback_error)?,
+        let poll = match self {
+            Self::Finite(session) => {
+                if session
+                    .read_frame(&mut output)
+                    .map_err(map_playback_error)?
+                {
+                    PlaybackFramePoll::Frame((
+                        OpusPacket::copy_from(output.data()).map_err(|_| {
+                            invalid_operation("Mantle produced an invalid Discord Opus frame")
+                        })?,
+                        output.timestamp().unwrap_or_default(),
+                    ))
+                } else {
+                    PlaybackFramePoll::Ended
+                }
+            }
             Self::Live { session, now } => {
+                let polled_at = *now;
                 let poll = session
-                    .poll_frame(*now, &mut output)
+                    .poll_frame(polled_at, &mut output)
                     .map_err(map_playback_error)?;
                 match poll {
-                    YoutubeLivePlaybackPoll::Frame => true,
+                    YoutubeLivePlaybackPoll::Frame => PlaybackFramePoll::Frame((
+                        OpusPacket::copy_from(output.data()).map_err(|_| {
+                            invalid_operation("Mantle produced an invalid Discord Opus frame")
+                        })?,
+                        output.timestamp().unwrap_or_default(),
+                    )),
                     YoutubeLivePlaybackPoll::WaitUntil(deadline) => {
                         *now = deadline;
-                        false
+                        PlaybackFramePoll::Wait(deadline.saturating_sub(polled_at))
                     }
-                    YoutubeLivePlaybackPoll::Ended | YoutubeLivePlaybackPoll::Exhausted => false,
+                    YoutubeLivePlaybackPoll::Ended | YoutubeLivePlaybackPoll::Exhausted => {
+                        PlaybackFramePoll::Ended
+                    }
                 }
             }
             #[cfg(test)]
-            Self::Fixture(session) => return session.read_frame(),
+            Self::Fixture(session) => {
+                return session
+                    .read_frame()
+                    .map(|frame| frame.map_or(PlaybackFramePoll::Ended, PlaybackFramePoll::Frame));
+            }
         };
-        Ok(produced.then(|| {
-            (
-                Arc::<[u8]>::from(output.data()),
-                output.timestamp().unwrap_or_default(),
-            )
-        }))
+        Ok(poll)
     }
+}
+
+// See `PlaybackFramePoll`: keeping the bounded media frame inline preserves
+// the measured no-extra-media-allocation path.
+#[allow(clippy::large_enum_variant)]
+enum PlayerFramePoll {
+    Frame(MediaFrame),
+    Wait(Duration),
+    Ended,
 }
 
 enum PlayerCommand {
@@ -580,7 +619,7 @@ enum PlayerCommand {
         reply: oneshot::Sender<Result<PlayerSnapshot, AdapterError>>,
     },
     NextFrame {
-        reply: oneshot::Sender<Result<Option<MediaFrame>, AdapterError>>,
+        reply: oneshot::Sender<Result<PlayerFramePoll, AdapterError>>,
     },
     NextEvent {
         reply: oneshot::Sender<Result<Option<MediaEvent>, AdapterError>>,
@@ -767,35 +806,32 @@ impl PlayerActor {
         Ok(())
     }
 
-    async fn next_frame(&mut self) -> Result<Option<MediaFrame>, AdapterError> {
+    async fn next_frame(&mut self) -> Result<PlayerFramePoll, AdapterError> {
         if self.paused || self.track.is_none() {
-            return Ok(None);
+            return Ok(PlayerFramePoll::Ended);
         }
-        let frame = self.with_session(PlaybackSession::read_frame).await?;
-        let Some((payload, timestamp)) = frame else {
-            #[cfg(test)]
-            if self
-                .track
-                .as_ref()
-                .is_some_and(|track| track.metadata.identifier == "fixture:short")
-            {
-                self.stop(TrackEndReason::Finished)?;
+        match self.with_session(PlaybackSession::read_frame).await? {
+            PlaybackFramePoll::Frame((payload, timestamp)) => {
+                self.position = self
+                    .session
+                    .as_ref()
+                    .and_then(PlaybackSession::source_media_position)
+                    .unwrap_or(timestamp);
+                let frame = MediaFrame {
+                    sequence: self.sequence,
+                    duration_ms: FRAME_DURATION_MS,
+                    format: FrameFormat::OpusLike,
+                    payload,
+                };
+                self.sequence = self.sequence.saturating_add(1);
+                Ok(PlayerFramePoll::Frame(frame))
             }
-            return Ok(None);
-        };
-        self.position = self
-            .session
-            .as_ref()
-            .and_then(PlaybackSession::source_media_position)
-            .unwrap_or(timestamp);
-        let frame = MediaFrame {
-            sequence: self.sequence,
-            duration_ms: FRAME_DURATION_MS,
-            format: FrameFormat::OpusLike,
-            payload,
-        };
-        self.sequence = self.sequence.saturating_add(1);
-        Ok(Some(frame))
+            PlaybackFramePoll::Wait(duration) => Ok(PlayerFramePoll::Wait(duration)),
+            PlaybackFramePoll::Ended => {
+                self.stop(TrackEndReason::Finished)?;
+                Ok(PlayerFramePoll::Ended)
+            }
+        }
     }
 
     async fn with_session<T: Send + 'static>(
@@ -988,10 +1024,25 @@ impl MantlePlayer for RealMantlePlayer {
         cancellation: CancellationToken,
     ) -> AdapterFuture<'_, Result<Option<MediaFrame>, AdapterError>> {
         Box::pin(async move {
-            self.request(Some(&cancellation), |reply| PlayerCommand::NextFrame {
-                reply,
-            })
-            .await
+            loop {
+                let poll = self
+                    .request(Some(&cancellation), |reply| PlayerCommand::NextFrame {
+                        reply,
+                    })
+                    .await?;
+                match poll {
+                    PlayerFramePoll::Frame(frame) => return Ok(Some(frame)),
+                    PlayerFramePoll::Ended => return Ok(None),
+                    PlayerFramePoll::Wait(duration) => {
+                        tokio::select! {
+                            biased;
+                            () = cancellation.cancelled() => return Err(cancelled()),
+                            () = self.shutdown.cancelled() => return Err(shutdown()),
+                            () = tokio::time::sleep(duration) => {}
+                        }
+                    }
+                }
+            }
         })
     }
 
@@ -1223,7 +1274,13 @@ impl FixtureSession {
             .engine
             .provide(self.player, Duration::ZERO)
             .map_err(|_| invalid_operation("Mantle fixture frame failed"))?;
-        Ok(frame.map(|frame| (Arc::from(frame.data), frame.timecode)))
+        frame
+            .map(|frame| {
+                OpusPacket::copy_from(&frame.data)
+                    .map(|payload| (payload, frame.timecode))
+                    .map_err(|_| invalid_operation("Mantle fixture produced an invalid Opus frame"))
+            })
+            .transpose()
     }
 }
 

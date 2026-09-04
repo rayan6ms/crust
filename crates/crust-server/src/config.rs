@@ -8,12 +8,14 @@ use serde::Deserialize;
 
 const MAX_PASSWORD_BYTES: usize = 16 * 1024;
 const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PLAYER_UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_PLAYER_EXECUTOR_SHARDS: usize = 1024;
 const MAX_PLAYER_COMMAND_CAPACITY: usize = 1_048_576;
 const MAX_CONCURRENT_LOADS: usize = 1_048_576;
 const MAX_BATCH_DECODE_TRACKS: usize = 1_048_576;
 const MAX_CONCURRENT_SOURCE_REQUESTS: usize = 1_048_576;
+const MAX_CONCURRENT_VOICE_CONNECTS: usize = 1_048_576;
 
 #[derive(Clone)]
 pub struct ServerConfig {
@@ -30,6 +32,8 @@ pub struct ServerConfig {
     pub max_concurrent_loads: usize,
     pub max_batch_decode_tracks: usize,
     pub max_concurrent_source_requests: usize,
+    pub max_concurrent_voice_connects: usize,
+    pub player_update_interval: Duration,
     pub shutdown_timeout: Duration,
 }
 
@@ -51,6 +55,8 @@ impl Default for ServerConfig {
             max_concurrent_loads: 64,
             max_batch_decode_tracks: 1_000,
             max_concurrent_source_requests: 64,
+            max_concurrent_voice_connects: 16,
+            player_update_interval: Duration::from_secs(5),
             shutdown_timeout: Duration::from_secs(30),
         }
     }
@@ -82,6 +88,11 @@ impl fmt::Debug for ServerConfig {
                 "max_concurrent_source_requests",
                 &self.max_concurrent_source_requests,
             )
+            .field(
+                "max_concurrent_voice_connects",
+                &self.max_concurrent_voice_connects,
+            )
+            .field("player_update_interval", &self.player_update_interval)
             .field("shutdown_timeout", &self.shutdown_timeout)
             .finish()
     }
@@ -128,9 +139,13 @@ impl ServerConfig {
         }
         if let Some(lavalink) = file.lavalink
             && let Some(server) = lavalink.server
-            && let Some(password) = server.password
         {
-            self.password = password;
+            if let Some(password) = server.password {
+                self.password = password;
+            }
+            if let Some(seconds) = server.player_update_interval {
+                self.player_update_interval = Duration::from_secs(seconds);
+            }
         }
         if let Some(crust) = file.crust {
             if let Some(value) = crust.max_request_body_bytes {
@@ -163,6 +178,12 @@ impl ServerConfig {
             if let Some(value) = crust.max_concurrent_source_requests {
                 self.max_concurrent_source_requests = value;
             }
+            if let Some(value) = crust.max_concurrent_voice_connects {
+                self.max_concurrent_voice_connects = value;
+            }
+            if let Some(value) = crust.player_update_interval_ms {
+                self.player_update_interval = Duration::from_millis(value);
+            }
             if let Some(value) = crust.shutdown_timeout_ms {
                 self.shutdown_timeout = Duration::from_millis(value);
             }
@@ -184,6 +205,12 @@ impl ServerConfig {
             environment("LAVALINK_SERVER_PASSWORD").or_else(|| environment("CRUST_PASSWORD"))
         {
             self.password = value;
+        }
+        if let Some(value) = environment("LAVALINK_SERVER_PLAYER_UPDATE_INTERVAL") {
+            let seconds = value
+                .parse()
+                .map_err(|_| ConfigError::Environment("LAVALINK_SERVER_PLAYER_UPDATE_INTERVAL"))?;
+            self.player_update_interval = Duration::from_secs(seconds);
         }
         if let Some(value) = environment("CRUST_MAX_REQUEST_BODY_BYTES") {
             self.max_request_body_bytes = value
@@ -234,6 +261,17 @@ impl ServerConfig {
             self.max_concurrent_source_requests = value
                 .parse()
                 .map_err(|_| ConfigError::Environment("CRUST_MAX_CONCURRENT_SOURCE_REQUESTS"))?;
+        }
+        if let Some(value) = environment("CRUST_MAX_CONCURRENT_VOICE_CONNECTS") {
+            self.max_concurrent_voice_connects = value
+                .parse()
+                .map_err(|_| ConfigError::Environment("CRUST_MAX_CONCURRENT_VOICE_CONNECTS"))?;
+        }
+        if let Some(value) = environment("CRUST_PLAYER_UPDATE_INTERVAL_MS") {
+            let milliseconds = value
+                .parse()
+                .map_err(|_| ConfigError::Environment("CRUST_PLAYER_UPDATE_INTERVAL_MS"))?;
+            self.player_update_interval = Duration::from_millis(milliseconds);
         }
         if let Some(value) = environment("CRUST_SHUTDOWN_TIMEOUT_MS") {
             let milliseconds = value
@@ -303,6 +341,20 @@ impl ServerConfig {
                 "max_concurrent_source_requests must be 1..=1048576",
             ));
         }
+        if self.max_concurrent_voice_connects == 0
+            || self.max_concurrent_voice_connects > MAX_CONCURRENT_VOICE_CONNECTS
+        {
+            return Err(ConfigError::Invalid(
+                "max_concurrent_voice_connects must be 1..=1048576",
+            ));
+        }
+        if self.player_update_interval.is_zero()
+            || self.player_update_interval > MAX_PLAYER_UPDATE_INTERVAL
+        {
+            return Err(ConfigError::Invalid(
+                "player_update_interval must be between 1 ms and 24 hours",
+            ));
+        }
         if self.shutdown_timeout.is_zero() || self.shutdown_timeout > MAX_SHUTDOWN_TIMEOUT {
             return Err(ConfigError::Invalid(
                 "shutdown_timeout must be between 1 ms and 5 minutes",
@@ -359,9 +411,10 @@ struct FileLavalink {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 struct FileLavalinkServer {
     password: Option<String>,
+    player_update_interval: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -377,6 +430,8 @@ struct FileCrust {
     max_concurrent_loads: Option<usize>,
     max_batch_decode_tracks: Option<usize>,
     max_concurrent_source_requests: Option<usize>,
+    max_concurrent_voice_connects: Option<usize>,
+    player_update_interval_ms: Option<u64>,
     shutdown_timeout_ms: Option<u64>,
 }
 
@@ -406,7 +461,7 @@ mod tests {
     #[test]
     fn p08_media_limits_load_from_yaml_and_reject_zero() {
         let file: ConfigFile = serde_saphyr::from_str(
-            "crust:\n  maxConcurrentLoads: 2\n  maxBatchDecodeTracks: 3\n  maxConcurrentSourceRequests: 4\n",
+            "crust:\n  maxConcurrentLoads: 2\n  maxBatchDecodeTracks: 3\n  maxConcurrentSourceRequests: 4\n  maxConcurrentVoiceConnects: 5\n",
         )
         .unwrap();
         let mut config = ServerConfig::default();
@@ -414,6 +469,7 @@ mod tests {
         assert_eq!(config.max_concurrent_loads, 2);
         assert_eq!(config.max_batch_decode_tracks, 3);
         assert_eq!(config.max_concurrent_source_requests, 4);
+        assert_eq!(config.max_concurrent_voice_connects, 5);
         assert!(config.validate().is_ok());
 
         config.max_batch_decode_tracks = 0;
@@ -423,5 +479,27 @@ mod tests {
                 "max_batch_decode_tracks must be 1..=1048576"
             ))
         ));
+    }
+
+    #[test]
+    fn p11_player_update_interval_supports_lavalink_seconds_and_crust_milliseconds() {
+        let file: ConfigFile = serde_saphyr::from_str(
+            "lavalink:\n  server:\n    playerUpdateInterval: 7\ncrust:\n  playerUpdateIntervalMs: 125\n",
+        )
+        .unwrap();
+        let mut config = ServerConfig::default();
+        config.apply_file(file);
+        assert_eq!(config.player_update_interval, Duration::from_millis(125));
+        assert!(config.validate().is_ok());
+
+        let file: ConfigFile =
+            serde_saphyr::from_str("lavalink:\n  server:\n    playerUpdateInterval: 7\n").unwrap();
+        config.apply_file(file);
+        assert_eq!(config.player_update_interval, Duration::from_secs(7));
+
+        config.player_update_interval = Duration::ZERO;
+        assert!(config.validate().is_err());
+        config.player_update_interval = MAX_PLAYER_UPDATE_INTERVAL + Duration::from_millis(1);
+        assert!(config.validate().is_err());
     }
 }

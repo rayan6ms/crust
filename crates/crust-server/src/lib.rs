@@ -3,6 +3,7 @@ pub mod player;
 pub mod session;
 mod track;
 
+use std::collections::HashSet;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -24,8 +25,9 @@ use crust::media::{
     AdapterError, AdapterErrorKind, EncodedTrack, LoadOutcome, LoadRequest, MantleAdapter,
     SourceRoute,
 };
+use crust::voice::VoiceBackend;
 use crust_protocol::{PatchField, PlayerUpdate, SessionUpdate};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
@@ -44,7 +46,7 @@ use session::{
 };
 
 pub const LAVALINK_VERSION: &str = "4.2.2";
-pub const MANTLE_REVISION: &str = "0c042705e64e956d7eb58634c5d4b73b365fe5d0";
+pub const MANTLE_REVISION: &str = "55b718058a36731e1c757b5edf53f432dc01ce3e";
 
 struct AppState {
     config: ServerConfig,
@@ -62,6 +64,7 @@ impl AppState {
         config: ServerConfig,
         clock: Arc<dyn SessionClock>,
         adapter: Option<Arc<dyn MantleAdapter>>,
+        voice: Option<Arc<dyn VoiceBackend>>,
     ) -> Self {
         let sessions = SessionRegistry::new(
             config.max_sessions,
@@ -73,7 +76,9 @@ impl AppState {
         let players = PlayerExecutor::new(
             config.player_executor_shards,
             config.player_command_capacity,
+            config.max_players,
             adapter.clone(),
+            voice,
         );
         let load_requests = Arc::new(Semaphore::new(config.max_concurrent_loads));
         let source_requests = Arc::new(Semaphore::new(config.max_concurrent_source_requests));
@@ -98,17 +103,38 @@ pub struct CrustServer {
 
 impl CrustServer {
     pub async fn bind(config: ServerConfig) -> io::Result<Self> {
-        Self::bind_with_clock_and_adapter(config, Arc::new(SystemSessionClock::new()), None).await
+        Self::bind_with_clock_adapter_and_voice(
+            config,
+            Arc::new(SystemSessionClock::new()),
+            None,
+            None,
+        )
+        .await
     }
 
     pub async fn bind_with_adapter(
         config: ServerConfig,
         adapter: Arc<dyn MantleAdapter>,
     ) -> io::Result<Self> {
-        Self::bind_with_clock_and_adapter(
+        Self::bind_with_clock_adapter_and_voice(
             config,
             Arc::new(SystemSessionClock::new()),
             Some(adapter),
+            None,
+        )
+        .await
+    }
+
+    pub async fn bind_with_backends(
+        config: ServerConfig,
+        adapter: Arc<dyn MantleAdapter>,
+        voice: Arc<dyn VoiceBackend>,
+    ) -> io::Result<Self> {
+        Self::bind_with_clock_adapter_and_voice(
+            config,
+            Arc::new(SystemSessionClock::new()),
+            Some(adapter),
+            Some(voice),
         )
         .await
     }
@@ -117,7 +143,7 @@ impl CrustServer {
         config: ServerConfig,
         clock: Arc<dyn SessionClock>,
     ) -> io::Result<Self> {
-        Self::bind_with_clock_and_adapter(config, clock, None).await
+        Self::bind_with_clock_adapter_and_voice(config, clock, None, None).await
     }
 
     pub async fn bind_with_clock_and_adapter(
@@ -125,10 +151,19 @@ impl CrustServer {
         clock: Arc<dyn SessionClock>,
         adapter: Option<Arc<dyn MantleAdapter>>,
     ) -> io::Result<Self> {
+        Self::bind_with_clock_adapter_and_voice(config, clock, adapter, None).await
+    }
+
+    pub async fn bind_with_clock_adapter_and_voice(
+        config: ServerConfig,
+        clock: Arc<dyn SessionClock>,
+        adapter: Option<Arc<dyn MantleAdapter>>,
+        voice: Option<Arc<dyn VoiceBackend>>,
+    ) -> io::Result<Self> {
         let listener = TcpListener::bind(config.socket_address()).await?;
         Ok(Self {
             listener: Arc::new(listener),
-            state: Arc::new(AppState::new(config, clock, adapter)),
+            state: Arc::new(AppState::new(config, clock, adapter, voice)),
         })
     }
 
@@ -152,17 +187,19 @@ impl CrustServer {
                 shutdown_for_server.cancelled().await;
                 sessions.shutdown();
             });
-        let graceful = graceful.into_future();
-        tokio::pin!(graceful);
-        let result = tokio::select! {
-            result = &mut graceful => result,
+        let shutdown_sequence = async move {
+            let result = graceful.await;
+            players.shutdown().await;
+            result
+        };
+        tokio::pin!(shutdown_sequence);
+        tokio::select! {
+            result = &mut shutdown_sequence => result,
             () = async {
                 shutdown.cancelled().await;
                 tokio::time::sleep(self.state.config.shutdown_timeout).await;
             } => Err(io::Error::new(io::ErrorKind::TimedOut, "server shutdown deadline elapsed")),
-        };
-        players.shutdown().await;
-        result
+        }
     }
 
     pub async fn spawn(config: ServerConfig) -> io::Result<RunningServer> {
@@ -692,6 +729,7 @@ async fn websocket(
     };
     let resumed = prepared.resumed();
     let session_id = prepared.id();
+    let player_update_interval = state.config.player_update_interval;
     tracing::info!(
         user_id,
         client_name = ?client_name,
@@ -702,7 +740,7 @@ async fn websocket(
     let mut response = upgrade
         .max_message_size(64 * 1024)
         .max_frame_size(64 * 1024)
-        .on_upgrade(move |socket| websocket_session(socket, prepared))
+        .on_upgrade(move |socket| websocket_session(socket, prepared, player_update_interval))
         .into_response();
     response.headers_mut().insert(
         "session-resumed",
@@ -711,7 +749,11 @@ async fn websocket(
     response
 }
 
-async fn websocket_session(socket: WebSocket, prepared: PreparedSession) {
+async fn websocket_session(
+    socket: WebSocket,
+    prepared: PreparedSession,
+    player_update_interval: Duration,
+) {
     let Ok(mut connection) = prepared.attach() else {
         return;
     };
@@ -741,6 +783,14 @@ async fn websocket_session(socket: WebSocket, prepared: PreparedSession) {
             return;
         }
     }
+    let mut update_tick = tokio::time::interval(player_update_interval);
+    update_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // `interval`'s first tick is immediate; initial/resumed snapshots above
+    // already cover that state, so the first periodic update waits one full
+    // configured interval.
+    update_tick.tick().await;
+    let mut refreshes = FuturesUnordered::new();
+    let mut refreshing_guilds = HashSet::new();
     loop {
         tokio::select! {
             outgoing_message = outgoing.recv() => {
@@ -758,6 +808,21 @@ async fn websocket_session(socket: WebSocket, prepared: PreparedSession) {
                         return;
                     }
                 }
+            }
+            _ = update_tick.tick() => {
+                for player in handle.players() {
+                    if !player.wants_periodic_updates() {
+                        continue;
+                    }
+                    let guild_id = player.guild_id().to_owned();
+                    if refreshing_guilds.insert(guild_id) {
+                        refreshes.push(player.refresh());
+                    }
+                }
+            }
+            Some((guild_id, payload)) = refreshes.next(), if !refreshes.is_empty() => {
+                refreshing_guilds.remove(&guild_id);
+                let _ = handle.publish_player_update(&guild_id, payload);
             }
             () = cancellation.cancelled() => {
                 let _ = sink.send(Message::Close(None)).await;
@@ -1031,7 +1096,7 @@ async fn delete_player(
                 false,
             );
         };
-        if let Err(error) = player.destroy().await {
+        if let Err(error) = player.destroy(session.clone()).await {
             return player_error(error, uri.path());
         }
     }

@@ -2,6 +2,7 @@
 members = [
     "crates/crust",
     "crates/crust-mantle-adapter",
+    "crates/crust-oto-adapter",
     "crates/crust-protocol",
     "crates/crust-server",
     "crates/crust-testkit",
@@ -28,3 +29,6 @@ tower = "0.5.2"
 tower-http = { version = "0.6.6", features = ["trace"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+
+[patch.crates-io]
+openmls_rust_crypto = { path = "../oto/vendor/openmls_rust_crypto" }

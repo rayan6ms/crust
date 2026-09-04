@@ -285,6 +285,19 @@ async fn playback_no_replace_controls_and_track_start_order_use_fake_mantle() {
     assert_eq!(event["type"], "TrackStartEvent");
     assert_eq!(event["track"]["info"]["identifier"], "fixture:one");
     assert_eq!(event["track"]["userData"]["request"], "p07");
+    let initial_update: Value = serde_json::from_str(
+        socket
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap()
+            .as_ref(),
+    )
+    .unwrap();
+    assert_eq!(initial_update["op"], "playerUpdate");
+    assert_eq!(initial_update["state"]["position"], 20);
 
     let (_, player) = json_response(response).await;
     assert_eq!(player["track"]["info"]["identifier"], "fixture:one");
@@ -536,7 +549,7 @@ async fn filter_replacements_apply_defaults_null_removal_and_validation() {
                 &path,
                 json!({
                     "filters": {
-                        "volume": 0.5,
+                        "volume": 0.8,
                         "equalizer": [{"band": 0, "gain": 0.2}, {"band": 0, "gain": 0.3}],
                         "karaoke": {},
                         "timescale": {"speed": 1.25},
@@ -556,6 +569,7 @@ async fn filter_replacements_apply_defaults_null_removal_and_validation() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let filters = &configured["filters"];
+    assert_eq!(filters["volume"], json!(0.8));
     assert_eq!(filters["karaoke"]["filterBand"], 220.0);
     assert_eq!(filters["timescale"]["pitch"], 1.0);
     assert_eq!(filters["tremolo"]["frequency"], 2.0);

@@ -10,6 +10,7 @@ use crust::media::{
     PlayerSnapshot, PlayerStatus, PlaylistInfo, ProcessingMode, SourceRoute, TrackEndReason,
     TrackMetadata,
 };
+use crust::voice::OpusPacket;
 use serde_json::json;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -55,6 +56,16 @@ struct FakeInner {
     load_release: Notify,
     last_route: Mutex<Option<SourceRoute>>,
     last_identifier: Mutex<Option<String>>,
+    snapshots: Arc<SnapshotProbe>,
+}
+
+#[derive(Debug, Default)]
+struct SnapshotProbe {
+    hold: AtomicBool,
+    calls: AtomicUsize,
+    active: AtomicUsize,
+    maximum_active: AtomicUsize,
+    release: Notify,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +86,7 @@ impl FakeMantle {
                 load_release: Notify::new(),
                 last_route: Mutex::new(None),
                 last_identifier: Mutex::new(None),
+                snapshots: Arc::new(SnapshotProbe::default()),
             }),
         }
     }
@@ -110,6 +122,30 @@ impl FakeMantle {
     #[must_use]
     pub fn last_route(&self) -> Option<SourceRoute> {
         *self.inner.last_route.lock().expect("route lock poisoned")
+    }
+
+    pub fn hold_snapshots(&self) {
+        self.inner.snapshots.hold.store(true, Ordering::Release);
+    }
+
+    pub fn release_snapshots(&self) {
+        self.inner.snapshots.hold.store(false, Ordering::Release);
+        self.inner.snapshots.release.notify_waiters();
+    }
+
+    #[must_use]
+    pub fn snapshot_calls(&self) -> usize {
+        self.inner.snapshots.calls.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn active_snapshots(&self) -> usize {
+        self.inner.snapshots.active.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn maximum_active_snapshots(&self) -> usize {
+        self.inner.snapshots.maximum_active.load(Ordering::Acquire)
     }
 }
 
@@ -216,6 +252,7 @@ impl MantleAdapter for FakeMantle {
                 Arc::clone(&inner.clock),
                 inner.event_capacity,
                 inner.shutdown.child_token(),
+                Arc::clone(&inner.snapshots),
             )) as Arc<dyn MantlePlayer>)
         })
     }
@@ -336,6 +373,7 @@ struct FakePlayer {
     clock: Arc<ManualClock>,
     event_capacity: NonZeroUsize,
     shutdown: CancellationToken,
+    snapshots: Arc<SnapshotProbe>,
     state: Mutex<FakePlayerState>,
 }
 
@@ -344,11 +382,13 @@ impl FakePlayer {
         clock: Arc<ManualClock>,
         event_capacity: NonZeroUsize,
         shutdown: CancellationToken,
+        snapshots: Arc<SnapshotProbe>,
     ) -> Self {
         Self {
             clock,
             event_capacity,
             shutdown,
+            snapshots,
             state: Mutex::new(FakePlayerState {
                 status: PlayerStatus::Idle,
                 track: None,
@@ -528,8 +568,19 @@ impl MantlePlayer for FakePlayer {
 
     fn snapshot(&self) -> AdapterFuture<'_, Result<PlayerSnapshot, AdapterError>> {
         Box::pin(async move {
-            if self.shutdown.is_cancelled() {
-                return Err(shutdown());
+            let _activity = SnapshotActivity::new(&self.snapshots);
+            loop {
+                let released = self.snapshots.release.notified();
+                if self.shutdown.is_cancelled() {
+                    return Err(shutdown());
+                }
+                if !self.snapshots.hold.load(Ordering::Acquire) {
+                    break;
+                }
+                tokio::select! {
+                    () = released => {}
+                    () = self.shutdown.cancelled() => return Err(shutdown()),
+                }
             }
             let state = self.state.lock().expect("player lock poisoned");
             Ok(PlayerSnapshot {
@@ -553,12 +604,18 @@ impl MantlePlayer for FakePlayer {
             }
             let track = state.track.clone().expect("playing track");
             let sequence = state.next_frame_sequence;
+            if track.metadata.identifier == "fixture:frame-error" {
+                return Err(error(
+                    AdapterErrorKind::InvalidOperation,
+                    "synthetic frame production failure",
+                ));
+            }
             let finishes = track.metadata.identifier == "fixture:short" && sequence == 1;
             if finishes {
                 self.require_event_capacity(&state, 1)?;
             }
             state.next_frame_sequence += 1;
-            let payload: Arc<[u8]> = sequence.to_be_bytes().into();
+            let payload = OpusPacket::copy_from(&sequence.to_be_bytes()).expect("bounded fixture");
             let frame = MediaFrame {
                 sequence,
                 duration_ms: FRAME_DURATION_MS,
@@ -600,6 +657,25 @@ impl MantlePlayer for FakePlayer {
             self.state.lock().expect("player lock poisoned").status = PlayerStatus::Shutdown;
             Ok(())
         })
+    }
+}
+
+struct SnapshotActivity<'a> {
+    probe: &'a SnapshotProbe,
+}
+
+impl<'a> SnapshotActivity<'a> {
+    fn new(probe: &'a SnapshotProbe) -> Self {
+        probe.calls.fetch_add(1, Ordering::AcqRel);
+        let active = probe.active.fetch_add(1, Ordering::AcqRel) + 1;
+        probe.maximum_active.fetch_max(active, Ordering::AcqRel);
+        Self { probe }
+    }
+}
+
+impl Drop for SnapshotActivity<'_> {
+    fn drop(&mut self) {
+        self.probe.active.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

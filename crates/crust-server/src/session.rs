@@ -3,6 +3,8 @@
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -46,9 +48,14 @@ impl SessionClock for SystemSessionClock {
 
 pub trait SessionPlayer: Send + Sync + 'static {
     fn as_any(&self) -> &dyn Any;
+    fn guild_id(&self) -> &str;
+    fn wants_periodic_updates(&self) -> bool;
     fn snapshot(&self) -> Arc<str>;
+    fn refresh(&self) -> SessionPlayerRefresh;
     fn shutdown(&self);
 }
+
+pub type SessionPlayerRefresh = Pin<Box<dyn Future<Output = (String, Arc<str>)> + Send + 'static>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionSettings {
@@ -668,13 +675,23 @@ impl PreparedSession {
                 cancellation: cancellation.clone(),
             });
             let critical = inner.critical_backlog.drain(..).collect::<Vec<_>>();
-            let mut state = inner.player_updates.values().cloned().collect::<Vec<_>>();
-            inner.player_updates.clear();
+            let mut state = if self.resumed {
+                // Player snapshots are the canonical latest state on resume;
+                // queued coalesced updates describe the same guilds and would
+                // otherwise duplicate those snapshots.
+                inner.player_updates.clear();
+                inner
+                    .players
+                    .values()
+                    .map(|entry| entry.player.snapshot())
+                    .collect::<Vec<_>>()
+            } else {
+                let updates = inner.player_updates.values().cloned().collect::<Vec<_>>();
+                inner.player_updates.clear();
+                updates
+            };
             if let Some(stats) = inner.stats.take() {
                 state.push(stats);
-            }
-            if self.resumed {
-                state.extend(inner.players.values().map(|entry| entry.player.snapshot()));
             }
             (critical, state)
         };
@@ -970,8 +987,21 @@ mod tests {
             self
         }
 
+        fn guild_id(&self) -> &str {
+            "7"
+        }
+
+        fn wants_periodic_updates(&self) -> bool {
+            true
+        }
+
         fn snapshot(&self) -> Arc<str> {
             Arc::from(r#"{"op":"playerUpdate","guildId":"7"}"#)
+        }
+
+        fn refresh(&self) -> SessionPlayerRefresh {
+            let snapshot = self.snapshot();
+            Box::pin(async move { ("7".to_owned(), snapshot) })
         }
 
         fn shutdown(&self) {

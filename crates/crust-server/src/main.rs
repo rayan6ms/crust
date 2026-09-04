@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crust::media::MantleAdapter;
 use crust::routeplanner::RoutePlanner;
 use crust_mantle_adapter::RealMantleAdapter;
+use crust_oto_adapter::OtoVoiceBackend;
 use crust_server::CrustServer;
 use crust_server::config::ServerConfig;
 use tokio_util::sync::CancellationToken;
@@ -20,7 +21,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mantle: Arc<dyn MantleAdapter> = Arc::new(RealMantleAdapter::with_defaults(
         RoutePlanner::new(std::iter::empty()),
     )?);
-    let server = CrustServer::bind_with_adapter(config, mantle).await?;
+    let voice = Arc::new(OtoVoiceBackend::with_defaults(
+        config.max_players,
+        config.max_concurrent_voice_connects,
+    )?);
+    let server = CrustServer::bind_with_backends(config, mantle, voice).await?;
     let address = server.local_address()?;
     tracing::info!(%address, "Crust server listening");
     let shutdown = CancellationToken::new();

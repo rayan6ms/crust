@@ -5,7 +5,9 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crust::filters::{
     ChannelMix as RuntimeChannelMix, Distortion as RuntimeDistortion, FilterConfiguration,
@@ -15,6 +17,10 @@ use crust::media::{
     AdapterErrorKind, EncodedTrack, LoadOutcome, LoadRequest, MantleAdapter, MantlePlayer,
     MediaEvent, MediaTrack, PlayerStatus, SourceRoute, TrackEndReason,
 };
+use crust::voice::{
+    TimedOpusFrame, VoiceBackend, VoiceClose, VoiceConnection, VoiceConnectionInfo, VoiceError,
+    VoiceErrorKind, VoiceEvent, VoiceFrameSource, VoiceFuture, VoiceSecret, VoiceSnapshot,
+};
 use crust_protocol::{Filters, JsonObject, PatchField, PlayerUpdate, VoiceState};
 use futures_util::future::BoxFuture;
 use futures_util::{FutureExt, StreamExt};
@@ -23,7 +29,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::session::{PublishError, SessionHandle, SessionPlayer};
+use crate::session::{PublishError, SessionHandle, SessionPlayer, SessionPlayerRefresh};
 use crate::track::track_value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,8 +67,9 @@ impl fmt::Debug for PlayerExecutor {
 }
 
 struct ExecutorInner {
-    senders: Vec<mpsc::Sender<PlayerCommand>>,
+    senders: Vec<(mpsc::Sender<PlayerCommand>, mpsc::Sender<PlayerHandle>)>,
     adapter: Option<Arc<dyn MantleAdapter>>,
+    voice: Option<Arc<dyn VoiceBackend>>,
     cancellation: CancellationToken,
     workers: Mutex<Option<Vec<JoinHandle<()>>>>,
 }
@@ -101,13 +108,32 @@ struct PlayerInner {
     execution_key: String,
     guild_id: String,
     sender: mpsc::Sender<PlayerCommand>,
+    shutdown_sender: mpsc::Sender<PlayerHandle>,
+    shutdown_requested: AtomicBool,
+    deferred_audio: AtomicBool,
+    periodic_updates: AtomicBool,
     state: tokio::sync::Mutex<PlayerState>,
     cached_update: Mutex<Arc<str>>,
     cancellation: CancellationToken,
+    voice_monitor: Mutex<Option<VoiceMonitor>>,
+}
+
+struct VoiceMonitor {
+    cancellation: CancellationToken,
+    task: JoinHandle<()>,
+}
+
+impl Drop for VoiceMonitor {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.task.abort();
+    }
 }
 
 struct PlayerState {
     mantle: Option<Arc<dyn MantlePlayer>>,
+    voice_connection: Option<Arc<dyn VoiceConnection>>,
+    audio_generation: u64,
     track: Option<ActiveTrack>,
     volume: i32,
     paused: bool,
@@ -137,7 +163,28 @@ enum PlayerCommand {
     },
     Destroy {
         handle: PlayerHandle,
+        session: SessionHandle,
         reply: oneshot::Sender<Result<(), PlayerError>>,
+    },
+    Shutdown {
+        handle: PlayerHandle,
+    },
+    SourceTerminal {
+        handle: PlayerHandle,
+        session: SessionHandle,
+        generation: u64,
+        failure: Option<VoiceError>,
+    },
+    VoiceClosed {
+        handle: PlayerHandle,
+        session: SessionHandle,
+        connection: Arc<dyn VoiceConnection>,
+        close: VoiceClose,
+    },
+    VoiceReady {
+        handle: PlayerHandle,
+        session: SessionHandle,
+        connection: Arc<dyn VoiceConnection>,
     },
 }
 
@@ -146,21 +193,31 @@ impl PlayerExecutor {
     pub fn new(
         shard_count: usize,
         command_capacity: usize,
+        max_players: usize,
         adapter: Option<Arc<dyn MantleAdapter>>,
+        voice: Option<Arc<dyn VoiceBackend>>,
     ) -> Self {
         assert!(shard_count > 0);
         assert!(command_capacity > 0);
+        assert!(max_players > 0);
         let cancellation = CancellationToken::new();
         let mut senders = Vec::with_capacity(shard_count);
         let mut workers = Vec::with_capacity(shard_count);
         for _ in 0..shard_count {
             let (sender, receiver) = mpsc::channel(command_capacity);
+            // Every admitted player can enqueue at most one shutdown request.
+            // This separate lane ensures lifecycle cleanup remains admissible
+            // even when ordinary player commands saturate their queue.
+            let (shutdown_sender, shutdown_receiver) = mpsc::channel(max_players);
             let worker_cancellation = cancellation.clone();
             let worker_adapter = adapter.clone();
-            senders.push(sender);
+            let worker_voice = voice.clone();
+            senders.push((sender, shutdown_sender));
             workers.push(tokio::spawn(run_shard(
                 receiver,
+                shutdown_receiver,
                 worker_adapter,
+                worker_voice,
                 worker_cancellation,
                 command_capacity,
             )));
@@ -169,6 +226,7 @@ impl PlayerExecutor {
             inner: Arc::new(ExecutorInner {
                 senders,
                 adapter,
+                voice,
                 cancellation,
                 workers: Mutex::new(Some(workers)),
             }),
@@ -182,7 +240,13 @@ impl PlayerExecutor {
         guild_id.hash(&mut hash);
         let index = usize::try_from(hash.finish()).unwrap_or(usize::MAX) % self.inner.senders.len();
         let execution_key = format!("{session_id}\0{guild_id}");
-        PlayerHandle::new(execution_key, guild_id, self.inner.senders[index].clone())
+        let (sender, shutdown_sender) = &self.inner.senders[index];
+        PlayerHandle::new(
+            execution_key,
+            guild_id,
+            sender.clone(),
+            shutdown_sender.clone(),
+        )
     }
 
     pub async fn shutdown(&self) {
@@ -197,6 +261,9 @@ impl PlayerExecutor {
             for worker in workers {
                 let _ = worker.await;
             }
+            if let Some(voice) = &self.inner.voice {
+                let _ = voice.shutdown().await;
+            }
             if let Some(adapter) = &self.inner.adapter {
                 let _ = adapter.shutdown().await;
             }
@@ -205,7 +272,12 @@ impl PlayerExecutor {
 }
 
 impl PlayerHandle {
-    fn new(execution_key: String, guild_id: String, sender: mpsc::Sender<PlayerCommand>) -> Self {
+    fn new(
+        execution_key: String,
+        guild_id: String,
+        sender: mpsc::Sender<PlayerCommand>,
+        shutdown_sender: mpsc::Sender<PlayerHandle>,
+    ) -> Self {
         let cached_update = Arc::from(
             json!({
                 "op": "playerUpdate",
@@ -219,9 +291,14 @@ impl PlayerHandle {
                 execution_key,
                 guild_id,
                 sender,
+                shutdown_sender,
+                shutdown_requested: AtomicBool::new(false),
+                deferred_audio: AtomicBool::new(false),
+                periodic_updates: AtomicBool::new(false),
                 state: tokio::sync::Mutex::new(PlayerState::default()),
                 cached_update: Mutex::new(cached_update),
                 cancellation: CancellationToken::new(),
+                voice_monitor: Mutex::new(None),
             }),
         }
     }
@@ -229,6 +306,16 @@ impl PlayerHandle {
     #[must_use]
     pub fn guild_id(&self) -> &str {
         &self.inner.guild_id
+    }
+
+    fn cached_update(&self) -> Arc<str> {
+        Arc::clone(
+            &self
+                .inner
+                .cached_update
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     pub async fn apply(
@@ -257,10 +344,11 @@ impl PlayerHandle {
         response.await.map_err(|_| PlayerError::NotFound)?
     }
 
-    pub async fn destroy(&self) -> Result<(), PlayerError> {
+    pub async fn destroy(&self, session: SessionHandle) -> Result<(), PlayerError> {
         let (reply, response) = oneshot::channel();
         self.send(PlayerCommand::Destroy {
             handle: self.clone(),
+            session,
             reply,
         })?;
         response.await.map_err(|_| PlayerError::NotFound)?
@@ -278,11 +366,113 @@ impl PlayerHandle {
                 mpsc::error::TrySendError::Closed(_) => PlayerError::NotFound,
             })
     }
+
+    fn start_voice_monitor(&self, session: SessionHandle, connection: Arc<dyn VoiceConnection>) {
+        let mut monitor = self
+            .inner
+            .voice_monitor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if monitor
+            .as_ref()
+            .is_some_and(|monitor| !monitor.task.is_finished())
+        {
+            return;
+        }
+        // A backend event stream may end before fresh voice information
+        // arrives. Dispose of that completed owner so the updated connection
+        // is monitored again.
+        drop(monitor.take());
+        let cancellation = self.inner.cancellation.child_token();
+        let task_cancellation = cancellation.clone();
+        let weak = Arc::downgrade(&self.inner);
+        let task_connection = Arc::clone(&connection);
+        let task = tokio::spawn(async move {
+            let mut connected = false;
+            loop {
+                let event = tokio::select! {
+                    biased;
+                    () = task_cancellation.cancelled() => return,
+                    event = task_connection.next_event(task_cancellation.clone()) => event,
+                };
+                match event {
+                    Ok(Some(VoiceEvent::Closed(close))) => {
+                        // Oto reports the old transport as replaced when fresh
+                        // voice information is installed. That is an internal
+                        // generation transition, not Lavalink's
+                        // WebSocketClosedEvent.
+                        if close.code == 0 && close.reason.as_ref() == "voice information replaced"
+                        {
+                            continue;
+                        }
+                        let Some(inner) = weak.upgrade() else {
+                            return;
+                        };
+                        let handle = PlayerHandle { inner };
+                        let command = PlayerCommand::VoiceClosed {
+                            handle: handle.clone(),
+                            session: session.clone(),
+                            connection: Arc::clone(&task_connection),
+                            close,
+                        };
+                        tokio::select! {
+                            biased;
+                            () = task_cancellation.cancelled() => {}
+                            _ = handle.inner.sender.send(command) => {}
+                        }
+                        return;
+                    }
+                    Ok(Some(VoiceEvent::PhaseChanged(phase))) => {
+                        if phase == crust::voice::VoicePhase::Connected && !connected {
+                            connected = true;
+                            let Some(inner) = weak.upgrade() else {
+                                return;
+                            };
+                            let handle = PlayerHandle { inner };
+                            let command = PlayerCommand::VoiceReady {
+                                handle: handle.clone(),
+                                session: session.clone(),
+                                connection: Arc::clone(&task_connection),
+                            };
+                            tokio::select! {
+                                biased;
+                                () = task_cancellation.cancelled() => return,
+                                _ = handle.inner.sender.send(command) => {}
+                            }
+                        } else if phase != crust::voice::VoicePhase::Connected {
+                            connected = false;
+                        }
+                    }
+                    Ok(Some(VoiceEvent::SourceFailed(_))) => {}
+                    Ok(None) | Err(_) => return,
+                }
+            }
+        });
+        *monitor = Some(VoiceMonitor { cancellation, task });
+    }
+
+    fn stop_voice_monitor(&self) {
+        let monitor = self
+            .inner
+            .voice_monitor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        drop(monitor);
+    }
 }
 
 impl SessionPlayer for PlayerHandle {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn guild_id(&self) -> &str {
+        self.guild_id()
+    }
+
+    fn wants_periodic_updates(&self) -> bool {
+        self.inner.periodic_updates.load(Ordering::Acquire)
     }
 
     fn snapshot(&self) -> Arc<str> {
@@ -295,8 +485,26 @@ impl SessionPlayer for PlayerHandle {
         )
     }
 
+    fn refresh(&self) -> SessionPlayerRefresh {
+        let handle = self.clone();
+        Box::pin(async move {
+            // Refreshing updates both Mantle position and the current voice
+            // ping/connection state. If the player disappears while this
+            // refresh is queued, retain the last durable coalesced snapshot.
+            let _ = handle.snapshot().await;
+            (handle.guild_id().to_owned(), handle.cached_update())
+        })
+    }
+
     fn shutdown(&self) {
         self.inner.cancellation.cancel();
+        if !self.inner.shutdown_requested.swap(true, Ordering::AcqRel) {
+            // Capacity equals the global admitted-player bound and each
+            // player contributes at most one request, so Full is unreachable
+            // while the executor is live. Closed means the executor's own
+            // global backend shutdown has already taken ownership.
+            let _ = self.inner.shutdown_sender.try_send(self.clone());
+        }
     }
 }
 
@@ -304,6 +512,8 @@ impl Default for PlayerState {
     fn default() -> Self {
         Self {
             mantle: None,
+            voice_connection: None,
+            audio_generation: 0,
             track: None,
             volume: 100,
             paused: false,
@@ -323,7 +533,9 @@ impl Default for PlayerState {
 
 async fn run_shard(
     mut receiver: mpsc::Receiver<PlayerCommand>,
+    mut shutdown_receiver: mpsc::Receiver<PlayerHandle>,
     adapter: Option<Arc<dyn MantleAdapter>>,
+    voice: Option<Arc<dyn VoiceBackend>>,
     cancellation: CancellationToken,
     max_queued: usize,
 ) {
@@ -352,7 +564,7 @@ async fn run_shard(
                     && let Some(command) = commands.pop_front()
                 {
                     queued_count -= 1;
-                    executing.push(execute_command(command, adapter.clone()));
+                    executing.push(execute_command(command, adapter.clone(), voice.clone()));
                     if commands.is_empty() {
                         queued.remove(&execution_key);
                     }
@@ -374,7 +586,18 @@ async fn run_shard(
                 };
                 let execution_key = command.execution_key().to_owned();
                 if active.insert(execution_key.clone()) {
-                    executing.push(execute_command(command, adapter.clone()));
+                    executing.push(execute_command(command, adapter.clone(), voice.clone()));
+                } else {
+                    queued.entry(execution_key).or_default().push_back(command);
+                    queued_count += 1;
+                }
+            }
+            handle = shutdown_receiver.recv() => {
+                let Some(handle) = handle else { continue };
+                let command = PlayerCommand::Shutdown { handle };
+                let execution_key = command.execution_key().to_owned();
+                if active.insert(execution_key.clone()) {
+                    executing.push(execute_command(command, adapter.clone(), voice.clone()));
                 } else {
                     queued.entry(execution_key).or_default().push_back(command);
                     queued_count += 1;
@@ -389,7 +612,11 @@ impl PlayerCommand {
         match self {
             Self::Apply { handle, .. }
             | Self::Snapshot { handle, .. }
-            | Self::Destroy { handle, .. } => &handle.inner.execution_key,
+            | Self::Destroy { handle, .. }
+            | Self::Shutdown { handle }
+            | Self::SourceTerminal { handle, .. }
+            | Self::VoiceClosed { handle, .. }
+            | Self::VoiceReady { handle, .. } => &handle.inner.execution_key,
         }
     }
 }
@@ -397,10 +624,11 @@ impl PlayerCommand {
 fn execute_command(
     command: PlayerCommand,
     adapter: Option<Arc<dyn MantleAdapter>>,
+    voice: Option<Arc<dyn VoiceBackend>>,
 ) -> BoxFuture<'static, String> {
     let execution_key = command.execution_key().to_owned();
     async move {
-        execute(command, adapter).await;
+        execute(command, adapter, voice).await;
         execution_key
     }
     .boxed()
@@ -414,10 +642,18 @@ fn reject_command(command: PlayerCommand) {
         PlayerCommand::Destroy { reply, .. } => {
             let _ = reply.send(Err(PlayerError::NotFound));
         }
+        PlayerCommand::Shutdown { .. }
+        | PlayerCommand::SourceTerminal { .. }
+        | PlayerCommand::VoiceClosed { .. }
+        | PlayerCommand::VoiceReady { .. } => {}
     }
 }
 
-async fn execute(command: PlayerCommand, adapter: Option<Arc<dyn MantleAdapter>>) {
+async fn execute(
+    command: PlayerCommand,
+    adapter: Option<Arc<dyn MantleAdapter>>,
+    voice: Option<Arc<dyn VoiceBackend>>,
+) {
     match command {
         PlayerCommand::Apply {
             handle,
@@ -426,17 +662,54 @@ async fn execute(command: PlayerCommand, adapter: Option<Arc<dyn MantleAdapter>>
             no_replace,
             reply,
         } => {
-            let result =
-                apply_update(&handle, &session, *update, no_replace, adapter.as_ref()).await;
+            let result = apply_update(
+                &handle,
+                &session,
+                *update,
+                no_replace,
+                adapter.as_ref(),
+                voice.as_ref(),
+            )
+            .await;
             let _ = reply.send(result);
         }
         PlayerCommand::Snapshot { handle, reply } => {
             let result = snapshot(&handle).await;
             let _ = reply.send(result);
         }
-        PlayerCommand::Destroy { handle, reply } => {
-            let result = destroy(&handle).await;
+        PlayerCommand::Destroy {
+            handle,
+            session,
+            reply,
+        } => {
+            let result = destroy(&handle, Some(&session)).await;
             let _ = reply.send(result);
+        }
+        PlayerCommand::Shutdown { handle } => {
+            let _ = destroy(&handle, None).await;
+        }
+        PlayerCommand::SourceTerminal {
+            handle,
+            session,
+            generation,
+            failure,
+        } => {
+            let _ = source_terminal(&handle, &session, generation, failure).await;
+        }
+        PlayerCommand::VoiceClosed {
+            handle,
+            session,
+            connection,
+            close,
+        } => {
+            let _ = voice_closed(&handle, &session, connection, close).await;
+        }
+        PlayerCommand::VoiceReady {
+            handle,
+            session,
+            connection,
+        } => {
+            let _ = voice_ready(&handle, &session, connection).await;
         }
     }
 }
@@ -513,8 +786,18 @@ async fn apply_update(
     update: PlayerUpdate,
     no_replace: bool,
     adapter: Option<&Arc<dyn MantleAdapter>>,
+    voice_backend: Option<&Arc<dyn VoiceBackend>>,
 ) -> Result<Value, PlayerError> {
     validate_update(&update)?;
+    let voice_changed = matches!(update.voice, PatchField::Value(_));
+    let filters_changed = matches!(update.filters, PatchField::Value(_));
+    let pause_changed = matches!(update.paused, PatchField::Value(_));
+    let position_changed = matches!(update.position, PatchField::Value(_));
+    let updated_voice = if let PatchField::Value(voice) = &update.voice {
+        prepare_voice_connection(handle, session, voice, voice_backend).await?
+    } else {
+        None
+    };
     let mut state = handle.inner.state.lock().await;
     if state.destroyed || handle.inner.cancellation.is_cancelled() {
         return Err(PlayerError::NotFound);
@@ -545,9 +828,14 @@ async fn apply_update(
     }
     if let PatchField::Value(voice) = &update.voice {
         state.voice = voice.clone();
+        state.voice_connection = updated_voice;
     }
     let (track_request, user_data) = normalized_track(&update)?;
     let replacing = !matches!(track_request, TrackRequest::Omitted);
+    let requests_track_start = matches!(
+        track_request,
+        TrackRequest::Encoded(_) | TrackRequest::Identifier(_)
+    );
     let publish_player_update = matches!(update.filters, PatchField::Value(_))
         || (!replacing && matches!(update.position, PatchField::Value(_)) && state.track.is_some());
     if !replacing {
@@ -587,7 +875,9 @@ async fn apply_update(
         PatchField::Null | PatchField::Value(_) => {}
     }
 
-    if replacing && !(no_replace && state.track.is_some()) {
+    let replace_allowed = replacing && !(no_replace && state.track.is_some());
+    let publish_player_update = publish_player_update || (replace_allowed && requests_track_start);
+    if replace_allowed {
         match track_request {
             TrackRequest::Omitted => {}
             TrackRequest::Stop => {
@@ -605,7 +895,7 @@ async fn apply_update(
                 state.position_ms = 0;
                 state.end_time_ms = None;
                 state.paused = false;
-                drain_events(handle, session, &state.mantle, &user_data, None).await?;
+                drain_events(handle, session, &state.mantle, &user_data, None, None).await?;
             }
             TrackRequest::Encoded(encoded) => {
                 let adapter = adapter.ok_or(PlayerError::Invalid("invalid encoded track"))?;
@@ -647,9 +937,74 @@ async fn apply_update(
         }
     }
 
-    refresh_from_mantle(handle, &mut state).await?;
-    let value = player_value(&handle.inner.guild_id, &state);
-    cache_update(handle, &state);
+    let refresh_audio =
+        voice_changed || filters_changed || pause_changed || position_changed || replace_allowed;
+    let voice_connection = state.voice_connection.clone();
+    let mantle_for_snapshot = state.mantle.clone();
+    let audio_action = if refresh_audio {
+        state.audio_generation = state
+            .audio_generation
+            .checked_add(1)
+            .ok_or(PlayerError::Media("audio source generation exhausted"))?;
+        let generation = state.audio_generation;
+        voice_connection.as_ref().map(|connection| {
+            if state.track.is_some() && !state.paused {
+                state.mantle.as_ref().map_or_else(
+                    || VoiceAudioAction::Stop(Arc::clone(connection)),
+                    |mantle| VoiceAudioAction::Set {
+                        connection: Arc::clone(connection),
+                        source: Arc::new(MantleVoiceSource {
+                            mantle: Arc::clone(mantle),
+                            handle: handle.clone(),
+                            session: session.clone(),
+                            generation,
+                        }),
+                    },
+                )
+            } else {
+                VoiceAudioAction::Stop(Arc::clone(connection))
+            }
+        })
+    } else {
+        None
+    };
+    drop(state);
+    if voice_changed && let Some(connection) = &voice_connection {
+        handle.start_voice_monitor(session.clone(), Arc::clone(connection));
+    }
+    if let Some(action) = audio_action
+        && let Err(error) = apply_voice_audio(action, handle.inner.cancellation.child_token()).await
+    {
+        if is_deferred_voice_audio_error(&error) {
+            // A fresh Discord voice generation can expose transport before
+            // DAVE reaches Connected. Keep the player alive and let the voice
+            // monitor attach the current Mantle source at the exact readiness
+            // transition; never send plaintext or fail the Lavalink voice
+            // update with a transient 500.
+            handle.inner.deferred_audio.store(true, Ordering::Release);
+        } else {
+            return Err(map_voice_error(error));
+        }
+    }
+    let mantle_snapshot = if let Some(mantle) = mantle_for_snapshot {
+        Some(mantle.snapshot().await.map_err(map_adapter_error)?)
+    } else {
+        None
+    };
+    let voice_snapshot = if let Some(connection) = &voice_connection {
+        Some(connection.snapshot().await.map_err(map_voice_error)?)
+    } else {
+        None
+    };
+    let mut state = handle.inner.state.lock().await;
+    if state.destroyed || handle.inner.cancellation.is_cancelled() {
+        return Err(PlayerError::NotFound);
+    }
+    if let Some(snapshot) = mantle_snapshot {
+        apply_mantle_snapshot(&mut state, snapshot);
+    }
+    let value = player_value(&handle.inner.guild_id, &state, voice_snapshot.as_ref());
+    cache_update(handle, &state, voice_snapshot.as_ref());
     if publish_player_update {
         let payload = SessionPlayer::snapshot(handle);
         session
@@ -657,6 +1012,227 @@ async fn apply_update(
             .map_err(map_publish_error)?;
     }
     Ok(value)
+}
+
+async fn prepare_voice_connection(
+    handle: &PlayerHandle,
+    session: &SessionHandle,
+    voice: &VoiceState,
+    backend: Option<&Arc<dyn VoiceBackend>>,
+) -> Result<Option<Arc<dyn VoiceConnection>>, PlayerError> {
+    let existing = {
+        let state = handle.inner.state.lock().await;
+        if state.destroyed || handle.inner.cancellation.is_cancelled() {
+            return Err(PlayerError::NotFound);
+        }
+        state.voice_connection.clone()
+    };
+    let Some(backend) = backend else {
+        return Ok(existing);
+    };
+    let info = voice_connection_info(handle, session, voice)?;
+    let cancellation = handle.inner.cancellation.child_token();
+    if let Some(connection) = existing {
+        connection
+            .update(info, cancellation)
+            .await
+            .map_err(map_voice_error)?;
+        Ok(Some(connection))
+    } else {
+        backend
+            .connect(info, cancellation)
+            .await
+            .map(Some)
+            .map_err(map_voice_error)
+    }
+}
+
+fn voice_connection_info(
+    handle: &PlayerHandle,
+    session: &SessionHandle,
+    voice: &VoiceState,
+) -> Result<VoiceConnectionInfo, PlayerError> {
+    let guild_id = handle
+        .guild_id()
+        .parse()
+        .map_err(|_| PlayerError::Invalid("guild ID is not a Discord snowflake"))?;
+    let user_id = session
+        .user_id()
+        .parse()
+        .map_err(|_| PlayerError::Invalid("user ID is not a Discord snowflake"))?;
+    let channel_id = voice
+        .channel_id
+        .as_deref()
+        .ok_or(PlayerError::Invalid("voice channel ID is required"))?
+        .parse()
+        .map_err(|_| PlayerError::Invalid("channel ID is not a Discord snowflake"))?;
+    Ok(VoiceConnectionInfo {
+        guild_id,
+        user_id,
+        channel_id,
+        endpoint: voice.endpoint.clone(),
+        session_id: VoiceSecret::new(voice.session_id.clone()),
+        token: VoiceSecret::new(voice.token.clone()),
+    })
+}
+
+enum VoiceAudioAction {
+    Set {
+        connection: Arc<dyn VoiceConnection>,
+        source: Arc<dyn VoiceFrameSource>,
+    },
+    Stop(Arc<dyn VoiceConnection>),
+}
+
+async fn apply_voice_audio(
+    action: VoiceAudioAction,
+    cancellation: CancellationToken,
+) -> Result<(), VoiceError> {
+    match action {
+        VoiceAudioAction::Set { connection, source } => {
+            connection.set_source(source, cancellation).await
+        }
+        VoiceAudioAction::Stop(connection) => connection.stop_audio().await,
+    }
+}
+
+fn is_deferred_voice_audio_error(error: &VoiceError) -> bool {
+    error.kind == VoiceErrorKind::NotReady
+}
+
+async fn voice_ready(
+    handle: &PlayerHandle,
+    session: &SessionHandle,
+    connection: Arc<dyn VoiceConnection>,
+) -> Result<(), PlayerError> {
+    if !handle.inner.deferred_audio.swap(false, Ordering::AcqRel) {
+        return Ok(());
+    }
+    let (mantle, generation) = {
+        let mut state = handle.inner.state.lock().await;
+        if state.destroyed
+            || handle.inner.cancellation.is_cancelled()
+            || !state
+                .voice_connection
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &connection))
+            || state.paused
+        {
+            return Ok(());
+        }
+        let Some(mantle) = state.mantle.clone() else {
+            return Ok(());
+        };
+        if state.track.is_none() {
+            return Ok(());
+        }
+        state.audio_generation = state
+            .audio_generation
+            .checked_add(1)
+            .ok_or(PlayerError::Media("audio source generation exhausted"))?;
+        (mantle, state.audio_generation)
+    };
+    let source = Arc::new(MantleVoiceSource {
+        mantle,
+        handle: handle.clone(),
+        session: session.clone(),
+        generation,
+    });
+    match connection
+        .set_source(source, handle.inner.cancellation.child_token())
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(error) if is_deferred_voice_audio_error(&error) => {
+            handle.inner.deferred_audio.store(true, Ordering::Release);
+            Ok(())
+        }
+        Err(error) => Err(map_voice_error(error)),
+    }
+}
+
+struct MantleVoiceSource {
+    mantle: Arc<dyn MantlePlayer>,
+    handle: PlayerHandle,
+    session: SessionHandle,
+    generation: u64,
+}
+
+impl VoiceFrameSource for MantleVoiceSource {
+    fn next_frame(
+        &self,
+        cancellation: CancellationToken,
+    ) -> VoiceFuture<'_, Result<Option<TimedOpusFrame>, VoiceError>> {
+        Box::pin(async move {
+            let frame = match self.mantle.next_frame(cancellation.clone()).await {
+                Ok(frame) => frame
+                    .map(|frame| {
+                        TimedOpusFrame::from_packet(
+                            frame.sequence,
+                            Duration::from_millis(frame.sequence.saturating_mul(20)),
+                            Duration::from_millis(u64::from(frame.duration_ms)),
+                            frame.payload,
+                        )
+                        .map_err(|_| {
+                            VoiceError::new(
+                                VoiceErrorKind::Protocol,
+                                "Mantle produced an invalid Discord Opus frame",
+                            )
+                        })
+                    })
+                    .transpose(),
+                Err(error) => Err(map_adapter_voice_error(error)),
+            };
+            match frame {
+                Ok(Some(frame)) => Ok(Some(frame)),
+                Ok(None) => {
+                    self.handle
+                        .report_source_terminal(
+                            self.session.clone(),
+                            self.generation,
+                            None,
+                            cancellation,
+                        )
+                        .await;
+                    Ok(None)
+                }
+                Err(error) => {
+                    self.handle
+                        .report_source_terminal(
+                            self.session.clone(),
+                            self.generation,
+                            Some(error.clone()),
+                            cancellation,
+                        )
+                        .await;
+                    Err(error)
+                }
+            }
+        })
+    }
+}
+
+impl PlayerHandle {
+    async fn report_source_terminal(
+        &self,
+        session: SessionHandle,
+        generation: u64,
+        failure: Option<VoiceError>,
+        cancellation: CancellationToken,
+    ) {
+        let command = PlayerCommand::SourceTerminal {
+            handle: self.clone(),
+            session,
+            generation,
+            failure,
+        };
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {}
+            () = self.inner.cancellation.cancelled() => {}
+            _ = self.inner.sender.send(command) => {}
+        }
+    }
 }
 
 fn validate_filters(filters: &Filters) -> Result<(), PlayerError> {
@@ -780,8 +1356,14 @@ fn normalize_filters(filters: &Filters) -> Result<(Value, FilterConfiguration), 
         low_pass: values_only(&filters.low_pass),
         plugin_filters: filters.plugin_filters.clone(),
     };
+    // `Value::from(f32)` first widens to the exact `f64` value, exposing binary
+    // noise such as `0.800000011920929` on the Lavalink wire. Serialize the
+    // protocol model directly so serde_json emits the shortest decimal that
+    // round-trips to the original `f32`, then retain that JSON representation.
+    let serialized =
+        serde_json::to_string(&normalized).map_err(|_| PlayerError::Invalid("invalid filters"))?;
     let wire =
-        serde_json::to_value(normalized).map_err(|_| PlayerError::Invalid("invalid filters"))?;
+        serde_json::from_str(&serialized).map_err(|_| PlayerError::Invalid("invalid filters"))?;
     Ok((wire, configuration))
 }
 
@@ -851,6 +1433,7 @@ async fn play_track(
         &state.mantle,
         &user_data,
         previous_user_data.as_ref(),
+        None,
     )
     .await?;
     Ok(())
@@ -862,15 +1445,26 @@ async fn drain_events(
     mantle: &Option<Arc<dyn MantlePlayer>>,
     user_data: &JsonObject,
     replaced_user_data: Option<&JsonObject>,
+    end_reason_override: Option<TrackEndReason>,
 ) -> Result<(), PlayerError> {
     let Some(mantle) = mantle else {
         return Ok(());
     };
-    while let Some(event) = mantle
+    while let Some(mut event) = mantle
         .next_event(handle.inner.cancellation.child_token())
         .await
         .map_err(map_adapter_error)?
     {
+        if let (
+            Some(reason),
+            MediaEvent::TrackEnd {
+                reason: event_reason,
+                ..
+            },
+        ) = (end_reason_override, &mut event)
+        {
+            *event_reason = reason;
+        }
         let event_user_data = if matches!(
             event,
             MediaEvent::TrackEnd {
@@ -892,39 +1486,221 @@ async fn drain_events(
     Ok(())
 }
 
+async fn source_terminal(
+    handle: &PlayerHandle,
+    session: &SessionHandle,
+    generation: u64,
+    failure: Option<VoiceError>,
+) -> Result<(), PlayerError> {
+    let (mantle, voice, track, user_data) = {
+        let state = handle.inner.state.lock().await;
+        if state.destroyed
+            || handle.inner.cancellation.is_cancelled()
+            || state.audio_generation != generation
+        {
+            return Ok(());
+        }
+        let Some(mantle) = state.mantle.clone() else {
+            return Ok(());
+        };
+        (
+            mantle,
+            state.voice_connection.clone(),
+            state.track.as_ref().map(|track| track.media.clone()),
+            state
+                .track
+                .as_ref()
+                .map_or_else(JsonObject::new, |track| track.user_data.clone()),
+        )
+    };
+
+    if let (Some(failure), Some(track)) = (&failure, track) {
+        let payload = Arc::from(
+            event_value(
+                &handle.inner.guild_id,
+                MediaEvent::TrackError {
+                    track,
+                    message: failure.message.to_owned(),
+                },
+                &user_data,
+            )
+            .to_string(),
+        );
+        session
+            .publish_critical_delivered(payload)
+            .await
+            .map_err(map_publish_error)?;
+        mantle
+            .stop(handle.inner.cancellation.child_token())
+            .await
+            .map_err(map_adapter_error)?;
+    }
+
+    drain_events(
+        handle,
+        session,
+        &Some(Arc::clone(&mantle)),
+        &user_data,
+        None,
+        failure.as_ref().map(|_| TrackEndReason::LoadFailed),
+    )
+    .await?;
+    let mantle_snapshot = mantle.snapshot().await.map_err(map_adapter_error)?;
+    let voice_snapshot = if let Some(connection) = voice {
+        Some(connection.snapshot().await.map_err(map_voice_error)?)
+    } else {
+        None
+    };
+
+    let mut state = handle.inner.state.lock().await;
+    if state.destroyed
+        || handle.inner.cancellation.is_cancelled()
+        || state.audio_generation != generation
+    {
+        return Ok(());
+    }
+    apply_mantle_snapshot(&mut state, mantle_snapshot);
+    cache_update(handle, &state, voice_snapshot.as_ref());
+    drop(state);
+    session
+        .publish_player_update(handle.guild_id(), SessionPlayer::snapshot(handle))
+        .map(|_| ())
+        .map_err(map_publish_error)
+}
+
+async fn voice_closed(
+    handle: &PlayerHandle,
+    session: &SessionHandle,
+    connection: Arc<dyn VoiceConnection>,
+    close: VoiceClose,
+) -> Result<(), PlayerError> {
+    {
+        let mut state = handle.inner.state.lock().await;
+        if state.destroyed || handle.inner.cancellation.is_cancelled() {
+            return Ok(());
+        }
+        let Some(current) = state.voice_connection.as_ref() else {
+            return Ok(());
+        };
+        if !Arc::ptr_eq(current, &connection) {
+            return Ok(());
+        }
+        state.voice_connection = None;
+        state.audio_generation = state
+            .audio_generation
+            .checked_add(1)
+            .ok_or(PlayerError::Media("audio source generation exhausted"))?;
+    }
+
+    handle.stop_voice_monitor();
+    let _ = connection.stop_audio().await;
+    let payload = Arc::from(
+        json!({
+            "op": "event",
+            "type": "WebSocketClosedEvent",
+            "guildId": handle.guild_id(),
+            "code": i32::from(close.code),
+            "reason": close.reason.as_ref(),
+            "byRemote": close.by_remote,
+        })
+        .to_string(),
+    );
+    session
+        .publish_critical_delivered(payload)
+        .await
+        .map_err(map_publish_error)?;
+
+    let state = handle.inner.state.lock().await;
+    cache_update(handle, &state, None);
+    drop(state);
+    session
+        .publish_player_update(handle.guild_id(), handle.cached_update())
+        .map(|_| ())
+        .map_err(map_publish_error)
+}
+
 async fn snapshot(handle: &PlayerHandle) -> Result<Value, PlayerError> {
+    let (mantle, voice_connection) = {
+        let state = handle.inner.state.lock().await;
+        if state.destroyed || handle.inner.cancellation.is_cancelled() {
+            return Err(PlayerError::NotFound);
+        }
+        (state.mantle.clone(), state.voice_connection.clone())
+    };
+    let mantle_snapshot = if let Some(mantle) = mantle {
+        Some(mantle.snapshot().await.map_err(map_adapter_error)?)
+    } else {
+        None
+    };
+    let voice_snapshot = if let Some(connection) = voice_connection {
+        Some(connection.snapshot().await.map_err(map_voice_error)?)
+    } else {
+        None
+    };
     let mut state = handle.inner.state.lock().await;
     if state.destroyed || handle.inner.cancellation.is_cancelled() {
         return Err(PlayerError::NotFound);
     }
-    refresh_from_mantle(handle, &mut state).await?;
-    let value = player_value(&handle.inner.guild_id, &state);
-    cache_update(handle, &state);
+    if let Some(snapshot) = mantle_snapshot {
+        apply_mantle_snapshot(&mut state, snapshot);
+    }
+    let value = player_value(&handle.inner.guild_id, &state, voice_snapshot.as_ref());
+    cache_update(handle, &state, voice_snapshot.as_ref());
     Ok(value)
 }
 
-async fn destroy(handle: &PlayerHandle) -> Result<(), PlayerError> {
-    let mut state = handle.inner.state.lock().await;
-    if state.destroyed {
-        return Ok(());
+async fn destroy(
+    handle: &PlayerHandle,
+    session: Option<&SessionHandle>,
+) -> Result<(), PlayerError> {
+    let (voice, mantle, cleanup_payload) = {
+        let mut state = handle.inner.state.lock().await;
+        if state.destroyed {
+            return Ok(());
+        }
+        let cleanup_payload = session.and_then(|_| {
+            state.track.as_ref().map(|active| {
+                Arc::from(
+                    event_value(
+                        handle.guild_id(),
+                        MediaEvent::TrackEnd {
+                            track: active.media.clone(),
+                            reason: TrackEndReason::Cleanup,
+                        },
+                        &active.user_data,
+                    )
+                    .to_string(),
+                )
+            })
+        });
+        handle.inner.cancellation.cancel();
+        state.destroyed = true;
+        state.track = None;
+        (
+            state.voice_connection.take(),
+            state.mantle.take(),
+            cleanup_payload,
+        )
+    };
+    handle.stop_voice_monitor();
+    let publish_result = if let (Some(session), Some(payload)) = (session, cleanup_payload) {
+        session
+            .publish_critical_delivered(payload)
+            .await
+            .map_err(map_publish_error)
+    } else {
+        Ok(())
+    };
+    if let Some(voice) = voice {
+        voice.shutdown().await.map_err(map_voice_error)?;
     }
-    handle.inner.cancellation.cancel();
-    if let Some(mantle) = state.mantle.take() {
+    if let Some(mantle) = mantle {
         mantle.shutdown().await.map_err(map_adapter_error)?;
     }
-    state.destroyed = true;
-    state.track = None;
-    Ok(())
+    publish_result
 }
 
-async fn refresh_from_mantle(
-    handle: &PlayerHandle,
-    state: &mut PlayerState,
-) -> Result<(), PlayerError> {
-    let Some(mantle) = &state.mantle else {
-        return Ok(());
-    };
-    let snapshot = mantle.snapshot().await.map_err(map_adapter_error)?;
+fn apply_mantle_snapshot(state: &mut PlayerState, snapshot: crust::media::PlayerSnapshot) {
     state.position_ms = snapshot.position_ms;
     state.paused = snapshot.status == PlayerStatus::Paused;
     if snapshot.track.is_none()
@@ -932,10 +1708,6 @@ async fn refresh_from_mantle(
     {
         state.track = None;
     }
-    if handle.inner.cancellation.is_cancelled() {
-        return Err(PlayerError::NotFound);
-    }
-    Ok(())
 }
 
 enum TrackRequest {
@@ -973,7 +1745,17 @@ fn normalized_track(
     Ok((request, user_data))
 }
 
-fn player_value(guild_id: &str, state: &PlayerState) -> Value {
+fn player_value(
+    guild_id: &str,
+    state: &PlayerState,
+    voice_snapshot: Option<&VoiceSnapshot>,
+) -> Value {
+    let connected = voice_snapshot
+        .is_some_and(|snapshot| matches!(snapshot.phase, crust::voice::VoicePhase::Connected));
+    let ping = voice_snapshot
+        .and_then(|snapshot| snapshot.ping)
+        .and_then(|ping| i64::try_from(ping.as_millis()).ok())
+        .unwrap_or(-1);
     json!({
         "guildId": guild_id,
         "track": state
@@ -985,15 +1767,29 @@ fn player_value(guild_id: &str, state: &PlayerState) -> Value {
         "state": {
             "time": timestamp_ms(),
             "position": state.position_ms,
-            "connected": false,
-            "ping": -1,
+            "connected": connected,
+            "ping": ping,
         },
         "voice": state.voice,
         "filters": state.filters,
     })
 }
 
-fn cache_update(handle: &PlayerHandle, state: &PlayerState) {
+fn cache_update(
+    handle: &PlayerHandle,
+    state: &PlayerState,
+    voice_snapshot: Option<&VoiceSnapshot>,
+) {
+    handle
+        .inner
+        .periodic_updates
+        .store(state.track.is_some(), Ordering::Release);
+    let connected = voice_snapshot
+        .is_some_and(|snapshot| matches!(snapshot.phase, crust::voice::VoicePhase::Connected));
+    let ping = voice_snapshot
+        .and_then(|snapshot| snapshot.ping)
+        .and_then(|ping| i64::try_from(ping.as_millis()).ok())
+        .unwrap_or(-1);
     let update: Arc<str> = Arc::from(
         json!({
             "op": "playerUpdate",
@@ -1001,8 +1797,8 @@ fn cache_update(handle: &PlayerHandle, state: &PlayerState) {
             "state": {
                 "time": timestamp_ms(),
                 "position": state.position_ms,
-                "connected": false,
-                "ping": -1,
+                "connected": connected,
+                "ping": ping,
             }
         })
         .to_string(),
@@ -1038,17 +1834,30 @@ fn event_value(guild_id: &str, event: MediaEvent, user_data: &JsonObject) -> Val
             "track": track_value(&track, 0, user_data),
             "reason": match reason {
                 TrackEndReason::Finished => "finished",
+                TrackEndReason::LoadFailed => "loadFailed",
                 TrackEndReason::Stopped => "stopped",
                 TrackEndReason::Replaced => "replaced",
+                TrackEndReason::Cleanup => "cleanup",
             },
         }),
-        MediaEvent::TrackError { track, message } => json!({
-            "op": "event",
-            "type": "TrackExceptionEvent",
-            "guildId": guild_id,
-            "track": track_value(&track, 0, user_data),
-            "exception": {"message": message, "severity": "fault", "cause": null},
-        }),
+        MediaEvent::TrackError { track, message } => {
+            // Lavalink v4 requires both root-cause strings even when the
+            // backend exposes only one bounded, redacted failure message.
+            // Reusing that message preserves the complete wire shape without
+            // manufacturing a native stack trace or leaking backend types.
+            json!({
+                "op": "event",
+                "type": "TrackExceptionEvent",
+                "guildId": guild_id,
+                "track": track_value(&track, 0, user_data),
+                "exception": {
+                    "message": message,
+                    "severity": "fault",
+                    "cause": message,
+                    "causeStackTrace": message,
+                },
+            })
+        }
         MediaEvent::TrackStuck {
             track,
             threshold_ms,
@@ -1069,6 +1878,30 @@ fn map_adapter_error(error: crust::media::AdapterError) -> PlayerError {
         }
         AdapterErrorKind::Overloaded => PlayerError::Overloaded,
         _ => PlayerError::Media(error.message),
+    }
+}
+
+fn map_adapter_voice_error(error: crust::media::AdapterError) -> VoiceError {
+    let kind = match error.kind {
+        AdapterErrorKind::Cancelled => VoiceErrorKind::Cancelled,
+        AdapterErrorKind::Shutdown => VoiceErrorKind::Shutdown,
+        AdapterErrorKind::Overloaded => VoiceErrorKind::Overloaded,
+        AdapterErrorKind::LoadFailed
+        | AdapterErrorKind::InvalidTrack
+        | AdapterErrorKind::InvalidOperation => VoiceErrorKind::Protocol,
+    };
+    VoiceError::new(kind, "Mantle frame production failed")
+}
+
+fn map_voice_error(error: VoiceError) -> PlayerError {
+    match error.kind {
+        VoiceErrorKind::Overloaded => PlayerError::Overloaded,
+        VoiceErrorKind::InvalidState => PlayerError::Invalid(error.message),
+        VoiceErrorKind::Cancelled
+        | VoiceErrorKind::Shutdown
+        | VoiceErrorKind::NotReady
+        | VoiceErrorKind::ConnectionFailed
+        | VoiceErrorKind::Protocol => PlayerError::Media(error.message),
     }
 }
 

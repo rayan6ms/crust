@@ -1,9 +1,9 @@
 //! Backend-neutral Discord voice contract.
 //!
 //! Crust deliberately exposes neither Songbird nor DAVE implementation types.
-//! Mantle is the sole pacing authority: a backend sends each already-paced
-//! 20 ms Opus frame immediately and must not introduce another media timer or
-//! an unbounded handoff queue.
+//! The selected voice backend is the sole network pacing authority. Crust
+//! supplies a readiness-aware stream of encoded 20 ms Opus frames and never
+//! runs a competing send timer or an unbounded handoff queue.
 
 use std::fmt;
 use std::future::Future;
@@ -73,28 +73,19 @@ pub enum VoicePhase {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VoicePacingAuthority {
-    Mantle,
+    Backend,
 }
 
-pub const VOICE_PACING_AUTHORITY: VoicePacingAuthority = VoicePacingAuthority::Mantle;
+pub const VOICE_PACING_AUTHORITY: VoicePacingAuthority = VoicePacingAuthority::Backend;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TimedOpusFrame {
-    sequence: u64,
-    source_position: Duration,
-    payload: Arc<[u8]>,
+#[derive(Clone, PartialEq, Eq)]
+pub struct OpusPacket {
+    bytes: [u8; MAX_OPUS_PACKET_BYTES],
+    len: u16,
 }
 
-impl TimedOpusFrame {
-    pub fn new(
-        sequence: u64,
-        source_position: Duration,
-        duration: Duration,
-        payload: Arc<[u8]>,
-    ) -> Result<Self, VoiceFrameError> {
-        if duration != OPUS_FRAME_DURATION {
-            return Err(VoiceFrameError::WrongDuration { duration });
-        }
+impl OpusPacket {
+    pub fn copy_from(payload: &[u8]) -> Result<Self, VoiceFrameError> {
         if payload.is_empty() {
             return Err(VoiceFrameError::EmptyPayload);
         }
@@ -103,6 +94,63 @@ impl TimedOpusFrame {
                 size: payload.len(),
                 maximum: MAX_OPUS_PACKET_BYTES,
             });
+        }
+        let mut bytes = [0_u8; MAX_OPUS_PACKET_BYTES];
+        bytes[..payload.len()].copy_from_slice(payload);
+        Ok(Self {
+            bytes,
+            len: u16::try_from(payload.len()).expect("validated Opus packet size fits u16"),
+        })
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+}
+
+impl fmt::Debug for OpusPacket {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OpusPacket")
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimedOpusFrame {
+    sequence: u64,
+    source_position: Duration,
+    payload: OpusPacket,
+}
+
+impl TimedOpusFrame {
+    pub fn new(
+        sequence: u64,
+        source_position: Duration,
+        duration: Duration,
+        payload: impl AsRef<[u8]>,
+    ) -> Result<Self, VoiceFrameError> {
+        if duration != OPUS_FRAME_DURATION {
+            return Err(VoiceFrameError::WrongDuration { duration });
+        }
+        let payload = OpusPacket::copy_from(payload.as_ref())?;
+        Ok(Self {
+            sequence,
+            source_position,
+            payload,
+        })
+    }
+
+    pub fn from_packet(
+        sequence: u64,
+        source_position: Duration,
+        duration: Duration,
+        payload: OpusPacket,
+    ) -> Result<Self, VoiceFrameError> {
+        if duration != OPUS_FRAME_DURATION {
+            return Err(VoiceFrameError::WrongDuration { duration });
         }
         Ok(Self {
             sequence,
@@ -123,7 +171,7 @@ impl TimedOpusFrame {
 
     #[must_use]
     pub fn payload(&self) -> &[u8] {
-        &self.payload
+        self.payload.as_slice()
     }
 }
 
@@ -147,6 +195,21 @@ impl fmt::Display for VoiceFrameError {
 }
 
 impl std::error::Error for VoiceFrameError {}
+
+/// One asynchronous encoded-frame producer consumed by exactly one logical
+/// voice sender at a time.
+///
+/// The future must wait for source readiness instead of maintaining a 20 ms
+/// polling timer. `Ok(None)` permanently ends the current source generation;
+/// restarting or replacing playback attaches a new source. A backend may keep
+/// at most one prefetched frame while adapting this contract to its synchronous
+/// send scheduler.
+pub trait VoiceFrameSource: Send + Sync {
+    fn next_frame(
+        &self,
+        cancellation: CancellationToken,
+    ) -> VoiceFuture<'_, Result<Option<TimedOpusFrame>, VoiceError>>;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VoiceCounters {
@@ -173,6 +236,9 @@ pub struct VoiceClose {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VoiceEvent {
     PhaseChanged(VoicePhase),
+    /// The currently attached source generation failed asynchronously.
+    /// Replacing the source starts a fresh generation.
+    SourceFailed(VoiceError),
     Closed(VoiceClose),
 }
 
@@ -181,6 +247,9 @@ pub enum VoiceErrorKind {
     Cancelled,
     Shutdown,
     InvalidState,
+    /// The connection is valid but its transport or DAVE generation has not
+    /// reached the atomic audio-attachment boundary yet.
+    NotReady,
     ConnectionFailed,
     Protocol,
     Overloaded,
@@ -209,9 +278,8 @@ impl std::error::Error for VoiceError {}
 
 /// One Discord voice connection owned by a backend.
 ///
-/// `send_opus` is a direct bounded handoff. Implementations must not queue an
-/// unbounded number of frames or sleep to pace them; Mantle has already paced
-/// the frame before this call.
+/// The backend owns network pacing and may stage exactly one frame while
+/// adapting the asynchronous [`VoiceFrameSource`] to its transport scheduler.
 pub trait VoiceConnection: Send + Sync {
     fn update(
         &self,
@@ -219,11 +287,21 @@ pub trait VoiceConnection: Send + Sync {
         cancellation: CancellationToken,
     ) -> VoiceFuture<'_, Result<(), VoiceError>>;
 
-    fn send_opus(
+    /// Starts audio on the first call and atomically replaces the active source
+    /// generation on later calls.
+    ///
+    /// `cancellation` gates admission. Once the backend admits a replacement,
+    /// it completes at one atomic source-generation boundary instead of trying
+    /// to roll back a transport command that may already have taken effect.
+    fn set_source(
         &self,
-        frame: TimedOpusFrame,
+        source: Arc<dyn VoiceFrameSource>,
         cancellation: CancellationToken,
     ) -> VoiceFuture<'_, Result<(), VoiceError>>;
+
+    /// Gracefully stops the active sender, including its backend-defined
+    /// terminal-silence drain. Calling this while already idle is harmless.
+    fn stop_audio(&self) -> VoiceFuture<'_, Result<(), VoiceError>>;
 
     fn snapshot(&self) -> VoiceFuture<'_, Result<VoiceSnapshot, VoiceError>>;
 
@@ -282,7 +360,7 @@ mod tests {
         assert_eq!(frame.sequence(), 7);
         assert_eq!(frame.source_position(), Duration::from_millis(120));
         assert_eq!(frame.payload(), payload.as_ref());
-        assert_eq!(VOICE_PACING_AUTHORITY, VoicePacingAuthority::Mantle);
+        assert_eq!(VOICE_PACING_AUTHORITY, VoicePacingAuthority::Backend);
 
         assert_eq!(
             TimedOpusFrame::new(0, Duration::ZERO, Duration::from_millis(10), payload,),

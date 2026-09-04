@@ -1,0 +1,20 @@
+[package]
+name = "crust-oto-adapter"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+crust = { path = "../crust" }
+futures-util.workspace = true
+oto = { path = "../../../oto/crates/oto" }
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+oto = { path = "../../../oto/crates/oto", features = ["testkit"] }
+oto-testkit = { path = "../../../oto/crates/oto-testkit" }
+serde_json.workspace = true
+stats_alloc = "0.1.10"

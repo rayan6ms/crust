@@ -7,19 +7,21 @@ license.workspace = true
 publish = false
 
 [features]
-default = ["real-mantle"]
+default = ["real-mantle", "oto-voice"]
 real-mantle = ["dep:crust-mantle-adapter"]
+oto-voice = ["dep:crust-oto-adapter"]
 
 [[bin]]
 name = "crust-server"
 path = "src/main.rs"
-required-features = ["real-mantle"]
+required-features = ["real-mantle", "oto-voice"]
 
 [dependencies]
 axum.workspace = true
 base64.workspace = true
 crust = { path = "../crust" }
 crust-mantle-adapter = { path = "../crust-mantle-adapter", optional = true }
+crust-oto-adapter = { path = "../crust-oto-adapter", optional = true }
 crust-protocol = { path = "../crust-protocol" }
 futures-util.workspace = true
 getrandom.workspace = true
@@ -35,5 +37,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 crust-testkit = { path = "../crust-testkit" }
+oto = { path = "../../../oto/crates/oto", features = ["testkit"] }
+oto-testkit = { path = "../../../oto/crates/oto-testkit" }
 tokio-tungstenite = "0.29.0"
 tower.workspace = true

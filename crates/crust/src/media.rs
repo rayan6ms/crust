@@ -11,6 +11,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::filters::FilterConfiguration;
+use crate::voice::OpusPacket;
 
 pub type AdapterFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub type JsonObject = BTreeMap<String, Value>;
@@ -108,8 +109,10 @@ pub struct PlayerSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackEndReason {
     Finished,
+    LoadFailed,
     Stopped,
     Replaced,
+    Cleanup,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -139,7 +142,7 @@ pub struct MediaFrame {
     pub sequence: u64,
     pub duration_ms: u16,
     pub format: FrameFormat,
-    pub payload: Arc<[u8]>,
+    pub payload: OpusPacket,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,6 +207,10 @@ pub trait MantlePlayer: Send + Sync {
 
     fn snapshot(&self) -> AdapterFuture<'_, Result<PlayerSnapshot, AdapterError>>;
 
+    /// Waits until the next frame is ready, the current playback generation
+    /// ends, or cancellation fires. An active live source uses its own exact
+    /// reload/readiness deadline; callers must not add a 20 ms polling timer.
+    /// `Ok(None)` is terminal for the current playback generation.
     fn next_frame(
         &self,
         cancellation: CancellationToken,
