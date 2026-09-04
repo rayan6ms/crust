@@ -22,6 +22,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
+use crust::extensions::{ExtensionDescriptor, ExtensionKind, ExtensionRegistry, StaticExtension};
 use crust::media::{
     AdapterError, AdapterErrorKind, EncodedTrack, LoadOutcome, LoadRequest, MantleAdapter,
     SourceRoute,
@@ -66,6 +67,7 @@ struct AppState {
     source_requests: Arc<Semaphore>,
     stats: StatsCollector,
     metrics: MetricsRegistry,
+    extensions: ExtensionRegistry,
     route_planner: RoutePlanner,
     accepting: std::sync::atomic::AtomicBool,
 }
@@ -78,6 +80,7 @@ impl AppState {
         voice: Option<Arc<dyn VoiceBackend>>,
         route_planner: RoutePlanner,
     ) -> Self {
+        let has_voice = voice.is_some();
         let sessions = SessionRegistry::new(
             config.max_sessions,
             config.max_players,
@@ -94,6 +97,7 @@ impl AppState {
         );
         let load_requests = Arc::new(Semaphore::new(config.max_concurrent_loads));
         let source_requests = Arc::new(Semaphore::new(config.max_concurrent_source_requests));
+        let extensions = registered_extensions(adapter.is_some(), has_voice);
         Self {
             config,
             next_request_id: AtomicU64::new(1),
@@ -104,6 +108,7 @@ impl AppState {
             source_requests,
             stats: StatsCollector::new(),
             metrics: MetricsRegistry::default(),
+            extensions,
             route_planner,
             accepting: std::sync::atomic::AtomicBool::new(true),
         }
@@ -563,6 +568,7 @@ async fn crust_info(State(state): State<Arc<AppState>>) -> Json<Value> {
             "sourceManagers": source_managers,
             "filters": filters,
         },
+        "extensions": extension_values(&state.extensions),
         "limits": {
             "requestBodyBytes": state.config.max_request_body_bytes,
             "sessions": state.config.max_sessions,
@@ -570,6 +576,53 @@ async fn crust_info(State(state): State<Arc<AppState>>) -> Json<Value> {
             "playerCommandCapacity": state.config.player_command_capacity,
         }
     }))
+}
+
+/// Register only first-party adapters attached to this server. These entries
+/// are Crust diagnostics, not Lavalink Java plugin registrations, so the
+/// standard `/v4/info.plugins` field remains truthful and client-compatible.
+fn registered_extensions(has_mantle: bool, has_oto: bool) -> ExtensionRegistry {
+    let mut registry = ExtensionRegistry::new();
+    if has_mantle {
+        let descriptor = ExtensionDescriptor::new(
+            "crust.mantle",
+            MANTLE_REVISION,
+            ExtensionKind::Media,
+            ["source:youtube", "media:opus", "media:pcm-filters"],
+        )
+        .expect("built-in Mantle extension descriptor is valid");
+        registry
+            .register(StaticExtension::new(descriptor))
+            .expect("built-in Mantle extension id is unique");
+    }
+    if has_oto {
+        let descriptor = ExtensionDescriptor::new(
+            "crust.oto",
+            OTO_VERSION,
+            ExtensionKind::Voice,
+            ["voice:discord", "voice:dave", "voice:opus-pacing"],
+        )
+        .expect("built-in Oto extension descriptor is valid");
+        registry
+            .register(StaticExtension::new(descriptor))
+            .expect("built-in Oto extension id is unique");
+    }
+    registry
+}
+
+fn extension_values(registry: &ExtensionRegistry) -> Vec<Value> {
+    registry
+        .descriptors()
+        .into_iter()
+        .map(|descriptor| {
+            json!({
+                "id": descriptor.id,
+                "version": descriptor.version,
+                "kind": descriptor.kind.as_str(),
+                "capabilities": descriptor.capabilities,
+            })
+        })
+        .collect()
 }
 
 /// Return only source managers that Crust actually implements. Mantle owns

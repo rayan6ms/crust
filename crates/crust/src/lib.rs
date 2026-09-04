@@ -9,6 +9,7 @@
 static TEST_ALLOCATOR: &stats_alloc::StatsAlloc<std::alloc::System> =
     &stats_alloc::INSTRUMENTED_SYSTEM;
 
+pub mod extensions;
 pub mod filters;
 pub mod lifecycle;
 pub mod media;
