@@ -580,8 +580,11 @@ checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
 name = "crust"
 version = "0.0.0"
 dependencies = [
+ "num-bigint",
+ "num-traits",
  "serde",
  "serde_json",
+ "stats_alloc",
  "tokio",
  "tokio-util",
 ]
@@ -644,6 +647,7 @@ dependencies = [
  "serde-saphyr",
  "serde_json",
  "subtle",
+ "time",
  "tokio",
  "tokio-tungstenite 0.29.0",
  "tokio-util",

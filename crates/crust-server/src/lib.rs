@@ -26,12 +26,15 @@ use crust::media::{
     AdapterError, AdapterErrorKind, EncodedTrack, LoadOutcome, LoadRequest, MantleAdapter,
     SourceRoute,
 };
+use crust::routeplanner::{RoutePlanner, RoutePlannerDetails, RoutePlannerSnapshot};
 use crust::voice::VoiceBackend;
 use crust_protocol::{PatchField, PlayerUpdate, SessionUpdate};
 use futures_util::{SinkExt, StreamExt, stream::FuturesUnordered};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
@@ -51,6 +54,7 @@ pub const LAVALINK_VERSION: &str = "4.2.2";
 pub const MANTLE_REVISION: &str = "55b718058a36731e1c757b5edf53f432dc01ce3e";
 pub const CRUST_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const OTO_VERSION: &str = "0.0.0";
+const MAX_ROUTE_PLANNER_BODY_BYTES: usize = 4 * 1024;
 
 struct AppState {
     config: ServerConfig,
@@ -61,6 +65,7 @@ struct AppState {
     load_requests: Arc<Semaphore>,
     source_requests: Arc<Semaphore>,
     stats: StatsCollector,
+    route_planner: RoutePlanner,
 }
 
 impl AppState {
@@ -69,6 +74,7 @@ impl AppState {
         clock: Arc<dyn SessionClock>,
         adapter: Option<Arc<dyn MantleAdapter>>,
         voice: Option<Arc<dyn VoiceBackend>>,
+        route_planner: RoutePlanner,
     ) -> Self {
         let sessions = SessionRegistry::new(
             config.max_sessions,
@@ -95,6 +101,7 @@ impl AppState {
             load_requests,
             source_requests,
             stats: StatsCollector::new(),
+            route_planner,
         }
     }
 }
@@ -143,6 +150,22 @@ impl CrustServer {
         .await
     }
 
+    pub async fn bind_with_backends_and_route_planner(
+        config: ServerConfig,
+        adapter: Arc<dyn MantleAdapter>,
+        voice: Arc<dyn VoiceBackend>,
+        route_planner: RoutePlanner,
+    ) -> io::Result<Self> {
+        Self::bind_with_clock_adapter_voice_and_route_planner(
+            config,
+            Arc::new(SystemSessionClock::new()),
+            Some(adapter),
+            Some(voice),
+            route_planner,
+        )
+        .await
+    }
+
     pub async fn bind_with_clock(
         config: ServerConfig,
         clock: Arc<dyn SessionClock>,
@@ -164,10 +187,27 @@ impl CrustServer {
         adapter: Option<Arc<dyn MantleAdapter>>,
         voice: Option<Arc<dyn VoiceBackend>>,
     ) -> io::Result<Self> {
+        Self::bind_with_clock_adapter_voice_and_route_planner(
+            config,
+            clock,
+            adapter,
+            voice,
+            RoutePlanner::disabled(),
+        )
+        .await
+    }
+
+    pub async fn bind_with_clock_adapter_voice_and_route_planner(
+        config: ServerConfig,
+        clock: Arc<dyn SessionClock>,
+        adapter: Option<Arc<dyn MantleAdapter>>,
+        voice: Option<Arc<dyn VoiceBackend>>,
+        route_planner: RoutePlanner,
+    ) -> io::Result<Self> {
         let listener = TcpListener::bind(config.socket_address()).await?;
         Ok(Self {
             listener: Arc::new(listener),
-            state: Arc::new(AppState::new(config, clock, adapter, voice)),
+            state: Arc::new(AppState::new(config, clock, adapter, voice, route_planner)),
         })
     }
 
@@ -265,6 +305,12 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/version", get(version))
         .route("/v4/info", get(info))
         .route("/v4/stats", get(stats))
+        .route("/v4/routeplanner/status", get(route_planner_status))
+        .route(
+            "/v4/routeplanner/free/address",
+            post(route_planner_free_address),
+        )
+        .route("/v4/routeplanner/free/all", post(route_planner_free_all))
         .route("/crust/v1/info", get(crust_info))
         .route("/v4/loadtracks", get(load_tracks))
         .route("/v4/decodetrack", get(decode_track))
@@ -434,6 +480,188 @@ fn build_commit_time_ms() -> u64 {
 
 async fn stats(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(stats_value(state.stats.rest(&state.sessions), false))
+}
+
+async fn route_planner_status(State(state): State<Arc<AppState>>) -> Response {
+    let Some(snapshot) = state.route_planner.snapshot() else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+    // Lavalink 4.2.2 dereferences RotatingIpRoutePlanner.currentAddress before
+    // its first selection. Preserve that observed 500 boundary while keeping
+    // the panic/null bug outside Crust itself.
+    if matches!(
+        snapshot.details,
+        RoutePlannerDetails::Rotating {
+            current_address: None,
+            ..
+        }
+    ) {
+        return reference_internal_error("/v4/routeplanner/status");
+    }
+    Json(route_planner_value(snapshot)).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct RoutePlannerFreeAddress {
+    address: String,
+}
+
+async fn route_planner_free_address(
+    State(state): State<Arc<AppState>>,
+    uri: Uri,
+    request: Request,
+) -> Response {
+    let bytes = match axum::body::to_bytes(request.into_body(), MAX_ROUTE_PLANNER_BODY_BYTES).await
+    {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return protocol_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "RoutePlanner request body exceeds its limit",
+                uri.path(),
+                false,
+            );
+        }
+    };
+    let body = match serde_json::from_slice::<RoutePlannerFreeAddress>(&bytes) {
+        Ok(body) => body,
+        Err(_) => {
+            return protocol_error(
+                StatusCode::BAD_REQUEST,
+                "Invalid RoutePlanner address body",
+                uri.path(),
+                false,
+            );
+        }
+    };
+    if !state.route_planner.is_enabled() {
+        return protocol_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Can't access disabled route planner",
+            uri.path(),
+            false,
+        );
+    }
+    let address = match body.address.parse() {
+        Ok(address) => address,
+        Err(_) => {
+            return protocol_error(
+                StatusCode::BAD_REQUEST,
+                "Invalid RoutePlanner IP address",
+                uri.path(),
+                false,
+            );
+        }
+    };
+    state.route_planner.free_address(address);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn route_planner_free_all(State(state): State<Arc<AppState>>, uri: Uri) -> Response {
+    if !state.route_planner.is_enabled() {
+        return protocol_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Can't access disabled route planner",
+            uri.path(),
+            false,
+        );
+    }
+    state.route_planner.free_all_addresses();
+    StatusCode::NO_CONTENT.into_response()
+}
+
+fn route_planner_value(snapshot: RoutePlannerSnapshot) -> Value {
+    let RoutePlannerSnapshot {
+        strategy,
+        ip_block_type,
+        ip_block_size,
+        failing_addresses,
+        details: strategy_details,
+    } = snapshot;
+    let mut details = serde_json::Map::new();
+    details.insert(
+        "ipBlock".to_owned(),
+        json!({
+            "type": ip_block_type.wire_name(),
+            "size": ip_block_size,
+        }),
+    );
+    details.insert(
+        "failingAddresses".to_owned(),
+        Value::Array(
+            failing_addresses
+                .into_iter()
+                .map(|failure| {
+                    json!({
+                        "failingAddress": format!("/{}", failure.address),
+                        "failingTimestamp": failure.failing_timestamp,
+                        "failingTime": failing_time(failure.failing_timestamp),
+                    })
+                })
+                .collect(),
+        ),
+    );
+    match strategy_details {
+        RoutePlannerDetails::Rotating {
+            rotate_index,
+            ip_index,
+            current_address,
+        } => {
+            details.insert("rotateIndex".to_owned(), Value::String(rotate_index));
+            details.insert("ipIndex".to_owned(), Value::String(ip_index));
+            details.insert(
+                "currentAddress".to_owned(),
+                Value::String(
+                    current_address
+                        .map_or_else(|| "null".to_owned(), |address| format!("/{address}")),
+                ),
+            );
+        }
+        RoutePlannerDetails::Nano {
+            current_address_index,
+        } => {
+            details.insert(
+                "currentAddressIndex".to_owned(),
+                Value::String(current_address_index),
+            );
+        }
+        RoutePlannerDetails::RotatingNano {
+            block_index,
+            current_address_index,
+        } => {
+            details.insert("blockIndex".to_owned(), Value::String(block_index));
+            details.insert(
+                "currentAddressIndex".to_owned(),
+                Value::String(current_address_index),
+            );
+        }
+        RoutePlannerDetails::Balancing => {}
+    }
+    json!({
+        "class": strategy.class_name(),
+        "details": Value::Object(details),
+    })
+}
+
+fn failing_time(timestamp_ms: u64) -> String {
+    let timestamp_nanos = i128::from(timestamp_ms).saturating_mul(1_000_000);
+    OffsetDateTime::from_unix_timestamp_nanos(timestamp_nanos)
+        .ok()
+        .and_then(|timestamp| timestamp.format(&Rfc3339).ok())
+        .unwrap_or_else(|| timestamp_ms.to_string())
+}
+
+fn reference_internal_error(path: &str) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "timestamp": timestamp_ms(),
+            "status": 500,
+            "error": "Internal Server Error",
+            "path": path,
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Debug, Deserialize)]

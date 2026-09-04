@@ -14,7 +14,7 @@ use crust::media::{
     LoadRequest, MantleAdapter, MantlePlayer, MediaEvent, MediaFrame, MediaTrack, PlayerSnapshot,
     PlayerStatus, PlaylistInfo, ProcessingMode, TrackEndReason, TrackMetadata,
 };
-use crust::routeplanner::{RouteOutcome, RoutePlanner};
+use crust::routeplanner::{RouteEntry, RouteOutcome, RoutePlanner};
 use crust::voice::OpusPacket;
 use mantle_audio::EncodedFrameSlot;
 use mantle_core::{
@@ -43,7 +43,7 @@ const PLAYER_EVENT_CAPACITY: usize = 32;
 const FRAME_DURATION_MS: u16 = 20;
 
 thread_local! {
-    static THREAD_ROUTE: Cell<Option<u64>> = const { Cell::new(None) };
+    static THREAD_ROUTE: Cell<Option<RouteEntry>> = const { Cell::new(None) };
 }
 
 /// Mantle policy backed by the same state used by Crust RoutePlanner operations.
@@ -58,10 +58,14 @@ impl CrustOutboundRoutePolicy {
         Self { planner }
     }
 
+    fn begin_operation(&self) {
+        THREAD_ROUTE.with(|route| route.set(None));
+    }
+
     fn report_source(&self, outcome: RouteOutcome) {
-        THREAD_ROUTE.with(|identity| {
-            if let Some(identity) = identity.get() {
-                self.planner.report(identity, outcome);
+        THREAD_ROUTE.with(|route| {
+            if let Some(route) = route.take() {
+                self.planner.report(route, outcome);
             }
         });
     }
@@ -78,7 +82,7 @@ impl fmt::Debug for CrustOutboundRoutePolicy {
 impl OutboundRoutePolicy for CrustOutboundRoutePolicy {
     fn select_route(&self, context: OutboundRouteContext<'_>) -> Option<OutboundRoute> {
         let route = self.planner.select_for_authority(context.authority)?;
-        THREAD_ROUTE.with(|identity| identity.set(Some(route.identity)));
+        THREAD_ROUTE.with(|selected| selected.set(Some(route)));
         Some(OutboundRoute {
             local_ip: route.local_address,
             identity: route.identity,
@@ -92,7 +96,13 @@ impl OutboundRoutePolicy for CrustOutboundRoutePolicy {
             OutboundRouteOutcome::Timeout => RouteOutcome::Timeout,
             OutboundRouteOutcome::TransportFailure => RouteOutcome::TransportFailure,
         };
-        self.planner.report(route.identity, outcome);
+        self.planner.report(
+            RouteEntry {
+                identity: route.identity,
+                local_address: route.local_ip,
+            },
+            outcome,
+        );
     }
 }
 
@@ -229,6 +239,7 @@ impl MantleAdapter for RealMantleAdapter {
                 }
             });
             let result = tokio::task::spawn_blocking(move || {
+                route_policy.begin_operation();
                 let reference = SourceReference::new(Some(identifier), false);
                 let result = registry.load_with_cancellation(&reference, &worker_cancel);
                 match result {
@@ -1091,6 +1102,7 @@ fn open_playback(
     if cancellation.is_cancelled() {
         return Err(cancelled());
     }
+    route_policy.begin_operation();
     let decoded = decode_encoded(&registry, &encoded)?;
     let YoutubeSourceItem::Track(track) = decoded.item.item else {
         return Err(invalid_track());
@@ -1377,16 +1389,20 @@ fn decode_fixture_track(encoded: &EncodedTrack) -> Result<MediaTrack, AdapterErr
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::thread;
 
     use crust_testkit::{ADAPTER_CONFORMANCE_CHECKS, run_adapter_conformance};
+    use mantle_media::{HttpNetworkAccess, RemoteHttpClient, RemoteHttpOptions, RemoteHttpRequest};
 
     use super::*;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn real_adapter_passes_the_shared_contract_through_mantle() {
         let adapter = RealMantleAdapter::new(
-            RoutePlanner::new(std::iter::empty()),
+            RoutePlanner::disabled(),
             YoutubeSourceOptions::default(),
             YoutubeAuthentication::default(),
         )
@@ -1397,10 +1413,11 @@ mod tests {
 
     #[test]
     fn outbound_policy_preserves_identity_and_rejects_known_family_mismatch() {
-        let planner = RoutePlanner::new([
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            IpAddr::V6(Ipv6Addr::LOCALHOST),
-        ]);
+        let planner = RoutePlanner::configured(crust::routeplanner::RoutePlannerConfig::new(
+            crust::routeplanner::RoutePlannerStrategy::RotateOnBan,
+            ["::1/128"],
+        ))
+        .unwrap();
         let policy = CrustOutboundRoutePolicy::new(planner.clone());
         let selected = policy
             .select_route(OutboundRouteContext {
@@ -1409,11 +1426,56 @@ mod tests {
             })
             .unwrap();
         assert_eq!(selected.local_ip, IpAddr::V6(Ipv6Addr::LOCALHOST));
-        assert_eq!(selected.identity, 2);
+        assert_eq!(selected.identity, 1);
         policy.report_outcome(selected, OutboundRouteOutcome::Timeout);
+        assert!(planner.snapshot().unwrap().failing_addresses.is_empty());
+        policy.report_outcome(selected, OutboundRouteOutcome::TransportFailure);
+        assert_eq!(planner.snapshot().unwrap().failing_addresses.len(), 1);
+    }
+
+    #[test]
+    fn routed_mantle_requests_bind_the_selected_local_ip_without_cross_route_reuse() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut peers = Vec::new();
+            for stream in listener.incoming().take(2) {
+                let mut stream = stream.unwrap();
+                peers.push(stream.peer_addr().unwrap().ip());
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request).unwrap();
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
+                    .unwrap();
+            }
+            peers
+        });
+        let planner = RoutePlanner::configured(crust::routeplanner::RoutePlannerConfig::new(
+            crust::routeplanner::RoutePlannerStrategy::RotateOnBan,
+            ["127.0.0.2/31"],
+        ))
+        .unwrap();
+        let policy = Arc::new(CrustOutboundRoutePolicy::new(planner));
+        let options = RemoteHttpOptions {
+            network_access: HttpNetworkAccess::AllowPrivateNetworks,
+            max_retries: 0,
+            ..RemoteHttpOptions::default()
+        };
+        let client = RemoteHttpClient::with_route_policy(options, policy.clone()).unwrap();
+        let request = RemoteHttpRequest::get(format!("http://{address}/route")).unwrap();
+
+        assert_eq!(client.execute(&request).unwrap().body(), b"ok");
+        policy.report_source(RouteOutcome::SourceRateLimited);
+        assert_eq!(client.execute(&request).unwrap().body(), b"ok");
+
         assert_eq!(
-            planner.health()[1].last_outcome,
-            Some(RouteOutcome::Timeout)
+            server.join().unwrap(),
+            [
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3)),
+            ]
         );
     }
 }

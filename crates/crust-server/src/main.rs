@@ -18,14 +18,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = config_path()?;
     let config = ServerConfig::load(config_path.as_deref())?;
     let shutdown_timeout = config.shutdown_timeout;
-    let mantle: Arc<dyn MantleAdapter> = Arc::new(RealMantleAdapter::with_defaults(
-        RoutePlanner::new(std::iter::empty()),
-    )?);
+    let route_planner = RoutePlanner::disabled();
+    let mantle: Arc<dyn MantleAdapter> =
+        Arc::new(RealMantleAdapter::with_defaults(route_planner.clone())?);
     let voice = Arc::new(OtoVoiceBackend::with_defaults(
         config.max_players,
         config.max_concurrent_voice_connects,
     )?);
-    let server = CrustServer::bind_with_backends(config, mantle, voice).await?;
+    let server =
+        CrustServer::bind_with_backends_and_route_planner(config, mantle, voice, route_planner)
+            .await?;
     let address = server.local_address()?;
     tracing::info!(%address, "Crust server listening");
     let shutdown = CancellationToken::new();

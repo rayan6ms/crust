@@ -4,6 +4,11 @@
 //! Discord integration. The modules here are the smallest contracts needed to
 //! test those future orchestration layers independently and under overload.
 
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOCATOR: &stats_alloc::StatsAlloc<std::alloc::System> =
+    &stats_alloc::INSTRUMENTED_SYSTEM;
+
 pub mod filters;
 pub mod lifecycle;
 pub mod media;
