@@ -213,8 +213,11 @@ pub trait VoiceFrameSource: Send + Sync {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VoiceCounters {
+    /// Regular Opus frames sent on planned audio opportunities.
     pub sent: u64,
+    /// Planned opportunities where source audio was unavailable.
     pub nulled: u64,
+    /// Planned opportunities skipped before polling because the pacer was late.
     pub deficit: u64,
 }
 

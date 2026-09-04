@@ -171,6 +171,19 @@ async fn websocket_validates_headers_emits_ready_and_reconnects() {
     .unwrap();
     assert_eq!(first_ready["op"], "ready");
     assert_eq!(first_ready["resumed"], false);
+    let first_stats: Value = serde_json::from_str(
+        first
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_text()
+            .unwrap()
+            .as_ref(),
+    )
+    .unwrap();
+    assert_eq!(first_stats["op"], "stats");
+    assert_eq!(first_stats["frameStats"], Value::Null);
     first.send(Message::Text("ignored".into())).await.unwrap();
     first
         .send(Message::Ping(vec![1, 2, 3].into()))

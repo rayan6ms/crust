@@ -29,7 +29,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::session::{PublishError, SessionHandle, SessionPlayer, SessionPlayerRefresh};
+use crate::session::{
+    PublishError, SessionHandle, SessionPlayer, SessionPlayerRefresh, SessionPlayerStats,
+};
 use crate::track::track_value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +114,7 @@ struct PlayerInner {
     shutdown_requested: AtomicBool,
     deferred_audio: AtomicBool,
     periodic_updates: AtomicBool,
+    stats: Mutex<SessionPlayerStats>,
     state: tokio::sync::Mutex<PlayerState>,
     cached_update: Mutex<Arc<str>>,
     cancellation: CancellationToken,
@@ -295,6 +298,7 @@ impl PlayerHandle {
                 shutdown_requested: AtomicBool::new(false),
                 deferred_audio: AtomicBool::new(false),
                 periodic_updates: AtomicBool::new(false),
+                stats: Mutex::new(SessionPlayerStats::default()),
                 state: tokio::sync::Mutex::new(PlayerState::default()),
                 cached_update: Mutex::new(cached_update),
                 cancellation: CancellationToken::new(),
@@ -473,6 +477,14 @@ impl SessionPlayer for PlayerHandle {
 
     fn wants_periodic_updates(&self) -> bool {
         self.inner.periodic_updates.load(Ordering::Acquire)
+    }
+
+    fn stats(&self) -> SessionPlayerStats {
+        *self
+            .inner
+            .stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn snapshot(&self) -> Arc<str> {
@@ -1676,6 +1688,12 @@ async fn destroy(
         handle.inner.cancellation.cancel();
         state.destroyed = true;
         state.track = None;
+        handle
+            .inner
+            .stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .playing = false;
         (
             state.voice_connection.take(),
             state.mantle.take(),
@@ -1784,6 +1802,19 @@ fn cache_update(
         .inner
         .periodic_updates
         .store(state.track.is_some(), Ordering::Release);
+    {
+        let mut stats = handle
+            .inner
+            .stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        stats.playing = state.track.is_some() && !state.paused && !state.destroyed;
+        if let Some(snapshot) = voice_snapshot {
+            stats.sent = snapshot.counters.sent;
+            stats.nulled = snapshot.counters.nulled;
+            stats.deficit = snapshot.counters.deficit;
+        }
+    }
     let connected = voice_snapshot
         .is_some_and(|snapshot| matches!(snapshot.phase, crust::voice::VoicePhase::Connected));
     let ping = voice_snapshot

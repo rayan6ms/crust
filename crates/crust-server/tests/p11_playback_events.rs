@@ -105,8 +105,13 @@ async fn open_session_with_id(
     let (mut socket, _) = connect_async(request).await.unwrap();
     let ready = next_json(&mut socket).await;
     assert_eq!(ready["op"], "ready");
-    let session_id = ready["sessionId"].as_str().unwrap().to_owned();
-    (socket, session_id)
+    let ready_session_id = ready["sessionId"].as_str().unwrap().to_owned();
+    if session_id.is_none() {
+        let stats = next_json(&mut socket).await;
+        assert_eq!(stats["op"], "stats");
+        assert_eq!(stats["frameStats"], Value::Null);
+    }
+    (socket, ready_session_id)
 }
 
 fn patch(path: &str, body: Value) -> Request<Body> {

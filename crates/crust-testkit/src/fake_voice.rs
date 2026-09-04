@@ -265,6 +265,13 @@ impl FakeVoiceConnection {
             .ping = ping;
     }
 
+    pub fn set_counters(&self, counters: VoiceCounters) {
+        self.snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .counters = counters;
+    }
+
     pub fn try_transition_to(&self, phase: VoicePhase) -> Result<(), VoiceError> {
         self.snapshot
             .lock()

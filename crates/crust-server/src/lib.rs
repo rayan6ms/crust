@@ -1,6 +1,7 @@
 pub mod config;
 pub mod player;
 pub mod session;
+mod stats;
 mod track;
 
 use std::collections::HashSet;
@@ -8,7 +9,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::rejection::QueryRejection;
@@ -44,19 +45,22 @@ use session::{
     PlayerAdmissionError, PrepareError, PreparedSession, SessionClock, SessionPlayer,
     SessionRegistry, SessionSettingsUpdate, SystemSessionClock,
 };
+use stats::{StatsCollector, StatsSnapshot};
 
 pub const LAVALINK_VERSION: &str = "4.2.2";
 pub const MANTLE_REVISION: &str = "55b718058a36731e1c757b5edf53f432dc01ce3e";
+pub const CRUST_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const OTO_VERSION: &str = "0.0.0";
 
 struct AppState {
     config: ServerConfig,
-    started: Instant,
     next_request_id: AtomicU64,
     sessions: SessionRegistry,
     players: PlayerExecutor,
     adapter: Option<Arc<dyn MantleAdapter>>,
     load_requests: Arc<Semaphore>,
     source_requests: Arc<Semaphore>,
+    stats: StatsCollector,
 }
 
 impl AppState {
@@ -84,13 +88,13 @@ impl AppState {
         let source_requests = Arc::new(Semaphore::new(config.max_concurrent_source_requests));
         Self {
             config,
-            started: Instant::now(),
             next_request_id: AtomicU64::new(1),
             sessions,
             players,
             adapter,
             load_requests,
             source_requests,
+            stats: StatsCollector::new(),
         }
     }
 }
@@ -261,6 +265,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/version", get(version))
         .route("/v4/info", get(info))
         .route("/v4/stats", get(stats))
+        .route("/crust/v1/info", get(crust_info))
         .route("/v4/loadtracks", get(load_tracks))
         .route("/v4/decodetrack", get(decode_track))
         .route("/v4/decodetracks", post(decode_tracks))
@@ -297,6 +302,12 @@ async fn response_headers(
     response
         .headers_mut()
         .insert("lavalink-api-version", HeaderValue::from_static("4"));
+    response
+        .headers_mut()
+        .insert("x-crust-version", HeaderValue::from_static(CRUST_VERSION));
+    if let Ok(value) = HeaderValue::from_str(env!("CRUST_BUILD_COMMIT")) {
+        response.headers_mut().insert("x-crust-commit", value);
+    }
     if let Ok(value) = HeaderValue::from_str(&format!("{request_id:016x}")) {
         response.headers_mut().insert("x-request-id", value);
     }
@@ -347,17 +358,82 @@ async fn info() -> Json<Value> {
             "preRelease": ""
         },
         "buildTime": 0,
-        "git": {"branch": "unknown", "commit": "unknown", "commitTime": 0},
+        "git": {
+            "branch": env!("CRUST_BUILD_BRANCH"),
+            "commit": env!("CRUST_BUILD_COMMIT"),
+            "commitTime": build_commit_time_ms(),
+        },
         "jvm": format!("Rust {}", env!("CARGO_PKG_RUST_VERSION")),
         "lavaplayer": format!("Mantle {}", &MANTLE_REVISION[..12]),
         "sourceManagers": ["youtube"],
-        "filters": [],
+        "filters": [
+            "volume", "equalizer", "karaoke", "timescale", "tremolo", "vibrato",
+            "distortion", "rotation", "channelMix", "lowPass"
+        ],
         "plugins": []
     }))
 }
 
+async fn crust_info(State(state): State<Arc<AppState>>) -> Json<Value> {
+    Json(json!({
+        "name": "Crust",
+        "version": CRUST_VERSION,
+        "build": {
+            "profile": env!("CRUST_BUILD_PROFILE"),
+            "git": {
+                "branch": env!("CRUST_BUILD_BRANCH"),
+                "commit": env!("CRUST_BUILD_COMMIT"),
+                "commitTime": build_commit_time_ms(),
+                "dirty": env!("CRUST_BUILD_DIRTY").parse::<bool>().ok(),
+            }
+        },
+        "protocol": {
+            "name": "Lavalink",
+            "version": LAVALINK_VERSION,
+            "apiVersion": 4,
+        },
+        "runtime": {
+            "name": "Rust",
+            "minimumVersion": env!("CARGO_PKG_RUST_VERSION"),
+        },
+        "media": {
+            "name": "Mantle",
+            "version": "0.0.0",
+            "revision": MANTLE_REVISION,
+        },
+        "voice": {
+            "name": "Oto",
+            "version": OTO_VERSION,
+            "voiceGatewayVersion": 8,
+            "daveProtocolVersions": [1],
+        },
+        "statistics": {
+            "runtimeProvider": runtime_stats_provider(),
+            "runtimeRefreshIntervalMs": 30_000,
+            "websocketIntervalMs": u64::try_from(state.config.stats_interval.as_millis())
+                .unwrap_or(u64::MAX),
+        }
+    }))
+}
+
+const fn runtime_stats_provider() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "linux-procfs-cgroup"
+    } else {
+        "unavailable-zero-fallback"
+    }
+}
+
+fn build_commit_time_ms() -> u64 {
+    env!("CRUST_BUILD_COMMIT_TIME")
+        .parse::<u64>()
+        .ok()
+        .and_then(|seconds| seconds.checked_mul(1_000))
+        .unwrap_or(0)
+}
+
 async fn stats(State(state): State<Arc<AppState>>) -> Json<Value> {
-    Json(stats_value(&state, false))
+    Json(stats_value(state.stats.rest(&state.sessions), false))
 }
 
 #[derive(Debug, Deserialize)]
@@ -648,20 +724,8 @@ fn trace_requested(uri: &Uri) -> bool {
         .is_some_and(|query| query.split('&').any(|field| field == "trace=true"))
 }
 
-fn stats_value(state: &AppState, websocket: bool) -> Value {
-    let counts = state.sessions.counts();
-    let mut value = json!({
-        "frameStats": null,
-        "players": counts.players,
-        "playingPlayers": 0,
-        "uptime": u64::try_from(state.started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        "memory": {"free": 0, "used": 0, "allocated": 0, "reservable": 0},
-        "cpu": {
-            "cores": std::thread::available_parallelism().map_or(1, usize::from),
-            "systemLoad": 0.0,
-            "lavalinkLoad": 0.0
-        }
-    });
+fn stats_value(snapshot: StatsSnapshot, websocket: bool) -> Value {
+    let mut value = serde_json::to_value(snapshot).expect("stats serialization");
     if websocket {
         value
             .as_object_mut()
@@ -730,6 +794,8 @@ async fn websocket(
     let resumed = prepared.resumed();
     let session_id = prepared.id();
     let player_update_interval = state.config.player_update_interval;
+    let stats_interval = state.config.stats_interval;
+    let websocket_state = Arc::clone(&state);
     tracing::info!(
         user_id,
         client_name = ?client_name,
@@ -740,7 +806,15 @@ async fn websocket(
     let mut response = upgrade
         .max_message_size(64 * 1024)
         .max_frame_size(64 * 1024)
-        .on_upgrade(move |socket| websocket_session(socket, prepared, player_update_interval))
+        .on_upgrade(move |socket| {
+            websocket_session(
+                socket,
+                prepared,
+                websocket_state,
+                player_update_interval,
+                stats_interval,
+            )
+        })
         .into_response();
     response.headers_mut().insert(
         "session-resumed",
@@ -752,7 +826,9 @@ async fn websocket(
 async fn websocket_session(
     socket: WebSocket,
     prepared: PreparedSession,
+    state: Arc<AppState>,
     player_update_interval: Duration,
+    stats_interval: Duration,
 ) {
     let Ok(mut connection) = prepared.attach() else {
         return;
@@ -783,12 +859,27 @@ async fn websocket_session(
             return;
         }
     }
+    if !resumed {
+        let initial_stats = stats_value(state.stats.websocket(&state.sessions, &handle), true);
+        if sink
+            .send(Message::Text(initial_stats.to_string().into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
     let mut update_tick = tokio::time::interval(player_update_interval);
     update_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // `interval`'s first tick is immediate; initial/resumed snapshots above
     // already cover that state, so the first periodic update waits one full
     // configured interval.
     update_tick.tick().await;
+    let mut stats_tick = tokio::time::interval(stats_interval);
+    stats_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The initial stats message above corresponds to Lavalink's immediate
+    // scheduled run. Periodic sampling starts after one full interval.
+    stats_tick.tick().await;
     let mut refreshes = FuturesUnordered::new();
     let mut refreshing_guilds = HashSet::new();
     loop {
@@ -818,6 +909,15 @@ async fn websocket_session(
                     if refreshing_guilds.insert(guild_id) {
                         refreshes.push(player.refresh());
                     }
+                }
+            }
+            _ = stats_tick.tick() => {
+                let payload = Arc::from(stats_value(
+                    state.stats.websocket(&state.sessions, &handle),
+                    true,
+                ).to_string());
+                if handle.publish_stats(payload).is_err() {
+                    break;
                 }
             }
             Some((guild_id, payload)) = refreshes.next(), if !refreshes.is_empty() => {

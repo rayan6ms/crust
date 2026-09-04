@@ -90,8 +90,13 @@ async fn open_session_with_id(
     let (mut socket, _) = connect_async(request).await.unwrap();
     let ready = socket.next().await.unwrap().unwrap().into_text().unwrap();
     let ready: Value = serde_json::from_str(&ready).unwrap();
-    let session_id = ready["sessionId"].as_str().unwrap().to_owned();
-    (socket, session_id)
+    let ready_session_id = ready["sessionId"].as_str().unwrap().to_owned();
+    if session_id.is_none() {
+        let stats = socket.next().await.unwrap().unwrap().into_text().unwrap();
+        let stats: Value = serde_json::from_str(&stats).unwrap();
+        assert_eq!(stats["op"], "stats");
+    }
+    (socket, ready_session_id)
 }
 
 async fn request(app: &Router, request: Request<Body>) -> Response<Body> {

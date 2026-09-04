@@ -432,8 +432,8 @@ impl OtoVoiceConnection {
             ping: connection.gateway_rtt(),
             counters: VoiceCounters {
                 sent: stats.frames_sent(),
-                nulled: stats.silence_frames_sent(),
-                deficit: stats.frames_unavailable(),
+                nulled: stats.frames_unavailable(),
+                deficit: stats.skipped_deadlines(),
             },
         }
     }
@@ -1370,6 +1370,20 @@ mod tests {
             .unwrap();
         second_send.send(Some(frame(3))).await.unwrap();
         eventually_sent(&connection, 3).await;
+        let counters = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let counters = connection.snapshot().await.unwrap().counters;
+                if counters.nulled >= 5 {
+                    break counters;
+                }
+                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the pending source did not produce bounded null-frame accounting");
+        assert_eq!(counters.sent, 3);
+        assert_eq!(counters.deficit, 0);
         connection.stop_audio().await.unwrap();
         eventually(|| udp.capture().len() >= 8).await;
 

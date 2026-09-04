@@ -9,6 +9,7 @@ use serde::Deserialize;
 const MAX_PASSWORD_BYTES: usize = 16 * 1024;
 const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PLAYER_UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_STATS_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_PLAYER_EXECUTOR_SHARDS: usize = 1024;
 const MAX_PLAYER_COMMAND_CAPACITY: usize = 1_048_576;
@@ -34,6 +35,7 @@ pub struct ServerConfig {
     pub max_concurrent_source_requests: usize,
     pub max_concurrent_voice_connects: usize,
     pub player_update_interval: Duration,
+    pub stats_interval: Duration,
     pub shutdown_timeout: Duration,
 }
 
@@ -57,6 +59,7 @@ impl Default for ServerConfig {
             max_concurrent_source_requests: 64,
             max_concurrent_voice_connects: 16,
             player_update_interval: Duration::from_secs(5),
+            stats_interval: Duration::from_secs(60),
             shutdown_timeout: Duration::from_secs(30),
         }
     }
@@ -93,6 +96,7 @@ impl fmt::Debug for ServerConfig {
                 &self.max_concurrent_voice_connects,
             )
             .field("player_update_interval", &self.player_update_interval)
+            .field("stats_interval", &self.stats_interval)
             .field("shutdown_timeout", &self.shutdown_timeout)
             .finish()
     }
@@ -184,6 +188,9 @@ impl ServerConfig {
             if let Some(value) = crust.player_update_interval_ms {
                 self.player_update_interval = Duration::from_millis(value);
             }
+            if let Some(value) = crust.stats_interval_ms {
+                self.stats_interval = Duration::from_millis(value);
+            }
             if let Some(value) = crust.shutdown_timeout_ms {
                 self.shutdown_timeout = Duration::from_millis(value);
             }
@@ -273,6 +280,12 @@ impl ServerConfig {
                 .map_err(|_| ConfigError::Environment("CRUST_PLAYER_UPDATE_INTERVAL_MS"))?;
             self.player_update_interval = Duration::from_millis(milliseconds);
         }
+        if let Some(value) = environment("CRUST_STATS_INTERVAL_MS") {
+            let milliseconds = value
+                .parse()
+                .map_err(|_| ConfigError::Environment("CRUST_STATS_INTERVAL_MS"))?;
+            self.stats_interval = Duration::from_millis(milliseconds);
+        }
         if let Some(value) = environment("CRUST_SHUTDOWN_TIMEOUT_MS") {
             let milliseconds = value
                 .parse()
@@ -355,6 +368,11 @@ impl ServerConfig {
                 "player_update_interval must be between 1 ms and 24 hours",
             ));
         }
+        if self.stats_interval.is_zero() || self.stats_interval > MAX_STATS_INTERVAL {
+            return Err(ConfigError::Invalid(
+                "stats_interval must be between 1 ms and 24 hours",
+            ));
+        }
         if self.shutdown_timeout.is_zero() || self.shutdown_timeout > MAX_SHUTDOWN_TIMEOUT {
             return Err(ConfigError::Invalid(
                 "shutdown_timeout must be between 1 ms and 5 minutes",
@@ -432,6 +450,7 @@ struct FileCrust {
     max_concurrent_source_requests: Option<usize>,
     max_concurrent_voice_connects: Option<usize>,
     player_update_interval_ms: Option<u64>,
+    stats_interval_ms: Option<u64>,
     shutdown_timeout_ms: Option<u64>,
 }
 
@@ -500,6 +519,20 @@ mod tests {
         config.player_update_interval = Duration::ZERO;
         assert!(config.validate().is_err());
         config.player_update_interval = MAX_PLAYER_UPDATE_INTERVAL + Duration::from_millis(1);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn p12_stats_interval_is_bounded_and_configurable() {
+        let file: ConfigFile = serde_saphyr::from_str("crust:\n  statsIntervalMs: 25\n").unwrap();
+        let mut config = ServerConfig::default();
+        config.apply_file(file);
+        assert_eq!(config.stats_interval, Duration::from_millis(25));
+        assert!(config.validate().is_ok());
+
+        config.stats_interval = Duration::ZERO;
+        assert!(config.validate().is_err());
+        config.stats_interval = MAX_STATS_INTERVAL + Duration::from_millis(1);
         assert!(config.validate().is_err());
     }
 }

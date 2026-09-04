@@ -100,6 +100,9 @@ async fn open_session(
     let ready = socket.next().await.unwrap().unwrap().into_text().unwrap();
     let ready: Value = serde_json::from_str(&ready).unwrap();
     let session_id = ready["sessionId"].as_str().unwrap().to_owned();
+    let stats = socket.next().await.unwrap().unwrap().into_text().unwrap();
+    let stats: Value = serde_json::from_str(&stats).unwrap();
+    assert_eq!(stats["op"], "stats");
     (socket, session_id)
 }
 

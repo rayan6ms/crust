@@ -14,6 +14,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use crate::stats::{FrameStats, FrameWindow};
+
 pub const DEFAULT_RESUME_TIMEOUT_SECONDS: i64 = 60;
 
 pub trait SessionClock: Send + Sync + 'static {
@@ -50,6 +52,7 @@ pub trait SessionPlayer: Send + Sync + 'static {
     fn as_any(&self) -> &dyn Any;
     fn guild_id(&self) -> &str;
     fn wants_periodic_updates(&self) -> bool;
+    fn stats(&self) -> SessionPlayerStats;
     fn snapshot(&self) -> Arc<str>;
     fn refresh(&self) -> SessionPlayerRefresh;
     fn shutdown(&self);
@@ -74,6 +77,14 @@ pub struct SessionCounts {
     pub connected: usize,
     pub resumable: usize,
     pub players: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SessionPlayerStats {
+    pub playing: bool,
+    pub sent: u64,
+    pub nulled: u64,
+    pub deficit: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +151,7 @@ struct Session {
     client_name: Option<String>,
     critical_capacity: usize,
     coalesced_notify: Notify,
+    frame_window: Mutex<FrameWindow>,
     inner: Mutex<SessionInner>,
 }
 
@@ -331,6 +343,7 @@ impl SessionRegistry {
             client_name: client_name.map(str::to_owned),
             critical_capacity: self.critical_capacity(),
             coalesced_notify: Notify::new(),
+            frame_window: Mutex::new(FrameWindow::default()),
             inner: Mutex::new(SessionInner {
                 generation: 1,
                 lifecycle: SessionLifecycle::Connecting {
@@ -541,6 +554,33 @@ impl SessionRegistry {
             resumable,
             players: self.core.player_count.load(Ordering::Acquire),
         }
+    }
+
+    #[must_use]
+    pub fn player_stats(&self) -> Vec<SessionPlayerStats> {
+        self.cleanup_expired();
+        let players = {
+            let state = self
+                .core
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state
+                .sessions
+                .values()
+                .flat_map(|session| {
+                    session
+                        .inner
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .players
+                        .values()
+                        .map(|entry| Arc::clone(&entry.player))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        players.into_iter().map(|player| player.stats()).collect()
     }
 
     fn disconnect(&self, session: &Arc<Session>, generation: u64) {
@@ -799,6 +839,23 @@ impl SessionHandle {
             .collect()
     }
 
+    #[must_use]
+    pub fn player_stats(&self) -> Vec<(String, SessionPlayerStats)> {
+        self.players()
+            .into_iter()
+            .map(|player| (player.guild_id().to_owned(), player.stats()))
+            .collect()
+    }
+
+    pub(crate) fn frame_stats(&self) -> Option<FrameStats> {
+        let players = self.player_stats();
+        self.0
+            .frame_window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .update(players)
+    }
+
     pub fn publish_critical(&self, payload: Arc<str>) -> Result<(), PublishError> {
         self.publish_critical_message(payload, None).map(|_| ())
     }
@@ -993,6 +1050,10 @@ mod tests {
 
         fn wants_periodic_updates(&self) -> bool {
             true
+        }
+
+        fn stats(&self) -> SessionPlayerStats {
+            SessionPlayerStats::default()
         }
 
         fn snapshot(&self) -> Arc<str> {
