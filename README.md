@@ -1,6 +1,17 @@
 # Crust
 
-<img src="icons/crust.png" alt="Crust, a smiling rock mascot" width="160" height="160">
+<p align="center">
+  <img src="icons/crust.png" alt="Crust, a smiling rock mascot" width="160" height="160">
+</p>
+
+<p align="center">
+  <a href="https://github.com/rayan6ms/crust/actions/workflows/ci.yml">
+    <img src="https://github.com/rayan6ms/crust/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status">
+  </a>
+  <a href="#license">
+    <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License: MIT OR Apache-2.0">
+  </a>
+</p>
 
 Crust is a Rust-native Lavalink v4 compatible audio node. It provides the
 Lavalink REST and WebSocket API, sessions, players, filters, statistics,
@@ -71,7 +82,7 @@ acknowledged in `deny.toml`; runtime vulnerability checks remain enforced.
 ## License
 
 Crust is dual licensed under the MIT License or Apache License, Version 2.0.
-See `LICENSE-MIT` and `LICENSE-APACHE`. Dependencies retain their own licenses;
+See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE). Dependencies retain their own licenses;
 the build dependency inventory is available through `cargo metadata --locked`.
 See `NOTICE` for dependency and redistribution notes. Media codec patent
 rights and third-party service terms are separate from these software licenses.
