@@ -1,5 +1,7 @@
 # Crust
 
+<img src="icons/crust.png" alt="Crust, a smiling rock mascot" width="160" height="160">
+
 Crust is a Rust-native Lavalink v4 compatible audio node. It provides the
 Lavalink REST and WebSocket API, sessions, players, filters, statistics,
 RoutePlanner, configuration, operations, and a bounded Discord voice boundary.
