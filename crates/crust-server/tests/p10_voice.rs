@@ -122,6 +122,37 @@ async fn patch_json(app: &Router, path: &str, body: Value) -> (StatusCode, Value
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn player_volume_reaches_media_and_survives_filter_replacement_without_wire_leaks() {
+    let mantle = Arc::new(FakeMantle::default());
+    let voice = Arc::new(FakeVoiceBackend::new(64, 4));
+    let harness = Harness::new(Arc::clone(&mantle), voice).await;
+    let (socket, session_id) = open_session(harness.address, "300000000000000710").await;
+    let path = format!("/v4/sessions/{session_id}/players/800000000000000710");
+    for (update, volume, filter_volume) in [
+        (json!({"volume":37}), 37, None),
+        (json!({"filters":{"volume":0.5}}), 37, Some(0.5)),
+        (json!({"volume":0}), 0, Some(0.5)),
+        (json!({"filters":{}}), 0, None),
+        (json!({"volume":100}), 100, None),
+    ] {
+        let (status, player) = patch_json(&harness.app, &path, update).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(player["volume"], volume);
+        assert!(player["filters"].get("player_volume").is_none());
+        assert!(player["filters"].get("playerVolume").is_none());
+        let configuration = mantle.last_filters().expect("player volume reached Mantle");
+        assert_eq!(configuration.player_volume, Some(volume));
+        assert_eq!(configuration.volume, filter_volume);
+        assert_eq!(
+            configuration.is_effective(),
+            volume != 100 || filter_volume.is_some()
+        );
+    }
+    drop(socket);
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_shutdown_deadline_includes_voice_backend_teardown() {
     let mut config = ServerConfig::default();
     config.listen_address = IpAddr::V4(Ipv4Addr::LOCALHOST);

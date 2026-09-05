@@ -39,7 +39,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 crust-testkit = { path = "../crust-testkit" }
-oto = { git = "https://github.com/rayan6ms/oto", rev = "efa8c366123bc6894f27044e6067d2b0a1a80aba", features = ["testkit"] }
-oto-testkit = { git = "https://github.com/rayan6ms/oto", rev = "efa8c366123bc6894f27044e6067d2b0a1a80aba" }
+oto = { git = "https://github.com/rayan6ms/oto", rev = "efa16faa8a3bd472f0818f65bd89f745f6b97f6d", features = ["testkit"] }
+oto-testkit = { git = "https://github.com/rayan6ms/oto", rev = "efa16faa8a3bd472f0818f65bd89f745f6b97f6d" }
 tokio-tungstenite = "0.29.0"
 tower.workspace = true

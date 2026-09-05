@@ -61,6 +61,7 @@ struct FakeInner {
 
 #[derive(Debug, Default)]
 struct SnapshotProbe {
+    last_filters: Mutex<Option<FilterConfiguration>>,
     hold: AtomicBool,
     calls: AtomicUsize,
     active: AtomicUsize,
@@ -74,6 +75,15 @@ pub struct FakeMantle {
 }
 
 impl FakeMantle {
+    #[must_use]
+    pub fn last_filters(&self) -> Option<FilterConfiguration> {
+        self.inner
+            .snapshots
+            .last_filters
+            .lock()
+            .expect("filter probe lock poisoned")
+            .clone()
+    }
     #[must_use]
     pub fn new(config: FakeMantleConfig) -> Self {
         Self {
@@ -555,6 +565,11 @@ impl MantlePlayer for FakePlayer {
     ) -> AdapterFuture<'_, Result<(), AdapterError>> {
         Box::pin(async move {
             self.check(&cancellation)?;
+            *self
+                .snapshots
+                .last_filters
+                .lock()
+                .expect("filter probe lock poisoned") = Some(configuration.clone());
             let mut state = self.state.lock().expect("player lock poisoned");
             state.processing = if configuration.is_effective() {
                 ProcessingMode::Pcm

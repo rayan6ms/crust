@@ -3,7 +3,7 @@ use std::f32::consts::PI;
 use crust::filters::{FilterConfiguration, Karaoke, Modulation};
 use mantle_audio::{
     AudioFrameError, EqualizerFactory, FilterChainBuilder, PcmFilter, PcmFilterFactory, PcmFormat,
-    PcmFrame, StreamingPcmProcessor, StreamingPcmProgress,
+    PcmFrame, StreamingPcmProcessor, StreamingPcmProgress, VolumeLevel, apply_volume,
 };
 use microfft::Complex32;
 use microfft::complex::cfft_1024;
@@ -73,8 +73,40 @@ impl PcmFilterFactory for CrustFilterFactory {
         if let Some(smoothing) = config.low_pass_smoothing.filter(|value| *value > 1.0) {
             builder.push(LowPass::new(smoothing, format.channels()))?;
         }
+        if let Some(volume) = config.player_volume.filter(|volume| *volume != 100) {
+            builder.push(PlayerVolume(VolumeLevel::new(i32::from(volume))))?;
+        }
         Ok(())
     }
+}
+
+/// Lavaplayer applies player volume to signed PCM after the user filter chain.
+/// The fixed scratch buffer avoids a per-frame allocation and preserves Mantle's
+/// integer scaling/clipping rather than approximating it with the float filter.
+struct PlayerVolume(VolumeLevel);
+
+impl PcmFilter for PlayerVolume {
+    fn process(&mut self, frame: &mut PcmFrame) -> Result<(), AudioFrameError> {
+        if self.0 == VolumeLevel::MUTED {
+            frame.samples_mut().fill(0.0);
+            return Ok(());
+        }
+        let mut scratch = [0_i16; mantle_audio::COMPATIBLE_PCM_SAMPLES];
+        for samples in frame.samples_mut().chunks_mut(scratch.len()) {
+            for (output, input) in scratch.iter_mut().zip(samples.iter()) {
+                #[allow(clippy::cast_possible_truncation)]
+                let converted = (*input * 32_768.0) as i32;
+                *output = i16::try_from(converted.clamp(i32::from(i16::MIN), i32::from(i16::MAX)))
+                    .unwrap_or(0);
+            }
+            apply_volume(&mut scratch[..samples.len()], self.0);
+            for (output, input) in samples.iter_mut().zip(scratch.iter()) {
+                *output = f32::from(*input) / 32_768.0;
+            }
+        }
+        Ok(())
+    }
+    fn reset(&mut self) {}
 }
 
 struct Volume(f32);
@@ -1104,6 +1136,31 @@ mod tests {
             .copy_from_interleaved(samples, format, Some(Duration::ZERO))
             .unwrap();
         frame
+    }
+
+    #[test]
+    fn player_volume_matches_frozen_lavaplayer_signed_pcm_oracle_without_allocations() {
+        // Lavaplayer 2.2.6 PcmVolumeProcessor.applyVolume(100, volume, samples),
+        // executed independently against the reference JAR on 2026-09-05.
+        for (volume, expected) in [
+            (0, [0, 0, 0, 0]),
+            (37, [4929, -4929, 9859, -9859]),
+            (70, [10112, -10112, 20223, -20224]),
+            (100, [16384, -16384, 32767, -32768]),
+            (150, [32767, -32768, 32767, -32768]),
+            (200, [32767, -32768, 32767, -32768]),
+        ] {
+            let mut input = frame(&[0.5, -0.5, 32767.0 / 32768.0, -1.0]);
+            let mut filter = super::PlayerVolume(mantle_audio::VolumeLevel::new(volume));
+            assert_eq!(count_allocations(|| filter.process(&mut input).unwrap()), 0);
+            for (actual, expected) in input.samples().iter().zip(expected) {
+                assert_eq!(
+                    *actual,
+                    f32::from(i16::try_from(expected).unwrap()) / 32768.0,
+                    "volume {volume}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -63,6 +63,9 @@ pub struct ChannelMix {
 /// Effective core filters. Plugin JSON intentionally has no execution path.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct FilterConfiguration {
+    /// Player volume, applied after user filters using Lavaplayer's 0..=1000 scale.
+    /// None is the normal player level (100); distinct from the `filters.volume` gain.
+    pub player_volume: Option<u16>,
     pub volume: Option<f32>,
     pub equalizer: Option<[f32; EQUALIZER_BANDS]>,
     pub karaoke: Option<Karaoke>,
@@ -78,7 +81,8 @@ pub struct FilterConfiguration {
 impl FilterConfiguration {
     #[must_use]
     pub fn is_effective(&self) -> bool {
-        self.volume.is_some_and(|value| value != 1.0)
+        self.player_volume.is_some_and(|value| value != 100)
+            || self.volume.is_some_and(|value| value != 1.0)
             || self
                 .equalizer
                 .is_some_and(|bands| bands.into_iter().any(|gain| gain != 0.0))

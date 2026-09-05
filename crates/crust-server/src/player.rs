@@ -215,6 +215,7 @@ struct PlayerState {
     position_ms: u64,
     end_time_ms: Option<u64>,
     filters: Value,
+    filter_configuration: FilterConfiguration,
     voice: VoiceState,
     destroyed: bool,
 }
@@ -611,6 +612,7 @@ impl Default for PlayerState {
             position_ms: 0,
             end_time_ms: None,
             filters: json!({}),
+            filter_configuration: FilterConfiguration::default(),
             voice: VoiceState {
                 token: String::new(),
                 endpoint: String::new(),
@@ -927,6 +929,7 @@ async fn apply_update(
     validate_update(&update)?;
     let voice_changed = matches!(update.voice, PatchField::Value(_));
     let filters_changed = matches!(update.filters, PatchField::Value(_));
+    let volume_changed = matches!(update.volume, PatchField::Value(_));
     let pause_changed = matches!(update.paused, PatchField::Value(_));
     let position_changed = matches!(update.position, PatchField::Value(_));
     let updated_voice = if let PatchField::Value(voice) = &update.voice {
@@ -949,18 +952,30 @@ async fn apply_update(
         );
     }
 
-    if let PatchField::Value(volume) = update.volume {
-        state.volume = volume;
-    }
-    if let PatchField::Value(filters) = &update.filters {
-        let (wire, configuration) = normalize_filters(filters)?;
+    if volume_changed || filters_changed {
+        let volume = match update.volume {
+            PatchField::Value(volume) => volume,
+            _ => state.volume,
+        };
+        let (wire, mut configuration) = if let PatchField::Value(filters) = &update.filters {
+            normalize_filters(filters)?
+        } else {
+            (state.filters.clone(), state.filter_configuration.clone())
+        };
+        configuration.player_volume =
+            Some(u16::try_from(volume.clamp(0, 1000)).expect("clamped player volume"));
         if let Some(mantle) = &state.mantle {
             mantle
-                .set_filters(configuration, handle.inner.cancellation.child_token())
+                .set_filters(
+                    configuration.clone(),
+                    handle.inner.cancellation.child_token(),
+                )
                 .await
                 .map_err(map_adapter_error)?;
         }
         state.filters = wire;
+        state.filter_configuration = configuration;
+        state.volume = volume;
     }
     if let PatchField::Value(voice) = &update.voice {
         state.voice = voice.clone();
@@ -1095,8 +1110,12 @@ async fn apply_update(
         }
     }
 
-    let refresh_audio =
-        voice_changed || filters_changed || pause_changed || position_changed || replace_allowed;
+    let refresh_audio = voice_changed
+        || filters_changed
+        || volume_changed
+        || pause_changed
+        || position_changed
+        || replace_allowed;
     let voice_connection = state.voice_connection.clone();
     let mantle_for_snapshot = state.mantle.clone();
     let audio_action = if refresh_audio {
@@ -1461,6 +1480,7 @@ fn normalize_filters(filters: &Filters) -> Result<(Value, FilterConfiguration), 
         }
     }
     let configuration = FilterConfiguration {
+        player_volume: None,
         volume: value(&filters.volume),
         equalizer: matches!(filters.equalizer, PatchField::Value(_)).then_some(equalizer),
         karaoke: value(&filters.karaoke).map(|value| RuntimeKaraoke {
