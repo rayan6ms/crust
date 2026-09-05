@@ -6,10 +6,12 @@ Wants=network-online.target
 [Service]
 Type=simple
 # This is a rootless Podman service. Prepare the image as the same user with:
-#   podman build -f crust/Containerfile -t localhost/crust:dev Projects/
+#   podman build -t localhost/crust:dev .
+# Set server.address to 0.0.0.0 in the mounted configuration for container use.
 ExecStart=/usr/bin/podman run --rm --name crust \
   --userns=keep-id \
-  --publish 2333:2333 \
+  --security-opt=no-new-privileges --cap-drop=all \
+  --publish 127.0.0.1:2333:2333 \
   --volume %h/.config/crust/application.yml:/home/crust/application.yml:ro \
   --env-file %h/.config/crust/environment \
   localhost/crust:dev --config /home/crust/application.yml
@@ -17,10 +19,8 @@ ExecStop=/usr/bin/podman stop --time 30 crust
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=40s
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=read-only
+# Apply privilege restrictions to the container above, not the Podman process:
+# rootless Podman needs its writable user storage and subordinate-ID helpers.
 
 # Create the environment file with mode 0600. It should contain only runtime
 # secrets such as CRUST_PASSWORD and must never be committed or logged.

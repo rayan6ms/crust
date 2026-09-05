@@ -28,10 +28,7 @@ struct Point {
 }
 
 fn matrix() -> Matrix {
-    serde_json::from_str(include_str!(
-        "fixtures/overload.json"
-    ))
-    .unwrap()
+    serde_json::from_str(include_str!("fixtures/overload.json")).unwrap()
 }
 
 #[test]

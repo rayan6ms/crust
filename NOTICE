@@ -1,0 +1,24 @@
+Crust includes and links to independently licensed dependencies.
+
+The Mantle project is licensed under Apache License 2.0:
+https://github.com/rayan6ms/mantle
+
+The Oto project is licensed under MIT or Apache License 2.0:
+https://github.com/rayan6ms/oto
+
+Oto also carries independently licensed davey and OpenMLS adaptations. The
+root Cargo patch selects Oto's MIT-licensed openmls_rust_crypto adaptation.
+Symphonia and hpke-rs components are MPL-2.0 licensed. Mantle's native codec
+dependencies (including libopus and libxaac) retain their upstream licenses
+and notices. These dependencies are fetched during the build, not vendored
+in this Crust source repository.
+
+The complete dependency license and source inventory can be generated with
+`cargo metadata --locked` and reviewed with `cargo deny --locked check`.
+Cargo metadata alone is not a complete native-code attribution bundle.
+
+This publication contains Crust source, not prebuilt binaries. Distributors
+of binaries or container images must include the applicable dependency
+licenses/notices and satisfy source-availability obligations, including
+those for MPL-covered files. Crust's MIT/Apache license does not relicense
+third-party dependencies or grant codec patent rights.

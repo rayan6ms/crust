@@ -1,0 +1,15 @@
+.git
+target
+.cache
+.env
+.env.*
+application.yml
+logs
+AGENTS.md
+PLAN.md
+TASKS.md
+STATUS.md
+PROJECT_LEDGER.md
+SPEC_INDEX.md
+docs
+compatibility

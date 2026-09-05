@@ -1,0 +1,20 @@
+# Set LAVALINK_SERVER_PASSWORD in the environment before starting Crust.
+server:
+  address: 127.0.0.1
+  port: 2333
+lavalink:
+  server:
+    sources:
+      youtube: true
+      bandcamp: false
+      soundcloud: false
+      twitch: false
+      vimeo: false
+      nico: false
+      http: false
+      local: false
+    playerUpdateInterval: 5
+metrics:
+  prometheus:
+    enabled: false
+    endpoint: /metrics

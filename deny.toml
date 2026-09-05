@@ -5,7 +5,7 @@ all-features = true
 version = 2
 yanked = "deny"
 ignore = [
-  { id = "RUSTSEC-2026-0173", reason = "Accepted P10 debt: unmaintained proc-macro-error2 is build-time-only inside Oto's private DAVE graph; no runtime code or vulnerability is admitted." },
+  { id = "RUSTSEC-2026-0173", reason = "Unmaintained proc-macro-error2 is build-time-only in Oto's DAVE dependency graph; revisit when upstream removes it. Runtime vulnerabilities remain denied." },
 ]
 
 [licenses]
@@ -20,7 +20,6 @@ allow = [
   "BSL-1.0",
   "CDLA-Permissive-2.0",
   "ISC",
-  "LGPL-2.1-or-later",
   "MIT",
   "MPL-2.0",
   "Unicode-3.0",
@@ -29,14 +28,10 @@ allow = [
 ]
 
 [bans]
-# P01 and P10 keep a measured duplicate-subsystem inventory, including the
-# current Oto/OpenMLS crypto split. Version-line convergence remains an
-# evidence-based budget rather than a blanket dependency-graph rejection.
+# Oto/OpenMLS currently require multiple crypto dependency versions.
 multiple-versions = "allow"
-# Cargo-deny's wildcard lint cannot distinguish the intentionally versionless
-# workspace/local paths and exact-revision Mantle dependencies from an
-# accidental wildcard. Their identities are enforced by the P01/P04/P10
-# evidence checkers, while the source allowlist below remains fail-closed.
+# Workspace paths and exact-revision Git dependencies omit registry versions.
+# The source allowlist below remains fail-closed.
 wildcards = "allow"
 highlight = "all"
 
@@ -44,4 +39,4 @@ highlight = "all"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = ["https://github.com/rayan6ms/mantle"]
+allow-git = ["https://github.com/rayan6ms/mantle", "https://github.com/rayan6ms/oto"]

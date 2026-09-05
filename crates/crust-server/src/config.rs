@@ -1766,10 +1766,8 @@ mod tests {
 
     #[test]
     fn frozen_representative_fixture_loads_with_opaque_sections() {
-        let file: ConfigFile = serde_saphyr::from_str(include_str!(
-            "../tests/fixtures/config.yml"
-        ))
-        .unwrap();
+        let file: ConfigFile =
+            serde_saphyr::from_str(include_str!("../tests/fixtures/config.yml")).unwrap();
         let mut config = ServerConfig::default();
         config.apply_file(file).unwrap();
         assert!(config.route_planner().unwrap().is_enabled());

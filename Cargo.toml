@@ -13,6 +13,7 @@ resolver = "3"
 edition = "2024"
 rust-version = "1.97.1"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/rayan6ms/crust"
 
 [workspace.dependencies]
 base64 = "0.22.1"
@@ -35,4 +36,5 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 
 [patch.crates-io]
-openmls_rust_crypto = { path = "../oto/vendor/openmls_rust_crypto" }
+# Cargo only applies patches declared by the root workspace.
+openmls_rust_crypto = { git = "https://github.com/rayan6ms/oto", rev = "efa8c366123bc6894f27044e6067d2b0a1a80aba" }

@@ -1282,7 +1282,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "run through scripts/run_p13_bench.py"]
+    #[ignore = "manual release-profile route benchmark; run with --ignored --nocapture"]
     fn p13_routeplanner_selection_benchmark_report() {
         const OPERATIONS: u64 = 250_000;
         let cases = [

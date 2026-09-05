@@ -1470,7 +1470,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "run through scripts/run_p09_filter_bench.py"]
+    #[ignore = "manual release-profile filter benchmark; run with --ignored --nocapture"]
     fn p09_filter_benchmark_report() {
         use std::hint::black_box;
         use std::time::Instant;

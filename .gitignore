@@ -1,0 +1,18 @@
+/target/
+/.cache/
+/application.yml
+/.env
+/.env.*
+/logs/
+**/__pycache__/
+*.pyc
+
+# Local development notes and evidence are not part of the public project.
+/AGENTS.md
+/PLAN.md
+/TASKS.md
+/STATUS.md
+/PROJECT_LEDGER.md
+/SPEC_INDEX.md
+/docs/
+/compatibility/

@@ -1567,7 +1567,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "run through scripts/run_p10_oto_bench.py"]
+    #[ignore = "manual release-profile voice bridge benchmark; run with --ignored --nocapture"]
     async fn p10_bridge_target_scale_benchmark_report() {
         let senders = std::env::var("CRUST_P10_BENCH_SENDERS")
             .ok()
