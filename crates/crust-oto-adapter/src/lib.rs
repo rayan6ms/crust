@@ -19,7 +19,7 @@ use crust::voice::{
     VoiceError, VoiceErrorKind, VoiceEvent, VoiceFrameSource, VoiceFuture, VoicePhase,
     VoiceSnapshot,
 };
-use futures_util::{StreamExt, stream::FuturesUnordered, task::AtomicWaker};
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use oto::{FrameSource, FrameStatus, Oto, PacedAudioSender};
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
@@ -464,6 +464,11 @@ impl OtoVoiceConnection {
                 tracing::warn!(
                     ?failure,
                     source_overruns = state.stats().source_overruns(),
+                    source_overrun_wall_us = state.stats().last_source_overrun_wall().as_micros(),
+                    source_overrun_cpu_us = state
+                        .stats()
+                        .last_source_overrun_cpu()
+                        .map(|duration| duration.as_micros() as u64),
                     send_failures = state.stats().send_failures(),
                     skipped_deadlines = state.stats().skipped_deadlines(),
                     "audio sender stopped after a terminal failure"
@@ -608,7 +613,6 @@ impl FrameBridge {
     ) -> (OtoFrameSource, BridgeProducer, Arc<BridgeShared>) {
         let (frames, receiver) = mpsc::channel(1);
         let shared = Arc::new(BridgeShared {
-            waker: AtomicWaker::new(),
             consumed: Notify::new(),
             changed: Notify::new(),
             state: AtomicU8::new(BRIDGE_RUNNING),
@@ -635,7 +639,6 @@ impl FrameBridge {
 }
 
 struct BridgeShared {
-    waker: AtomicWaker,
     consumed: Notify,
     changed: Notify,
     state: AtomicU8,
@@ -650,7 +653,6 @@ impl BridgeShared {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
         self.state.store(BRIDGE_FAILED, Ordering::Release);
         self.changed.notify_waiters();
-        self.waker.wake();
     }
 
     fn take_failure(&self) -> Option<VoiceError> {
@@ -666,10 +668,14 @@ struct OtoFrameSource {
     shared: Arc<BridgeShared>,
 }
 
-impl OtoFrameSource {
-    fn try_frame(&mut self, output: &mut [u8]) -> Option<Poll<FrameStatus>> {
-        match self.frames.try_recv() {
-            Ok(frame) => {
+impl FrameSource for OtoFrameSource {
+    fn poll_frame(&mut self, cx: &mut Context<'_>, output: &mut [u8]) -> Poll<FrameStatus> {
+        // Tokio's try_recv can park the thread while a producer is publishing.
+        // poll_recv instead registers/rechecks readiness and yields on that
+        // race (or an exhausted cooperative budget). Channel closure also wakes
+        // a pending receiver after EOF, failure, or producer cancellation.
+        match self.frames.poll_recv(cx) {
+            Poll::Ready(Some(frame)) => {
                 let payload = frame.payload();
                 if payload.len() > output.len() {
                     self.shared.fail(VoiceError::new(
@@ -677,31 +683,15 @@ impl OtoFrameSource {
                         "Oto frame capacity is smaller than the Crust Opus frame",
                     ));
                     self.shared.consumed.notify_one();
-                    return Some(Poll::Ready(FrameStatus::Ended));
+                    return Poll::Ready(FrameStatus::Ended);
                 }
                 output[..payload.len()].copy_from_slice(payload);
                 self.shared.consumed.notify_one();
-                Some(Poll::Ready(FrameStatus::Frame { len: payload.len() }))
+                Poll::Ready(FrameStatus::Frame { len: payload.len() })
             }
-            Err(mpsc::error::TryRecvError::Disconnected) => Some(Poll::Ready(FrameStatus::Ended)),
-            Err(mpsc::error::TryRecvError::Empty) => None,
+            Poll::Ready(None) => Poll::Ready(FrameStatus::Ended),
+            Poll::Pending => Poll::Pending,
         }
-    }
-}
-
-impl FrameSource for OtoFrameSource {
-    fn poll_frame(&mut self, cx: &mut Context<'_>, output: &mut [u8]) -> Poll<FrameStatus> {
-        if let Some(result) = self.try_frame(output) {
-            return result;
-        }
-        self.shared.waker.register(cx.waker());
-        if let Some(result) = self.try_frame(output) {
-            return result;
-        }
-        if self.shared.state.load(Ordering::Acquire) != BRIDGE_RUNNING {
-            return Poll::Ready(FrameStatus::Ended);
-        }
-        Poll::Pending
     }
 }
 
@@ -722,7 +712,6 @@ async fn run_producer(
             Ok(Some(frame)) => frame,
             Ok(None) => {
                 shared.state.store(BRIDGE_ENDED, Ordering::Release);
-                shared.waker.wake();
                 return;
             }
             Err(error) => {
@@ -738,7 +727,6 @@ async fn run_producer(
         if !delivered {
             return;
         }
-        shared.waker.wake();
         tokio::select! {
             biased;
             () = cancellation.cancelled() => return,
@@ -1170,6 +1158,82 @@ mod tests {
             session_id: VoiceSecret::new("session"),
             token: VoiceSecret::new("token"),
         }
+    }
+
+    #[tokio::test]
+    async fn pending_consumer_wakes_when_the_producer_is_cancelled() {
+        let (mut bridge, producer, _) = FrameBridge::spawn(Arc::new(PendingSource));
+        let counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(Arc::clone(&counter));
+        let mut output = [0_u8; 16];
+        assert_eq!(poll(&mut bridge, &waker, &mut output), Poll::Pending);
+        producer.shutdown().await;
+        assert!(counter.0.load(Ordering::Acquire) > 0);
+        assert_eq!(
+            poll(&mut bridge, &waker, &mut output),
+            Poll::Ready(FrameStatus::Ended)
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_frame_survives_a_cooperative_yield_without_a_missed_wake() {
+        let (send, receive) = mpsc::channel(1);
+        let source = Arc::new(TestSource {
+            frames: AsyncMutex::new(receive),
+            polls: Arc::new(AtomicUsize::new(0)),
+        });
+        let (mut bridge, producer, _) = FrameBridge::spawn(source);
+        send.send(Some(frame(7))).await.unwrap();
+        eventually(|| !bridge.frames.is_empty()).await;
+        let counter = Arc::new(WakeCounter::default());
+        let waker = Waker::from(Arc::clone(&counter));
+        let mut output = [0_u8; 16];
+        while tokio::task::coop::has_budget_remaining() {
+            tokio::task::coop::consume_budget().await;
+        }
+        assert_eq!(poll(&mut bridge, &waker, &mut output), Poll::Pending);
+        tokio::task::yield_now().await;
+        assert!(counter.0.load(Ordering::Acquire) > 0);
+        assert_eq!(
+            poll(&mut bridge, &waker, &mut output),
+            Poll::Ready(FrameStatus::Frame { len: 2 })
+        );
+        assert_eq!(&output[..2], &[7, 0xff]);
+        producer.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_publication_preserves_every_frame_and_terminal_order() {
+        let (send, receive) = mpsc::channel(1);
+        let source = Arc::new(TestSource {
+            frames: AsyncMutex::new(receive),
+            polls: Arc::new(AtomicUsize::new(0)),
+        });
+        let (mut bridge, producer, _) = FrameBridge::spawn(source);
+        let publishing = tokio::spawn(async move {
+            for sequence in 0..4096 {
+                send.send(Some(frame(sequence))).await.unwrap();
+            }
+            send.send(None).await.unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut output = [0_u8; 16];
+            for sequence in 0..4096 {
+                assert_eq!(
+                    futures_util::future::poll_fn(|cx| bridge.poll_frame(cx, &mut output)).await,
+                    FrameStatus::Frame { len: 2 }
+                );
+                assert_eq!(&output[..2], &[sequence as u8, 0xff]);
+            }
+            assert_eq!(
+                futures_util::future::poll_fn(|cx| bridge.poll_frame(cx, &mut output)).await,
+                FrameStatus::Ended
+            );
+        })
+        .await
+        .expect("publication race must not strand the consumer");
+        publishing.await.unwrap();
+        producer.shutdown().await;
     }
 
     #[tokio::test]
