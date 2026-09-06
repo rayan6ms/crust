@@ -66,3 +66,16 @@ is restored to 16 frames (320 ms). A lifecycle-only audio shutdown log now
 preserves all sender counters; the latest node window was too late to classify
 the receiver gap. Do not claim the remaining gaps originate at the source,
 network, VM scheduler, or receiver until corresponding evidence is collected.
+
+The AtomicWaker consumption handoff still terminated on Oracle at 19:44:36 UTC:
+5.907 ms wall, 5.913 ms thread CPU, zero skipped deadlines and send failures.
+The new ring bridge removes both the mpsc receive semaphore lock and producer
+task wake from normal audio callbacks. A capacity-one rtrb 0.3.5 ring retains
+register/recheck consumer readiness; completion guards cover cancellation before
+the producer's first poll. The producer checks the consumption atomic after
+1 ms sleeps while its one frame is queued; it does not poll the media source on
+a timer. Cancellation still selects immediately. This is a deliberate prototype
+tradeoff pending Oracle results: the ten-sender benchmark increases CPU from
+roughly 1% to 3.33% of one core but lowers warmed process PSS from 3,694 to
+2,696 KiB; allocations remain 1,491/1,500 frames and no new threads. The 14 bridge
+tests plus abort-before-start regression and Clippy pass. No six-hour claim.

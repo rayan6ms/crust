@@ -15,6 +15,8 @@
 - [x] Retain Oto wall/CPU overrun timings in the terminal warning; run adapter tests, Clippy, and before/after bridge benchmark.
 - [x] Isolate the repeated overrun to producer notification and replace Notify's waiter lock with an atomic consumption permit; test readiness/cancellation and concurrent ordering.
 - [x] Test and revert 64-frame prefetch: receiver gaps remained and source-read causality was unproved. Retain lifecycle sender counters for the next diagnosis.
+- [x] Replace the remaining Tokio frame channel with a capacity-one rtrb ring and remove producer task waking from the audio callback; test startup cancellation and benchmark the timer cost.
+- [ ] Qualify the ring bridge on Oracle; CPU-bound source kill gate remains unchanged.
 
 - [x] Prove disabled RoutePlanner unnecessarily opens two TCP connections for two source requests.
 - [x] Use Mantle's pooled source/control and playback paths only when RoutePlanner is disabled; preserve enabled route isolation.

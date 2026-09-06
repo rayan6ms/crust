@@ -13,6 +13,7 @@ oto = { git = "https://github.com/rayan6ms/oto", rev = "3b770a93453b767e0c399a8e
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+rtrb = "0.3.5"
 
 [dev-dependencies]
 oto = { git = "https://github.com/rayan6ms/oto", rev = "3b770a93453b767e0c399a8e5dc23349205de280", features = ["testkit"] }

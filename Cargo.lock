@@ -614,6 +614,7 @@ dependencies = [
  "futures-util",
  "oto",
  "oto-testkit",
+ "rtrb",
  "serde_json",
  "stats_alloc",
  "tokio",
