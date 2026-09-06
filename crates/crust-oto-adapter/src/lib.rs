@@ -449,6 +449,34 @@ impl OtoVoiceConnection {
         };
         loop {
             let audio_changed = self.audio_changed.notified();
+            // Consult the current durable snapshot, rather than trusting an
+            // AudioChanged event that may belong to a replaced source. A dead
+            // sender cannot deliver more frames even if the gateway is healthy.
+            let failed_audio = self
+                .snapshot_sender
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map(PacedAudioSender::state)
+                .filter(|state| state.phase() == oto::AudioPhase::Failed);
+            if let Some(state) = failed_audio {
+                let failure = state.failure();
+                tracing::warn!(
+                    ?failure,
+                    source_overruns = state.stats().source_overruns(),
+                    send_failures = state.stats().send_failures(),
+                    skipped_deadlines = state.stats().skipped_deadlines(),
+                    "audio sender stopped after a terminal failure"
+                );
+                return Ok(Some(VoiceEvent::Closed(VoiceClose {
+                    code: 0,
+                    reason: Arc::from(match failure {
+                        Some(kind) => format!("audio sender failed: {kind:?}"),
+                        None => "audio sender failed".to_owned(),
+                    }),
+                    by_remote: false,
+                })));
+            }
             let shared = {
                 let audio = self
                     .audio
@@ -1394,6 +1422,66 @@ mod tests {
         );
         gateway.shutdown().await.unwrap();
         udp.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_audio_failure_is_reported_instead_of_leaving_a_playing_zombie() {
+        struct InvalidFrame;
+        impl FrameSource for InvalidFrame {
+            fn poll_frame(&mut self, _: &mut Context<'_>, output: &mut [u8]) -> Poll<FrameStatus> {
+                Poll::Ready(FrameStatus::Frame {
+                    len: output.len() + 1,
+                })
+            }
+        }
+        let (gateway, udp) = peer(FakeVoiceGatewayConfig::local()).await;
+        let oto = Oto::builder()
+            .test_tls_config(gateway.tls().client_config())
+            .build()
+            .unwrap();
+        let backend = OtoVoiceBackend::new(oto, 1, 1);
+        let _public = backend
+            .connect_inner(voice_info(&gateway, 3), CancellationToken::new())
+            .await
+            .unwrap();
+        let connection = backend
+            .inner
+            .connections
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .upgrade()
+            .unwrap();
+        connection
+            .set_source_inner(Arc::new(PendingSource), CancellationToken::new())
+            .await
+            .unwrap();
+        let sender = connection.snapshot_sender.lock().unwrap().clone().unwrap();
+        sender.replace_source(InvalidFrame).await.unwrap();
+        eventually(|| sender.state().phase() == oto::AudioPhase::Failed).await;
+        let observed = tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                if let Some(VoiceEvent::Closed(close)) = connection
+                    .next_event_inner(CancellationToken::new())
+                    .await
+                    .unwrap()
+                {
+                    break close;
+                }
+            }
+        })
+        .await;
+        // Always release the fake peer, including when the regression fails.
+        backend.shutdown_inner().await.unwrap();
+        gateway.shutdown().await.unwrap();
+        udp.shutdown().await.unwrap();
+        let close = observed.expect("terminal sender failure was silently ignored");
+        assert!(!close.by_remote);
+        assert_eq!(
+            close.reason.as_ref(),
+            "audio sender failed: FrameSourceContract"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -618,6 +618,7 @@ dependencies = [
  "stats_alloc",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -765,7 +766,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 [[package]]
 name = "davey"
 version = "0.1.4"
-source = "git+https://github.com/rayan6ms/oto?rev=efa16faa8a3bd472f0818f65bd89f745f6b97f6d#efa16faa8a3bd472f0818f65bd89f745f6b97f6d"
+source = "git+https://github.com/rayan6ms/oto?rev=3577fed5ce7d62da9b038476892aa937a63fc73b#3577fed5ce7d62da9b038476892aa937a63fc73b"
 dependencies = [
  "aead 0.5.2",
  "aes 0.8.4",
@@ -1661,6 +1662,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "linux-raw-sys"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+
+[[package]]
 name = "log"
 version = "0.4.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1932,7 +1939,7 @@ dependencies = [
 [[package]]
 name = "openmls_rust_crypto"
 version = "0.5.1"
-source = "git+https://github.com/rayan6ms/oto?rev=efa16faa8a3bd472f0818f65bd89f745f6b97f6d#efa16faa8a3bd472f0818f65bd89f745f6b97f6d"
+source = "git+https://github.com/rayan6ms/oto?rev=3577fed5ce7d62da9b038476892aa937a63fc73b#3577fed5ce7d62da9b038476892aa937a63fc73b"
 dependencies = [
  "aes-gcm 0.10.3",
  "chacha20poly1305 0.10.1",
@@ -1981,13 +1988,14 @@ dependencies = [
 [[package]]
 name = "oto"
 version = "1.0.0"
-source = "git+https://github.com/rayan6ms/oto?rev=efa16faa8a3bd472f0818f65bd89f745f6b97f6d#efa16faa8a3bd472f0818f65bd89f745f6b97f6d"
+source = "git+https://github.com/rayan6ms/oto?rev=3577fed5ce7d62da9b038476892aa937a63fc73b#3577fed5ce7d62da9b038476892aa937a63fc73b"
 dependencies = [
  "aes-gcm 0.11.1",
  "chacha20poly1305 0.11.0",
  "davey",
  "futures-util",
  "getrandom 0.4.3",
+ "rustix",
  "rustls",
  "serde",
  "serde_json",
@@ -1998,7 +2006,7 @@ dependencies = [
 [[package]]
 name = "oto-testkit"
 version = "1.0.0"
-source = "git+https://github.com/rayan6ms/oto?rev=efa16faa8a3bd472f0818f65bd89f745f6b97f6d#efa16faa8a3bd472f0818f65bd89f745f6b97f6d"
+source = "git+https://github.com/rayan6ms/oto?rev=3577fed5ce7d62da9b038476892aa937a63fc73b#3577fed5ce7d62da9b038476892aa937a63fc73b"
 dependencies = [
  "aes-gcm 0.11.1",
  "chacha20poly1305 0.11.0",
@@ -2457,6 +2465,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf0c4a6ece9950b9abdb62b1cfcf2a68b3b67a10ba445b3bb85be2a293d0632"
 dependencies = [
  "nom",
+]
+
+[[package]]
+name = "rustix"
+version = "1.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+dependencies = [
+ "bitflags",
+ "errno",
+ "libc",
+ "linux-raw-sys",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
