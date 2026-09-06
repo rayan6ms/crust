@@ -41,6 +41,9 @@ use filters::CrustFilterFactory;
 const PLAYER_COMMAND_CAPACITY: usize = 32;
 const PLAYER_EVENT_CAPACITY: usize = 32;
 const FRAME_DURATION_MS: u16 = 20;
+// 320 ms of encoded audio absorbs finite-source range-request jitter. Full
+// means stop reading; never drop frames. Allocate only for active playback.
+const MEDIA_READ_AHEAD_FRAMES: usize = 16;
 
 /// Operator-facing source options mapped by the Crust server into Mantle's
 /// validated YouTube and HTTP policy. Codec and DSP settings remain Mantle-owned.
@@ -689,19 +692,128 @@ struct PlayerActor {
     sequence: u64,
     events: VecDeque<MediaEvent>,
     filters: FilterConfiguration,
+    buffered: VecDeque<Result<BufferedFrame, AdapterError>>,
+    // Filter changes wait for the owned read without blocking frame delivery.
+    // Full rejects the new update explicitly; no accepted reply is dropped.
+    pending_filters: VecDeque<FilterUpdate>,
+    reading: Option<JoinHandle<ReadResult>>,
+    read_ahead_halted: bool,
+    processing: ProcessingMode,
+}
+
+struct BufferedFrame {
+    poll: PlaybackFramePoll,
+    source_position: Option<Duration>,
+}
+
+type ReadResult = (PlaybackSession, Result<BufferedFrame, AdapterError>);
+
+struct FilterUpdate {
+    configuration: Box<FilterConfiguration>,
+    reply: oneshot::Sender<Result<(), AdapterError>>,
 }
 
 impl PlayerActor {
     async fn run(mut self, mut commands: mpsc::Receiver<PlayerCommand>) {
-        while let Some(command) = commands.recv().await {
-            let terminal = matches!(command, PlayerCommand::Shutdown { .. });
-            self.handle(command).await;
-            if terminal {
-                break;
+        loop {
+            self.start_read_ahead();
+            tokio::select! {
+                biased;
+                command = commands.recv() => {
+                    let Some(command) = command else { break; };
+                    let terminal = matches!(command, PlayerCommand::Shutdown { .. });
+                    self.handle(command).await;
+                    if terminal { break; }
+                }
+                result = async { self.reading.as_mut().expect("guarded read").await }, if self.reading.is_some() => {
+                    self.reading = None;
+                    self.accept_read(result);
+                    self.apply_pending_filters().await;
+                }
             }
         }
+        self.settle_read().await;
         self.session = None;
         self.status = PlayerStatus::Shutdown;
+    }
+
+    fn start_read_ahead(&mut self) {
+        if self.reading.is_some()
+            || self.paused
+            || self.track.is_none()
+            || self.read_ahead_halted
+            || self.buffered.len() >= MEDIA_READ_AHEAD_FRAMES
+            || self
+                .session
+                .as_ref()
+                .is_none_or(|s| matches!(s, PlaybackSession::Live { .. }))
+        {
+            return;
+        }
+        let mut session = self.session.take().expect("active finite session");
+        self.reading = Some(tokio::task::spawn_blocking(move || {
+            let result = session.read_frame().map(|poll| BufferedFrame {
+                poll,
+                source_position: session.source_media_position(),
+            });
+            (session, result)
+        }));
+    }
+
+    fn accept_read(&mut self, result: Result<ReadResult, tokio::task::JoinError>) {
+        let frame = match result {
+            Ok((session, frame)) => {
+                self.session = Some(session);
+                frame
+            }
+            Err(_) => Err(invalid_operation("Mantle playback worker failed")),
+        };
+        self.read_ahead_halted = !matches!(
+            &frame,
+            Ok(BufferedFrame {
+                poll: PlaybackFramePoll::Frame(_),
+                ..
+            })
+        );
+        self.buffered.push_back(frame);
+    }
+
+    async fn settle_read(&mut self) {
+        if let Some(task) = self.reading.take() {
+            self.accept_read(task.await);
+        }
+        self.apply_pending_filters().await;
+    }
+
+    async fn apply_pending_filters(&mut self) {
+        while let Some(update) = self.pending_filters.pop_front() {
+            self.apply_filters(update).await;
+        }
+        // This queue is used only when a control overlaps a source read.
+        self.pending_filters = VecDeque::new();
+    }
+
+    async fn apply_filters(&mut self, update: FilterUpdate) {
+        let result = if self.session.is_some() {
+            let installed = update.configuration.clone();
+            self.with_settled_session(move |session| session.set_filters(&installed))
+                .await
+        } else {
+            Ok(())
+        };
+        if result.is_ok() {
+            self.filters = *update.configuration;
+            self.processing = self
+                .session
+                .as_ref()
+                .map_or(ProcessingMode::Passthrough, PlaybackSession::mode);
+        }
+        let _ = update.reply.send(result);
+    }
+
+    fn clear_read_ahead(&mut self) {
+        self.buffered.clear();
+        self.read_ahead_halted = false;
     }
 
     async fn handle(&mut self, command: PlayerCommand) {
@@ -734,10 +846,12 @@ impl PlayerActor {
                     .await;
                 if let Ok(position) = result {
                     self.position = position;
+                    self.clear_read_ahead();
                 }
                 let _ = reply.send(result.map(|_| ()));
             }
             PlayerCommand::Stop { reply } => {
+                self.settle_read().await;
                 let result = self.stop(TrackEndReason::Stopped);
                 let _ = reply.send(result);
             }
@@ -745,28 +859,29 @@ impl PlayerActor {
                 configuration,
                 reply,
             } => {
-                let result = if self.session.is_some() {
-                    let installed = configuration.clone();
-                    self.with_session(move |session| session.set_filters(&installed))
-                        .await
+                if self.reading.is_some() {
+                    if self.pending_filters.len() == PLAYER_COMMAND_CAPACITY {
+                        let _ = reply.send(Err(overloaded()));
+                    } else {
+                        self.pending_filters.push_back(FilterUpdate {
+                            configuration,
+                            reply,
+                        });
+                    }
                 } else {
-                    Ok(())
-                };
-                if result.is_ok() {
-                    self.filters = *configuration;
+                    self.apply_filters(FilterUpdate {
+                        configuration,
+                        reply,
+                    })
+                    .await;
                 }
-                let _ = reply.send(result);
             }
             PlayerCommand::Snapshot { reply } => {
-                let processing = self
-                    .session
-                    .as_ref()
-                    .map_or(ProcessingMode::Passthrough, PlaybackSession::mode);
                 let _ = reply.send(Ok(PlayerSnapshot {
                     status: self.status,
                     track: self.track.clone(),
                     position_ms: u64::try_from(self.position.as_millis()).unwrap_or(u64::MAX),
-                    processing,
+                    processing: self.processing,
                 }));
             }
             PlayerCommand::NextFrame { reply } => {
@@ -777,6 +892,8 @@ impl PlayerActor {
                 let _ = reply.send(Ok(self.events.pop_front()));
             }
             PlayerCommand::Shutdown { reply } => {
+                self.settle_read().await;
+                self.clear_read_ahead();
                 self.session = None;
                 self.track = None;
                 self.status = PlayerStatus::Shutdown;
@@ -793,6 +910,7 @@ impl PlayerActor {
         if self.events.len().saturating_add(2) > PLAYER_EVENT_CAPACITY {
             return Err(overloaded());
         }
+        self.settle_read().await;
         let manager = Arc::clone(&self.manager);
         let registry = Arc::clone(&self.registry);
         let policy = Arc::clone(&self.route_policy);
@@ -832,6 +950,9 @@ impl PlayerActor {
                 threshold_ms: 5_000,
             });
         }
+        self.clear_read_ahead();
+        self.buffered.reserve(MEDIA_READ_AHEAD_FRAMES);
+        self.processing = session.mode();
         self.session = Some(session);
         self.paused = false;
         self.status = PlayerStatus::Playing;
@@ -845,6 +966,9 @@ impl PlayerActor {
             return Err(overloaded());
         }
         self.session = None;
+        self.clear_read_ahead();
+        self.buffered = VecDeque::new();
+        self.processing = ProcessingMode::Passthrough;
         if let Some(track) = self.track.take() {
             self.events
                 .push_back(MediaEvent::TrackEnd { track, reason });
@@ -858,13 +982,24 @@ impl PlayerActor {
         if self.paused || self.track.is_none() {
             return Ok(PlayerFramePoll::Ended);
         }
-        match self.with_session(PlaybackSession::read_frame).await? {
+        if self.buffered.is_empty() {
+            self.settle_read().await;
+        }
+        let frame = match self.buffered.pop_front() {
+            Some(frame) => frame?,
+            None => {
+                self.with_session(|session| {
+                    session.read_frame().map(|poll| BufferedFrame {
+                        poll,
+                        source_position: session.source_media_position(),
+                    })
+                })
+                .await?
+            }
+        };
+        match frame.poll {
             PlaybackFramePoll::Frame((payload, timestamp)) => {
-                self.position = self
-                    .session
-                    .as_ref()
-                    .and_then(PlaybackSession::source_media_position)
-                    .unwrap_or(timestamp);
+                self.position = frame.source_position.unwrap_or(timestamp);
                 let frame = MediaFrame {
                     sequence: self.sequence,
                     duration_ms: FRAME_DURATION_MS,
@@ -883,6 +1018,14 @@ impl PlayerActor {
     }
 
     async fn with_session<T: Send + 'static>(
+        &mut self,
+        operation: impl FnOnce(&mut PlaybackSession) -> Result<T, AdapterError> + Send + 'static,
+    ) -> Result<T, AdapterError> {
+        self.settle_read().await;
+        self.with_settled_session(operation).await
+    }
+
+    async fn with_settled_session<T: Send + 'static>(
         &mut self,
         operation: impl FnOnce(&mut PlaybackSession) -> Result<T, AdapterError> + Send + 'static,
     ) -> Result<T, AdapterError> {
@@ -927,6 +1070,11 @@ impl RealMantlePlayer {
             sequence: 0,
             events: VecDeque::with_capacity(PLAYER_EVENT_CAPACITY),
             filters: FilterConfiguration::default(),
+            buffered: VecDeque::new(),
+            pending_filters: VecDeque::new(),
+            reading: None,
+            read_ahead_halted: false,
+            processing: ProcessingMode::Passthrough,
         };
         let task = tokio::spawn(actor.run(receiver));
         Arc::new(Self {
@@ -1440,6 +1588,301 @@ mod tests {
     };
 
     use super::*;
+
+    fn buffered_fixture_actor() -> PlayerActor {
+        let adapter = RealMantleAdapter::with_defaults(RoutePlanner::disabled()).unwrap();
+        let track = fixture_track("fixture:buffered").unwrap();
+        let session = FixtureSession::new(&track.metadata).unwrap();
+        PlayerActor {
+            manager: Arc::clone(&adapter.inner.manager),
+            registry: Arc::clone(&adapter.inner.registry),
+            route_policy: Arc::clone(&adapter.inner.route_policy),
+            session: Some(PlaybackSession::Fixture(Box::new(session))),
+            track: Some(track),
+            status: PlayerStatus::Playing,
+            paused: false,
+            position: Duration::ZERO,
+            sequence: 0,
+            events: VecDeque::new(),
+            filters: FilterConfiguration::default(),
+            buffered: VecDeque::new(),
+            pending_filters: VecDeque::new(),
+            reading: None,
+            read_ahead_halted: false,
+            processing: ProcessingMode::Passthrough,
+        }
+    }
+
+    #[tokio::test]
+    async fn read_ahead_is_bounded_and_eof_waits_for_the_last_delivered_frame() {
+        let mut actor = buffered_fixture_actor();
+        for _ in 0..(MEDIA_READ_AHEAD_FRAMES * 2) {
+            actor.start_read_ahead();
+            actor.settle_read().await;
+        }
+        assert_eq!(actor.buffered.len(), MEDIA_READ_AHEAD_FRAMES);
+        assert_eq!(
+            actor.position,
+            Duration::ZERO,
+            "decoded position must not become delivered position"
+        );
+        assert!(actor.events.is_empty());
+        assert_eq!(actor.status, PlayerStatus::Playing);
+        for expected in 0..16 {
+            let PlayerFramePoll::Frame(frame) = actor.next_frame().await.unwrap() else {
+                panic!("early EOF");
+            };
+            assert_eq!(frame.sequence, expected);
+            assert_eq!(frame.payload.as_slice(), &expected.to_be_bytes());
+            assert_eq!(actor.position, Duration::from_millis(expected * 20));
+            actor.start_read_ahead();
+            actor.settle_read().await;
+            assert!(
+                actor.events.is_empty(),
+                "prefetched EOF must not terminate the queued tail"
+            );
+        }
+        assert!(matches!(
+            actor.next_frame().await.unwrap(),
+            PlayerFramePoll::Ended
+        ));
+        assert!(matches!(
+            actor.events.pop_front(),
+            Some(MediaEvent::TrackEnd {
+                reason: TrackEndReason::Finished,
+                ..
+            })
+        ));
+        assert_eq!(actor.status, PlayerStatus::Stopped);
+        assert_eq!(
+            actor.buffered.capacity(),
+            0,
+            "stopped players release their buffer"
+        );
+    }
+
+    #[tokio::test]
+    async fn pause_retains_read_ahead_and_resume_delivers_in_order() {
+        let mut actor = buffered_fixture_actor();
+        for _ in 0..8 {
+            actor.start_read_ahead();
+            actor.settle_read().await;
+        }
+        let (reply, response) = oneshot::channel();
+        actor
+            .handle(PlayerCommand::Pause {
+                paused: true,
+                reply,
+            })
+            .await;
+        response.await.unwrap().unwrap();
+        let buffered = actor.buffered.len();
+        actor.start_read_ahead();
+        assert!(actor.reading.is_none());
+        assert!(matches!(
+            actor.next_frame().await.unwrap(),
+            PlayerFramePoll::Ended
+        ));
+        assert_eq!(actor.buffered.len(), buffered);
+        let (reply, response) = oneshot::channel();
+        actor
+            .handle(PlayerCommand::Pause {
+                paused: false,
+                reply,
+            })
+            .await;
+        response.await.unwrap().unwrap();
+        let PlayerFramePoll::Frame(frame) = actor.next_frame().await.unwrap() else {
+            panic!("resume lost the queued audio");
+        };
+        assert_eq!(frame.payload.as_slice(), &0_u64.to_be_bytes());
+        let (reply, response) = oneshot::channel();
+        actor.handle(PlayerCommand::Stop { reply }).await;
+        response.await.unwrap().unwrap();
+        assert!(actor.buffered.is_empty());
+        assert!(actor.reading.is_none());
+    }
+
+    #[tokio::test]
+    async fn buffered_audio_remains_available_while_next_read_is_blocked() {
+        let mut actor = buffered_fixture_actor();
+        for _ in 0..8 {
+            actor.start_read_ahead();
+            actor.settle_read().await;
+        }
+        let session = actor.session.take().unwrap();
+        let (release, wait) = oneshot::channel();
+        actor.reading = Some(tokio::spawn(async move {
+            let _ = wait.await;
+            (session, Err(load_failed()))
+        }));
+        // No timer advances and the pending read cannot finish. Existing frames
+        // and pause acknowledgements must still be available immediately.
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        let mut cx = Context::from_waker(Waker::noop());
+        for _ in 0..4 {
+            let mut request = Box::pin(actor.next_frame());
+            assert!(matches!(
+                request.as_mut().poll(&mut cx),
+                Poll::Ready(Ok(PlayerFramePoll::Frame(_)))
+            ));
+        }
+        let (reply, mut response) = oneshot::channel();
+        {
+            let mut pause = Box::pin(actor.handle(PlayerCommand::Pause {
+                paused: true,
+                reply,
+            }));
+            assert!(matches!(pause.as_mut().poll(&mut cx), Poll::Ready(())));
+        }
+        response.try_recv().unwrap().unwrap();
+        assert_eq!(actor.status, PlayerStatus::Paused);
+        let (reply, response) = oneshot::channel();
+        actor
+            .handle(PlayerCommand::Pause {
+                paused: false,
+                reply,
+            })
+            .await;
+        response.await.unwrap().unwrap();
+        release.send(()).unwrap();
+        actor.settle_read().await;
+        for _ in 0..4 {
+            assert!(matches!(
+                actor.next_frame().await.unwrap(),
+                PlayerFramePoll::Frame(_)
+            ));
+        }
+        assert_eq!(
+            actor.next_frame().await.err().unwrap(),
+            load_failed(),
+            "source errors follow already buffered audio"
+        );
+    }
+
+    #[tokio::test]
+    async fn filter_update_waiting_on_a_source_read_does_not_block_buffered_audio() {
+        let mut actor = buffered_fixture_actor();
+        for _ in 0..8 {
+            actor.start_read_ahead();
+            actor.settle_read().await;
+        }
+        let session = actor.session.take().unwrap();
+        let (release, wait) = oneshot::channel();
+        actor.reading = Some(tokio::spawn(async move {
+            let _ = wait.await;
+            (session, Err(load_failed()))
+        }));
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        let mut cx = Context::from_waker(Waker::noop());
+        let (reply, mut response) = oneshot::channel();
+        {
+            let mut update = Box::pin(actor.handle(PlayerCommand::SetFilters {
+                configuration: Box::default(),
+                reply,
+            }));
+            assert!(
+                matches!(update.as_mut().poll(&mut cx), Poll::Ready(())),
+                "a pending HTTP read must not hold the actor inside a filter command"
+            );
+        }
+        assert!(matches!(
+            response.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        for _ in 0..4 {
+            let mut frame = Box::pin(actor.next_frame());
+            assert!(matches!(
+                frame.as_mut().poll(&mut cx),
+                Poll::Ready(Ok(PlayerFramePoll::Frame(_)))
+            ));
+        }
+        release.send(()).unwrap();
+        actor.settle_read().await;
+        response.await.unwrap().unwrap();
+        assert_eq!(actor.buffered.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn deferred_filters_are_bounded_ordered_and_drained_before_stop() {
+        let mut actor = buffered_fixture_actor();
+        actor.start_read_ahead();
+        let mut replies = Vec::new();
+        for volume in 0..PLAYER_COMMAND_CAPACITY {
+            let (reply, response) = oneshot::channel();
+            actor
+                .handle(PlayerCommand::SetFilters {
+                    configuration: Box::new(FilterConfiguration {
+                        player_volume: Some(volume as u16),
+                        ..FilterConfiguration::default()
+                    }),
+                    reply,
+                })
+                .await;
+            replies.push(response);
+        }
+        let (reply, response) = oneshot::channel();
+        actor
+            .handle(PlayerCommand::SetFilters {
+                configuration: Box::default(),
+                reply,
+            })
+            .await;
+        assert_eq!(response.await.unwrap(), Err(overloaded()));
+        assert_eq!(actor.pending_filters.len(), PLAYER_COMMAND_CAPACITY);
+        let (reply, response) = oneshot::channel();
+        actor.handle(PlayerCommand::Stop { reply }).await;
+        response.await.unwrap().unwrap();
+        for response in replies {
+            response.await.unwrap().unwrap();
+        }
+        assert_eq!(
+            actor.filters.player_volume,
+            Some((PLAYER_COMMAND_CAPACITY - 1) as u16)
+        );
+        assert_eq!(actor.pending_filters.capacity(), 0);
+        assert_eq!(actor.status, PlayerStatus::Stopped);
+    }
+
+    #[tokio::test]
+    async fn seek_and_replacement_discard_frames_from_the_previous_position() {
+        let mut actor = buffered_fixture_actor();
+        for _ in 0..8 {
+            actor.start_read_ahead();
+            actor.settle_read().await;
+        }
+        actor.start_read_ahead();
+        let (reply, response) = oneshot::channel();
+        actor
+            .handle(PlayerCommand::Seek {
+                position: Duration::from_millis(120),
+                reply,
+            })
+            .await;
+        response.await.unwrap().unwrap();
+        assert!(actor.buffered.is_empty());
+        assert!(actor.reading.is_none());
+        assert_eq!(actor.position, Duration::from_millis(120));
+        actor.start_read_ahead();
+        actor.settle_read().await;
+        actor
+            .play(
+                fixture_track("fixture:short").unwrap(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let PlayerFramePoll::Frame(frame) = actor.next_frame().await.unwrap() else {
+            panic!("replacement did not start");
+        };
+        assert_eq!(frame.payload.as_slice(), &0_u64.to_be_bytes());
+        assert!(matches!(
+            actor.next_frame().await.unwrap(),
+            PlayerFramePoll::Ended
+        ));
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn real_adapter_passes_the_shared_contract_through_mantle() {
