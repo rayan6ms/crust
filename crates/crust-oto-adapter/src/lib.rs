@@ -353,6 +353,7 @@ impl OtoVoiceConnection {
             }
         };
         let stop_result = binding.sender.stop().await.map_err(map_oto_error);
+        report_stopped_sender(&binding.sender);
         binding.producer.shutdown().await;
         *self
             .snapshot_sender
@@ -399,6 +400,7 @@ impl OtoVoiceConnection {
             match slot {
                 Some(Some(binding)) => {
                     let _ = binding.sender.stop().await;
+                    report_stopped_sender(&binding.sender);
                     binding.producer.shutdown().await;
                     break;
                 }
@@ -603,6 +605,26 @@ impl VoiceConnection for OtoVoiceConnection {
     fn shutdown(&self) -> VoiceFuture<'_, Result<(), VoiceError>> {
         Box::pin(async move { self.shutdown_inner().await })
     }
+}
+
+// Lifecycle-only summary: preserve the entire sender's counters after shutdown
+// without per-frame logs, timers, or an extra observer task. FrameStats on the
+// Lavalink websocket otherwise retains only the last node-wide minute window.
+fn report_stopped_sender(sender: &PacedAudioSender) {
+    let state = sender.state();
+    let stats = state.stats();
+    tracing::info!(
+        frames_sent = stats.frames_sent(),
+        silence_frames_sent = stats.silence_frames_sent(),
+        frames_unavailable = stats.frames_unavailable(),
+        skipped_deadlines = stats.skipped_deadlines(),
+        send_failures = stats.send_failures(),
+        source_overruns = stats.source_overruns(),
+        max_lateness_us = stats.max_lateness().as_micros(),
+        phase = ?state.phase(),
+        failure = ?state.failure(),
+        "audio sender stopped"
+    );
 }
 
 struct FrameBridge;

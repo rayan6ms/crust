@@ -56,10 +56,13 @@ of Notify's per-frame waiter lock. Early consumption, latest-waker replacement,
 (14 tests). Temporary stage timing is removed; the CPU kill gate is unchanged.
 Live qualification still must show whether runtime wake cost also needs repair.
 
-The atomic handoff run stayed connected for 7m18s but recorded repeated
-600–770 ms receiver concealment and speaking drops, with no net packet loss.
-The existing finite-source read-ahead was 16 frames (320 ms), below these
-observed gaps. It is now 64 frames (1.28 s, about 80 KiB maximum Opus payload)
-with a fixture-specific 64-frame bounded test. The 19 adapter tests and Clippy
-pass. This is a measured reliability tradeoff, not a memory reduction; a fresh
-live run is required before a six-hour qualification.
+The atomic handoff run stayed connected for 7m19s but recorded a 605 ms
+mid-song quiet interval and 1.404 seconds total receiver concealment, with no
+reported packet loss. A 64-frame (1.28 s) prefetch experiment passed 19 adapter
+tests and Clippy, but its fresh 86-second receiver run still had a 751 ms
+mid-song quiet interval and four lost packets. That experiment did not isolate
+source-read delay and did not demonstrate a benefit, so production read-ahead
+is restored to 16 frames (320 ms). A lifecycle-only audio shutdown log now
+preserves all sender counters; the latest node window was too late to classify
+the receiver gap. Do not claim the remaining gaps originate at the source,
+network, VM scheduler, or receiver until corresponding evidence is collected.

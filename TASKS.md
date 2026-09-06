@@ -14,7 +14,7 @@
 - [x] Replace Tokio try_recv's possible parking path with poll_recv, remove the duplicate waker, and test cancellation, cooperative yielding, concurrent delivery, and terminal ordering.
 - [x] Retain Oto wall/CPU overrun timings in the terminal warning; run adapter tests, Clippy, and before/after bridge benchmark.
 - [x] Isolate the repeated overrun to producer notification and replace Notify's waiter lock with an atomic consumption permit; test readiness/cancellation and concurrent ordering.
-- [x] Increase finite-source read-ahead from 16 (320 ms) to 64 frames (1.28 s) after receiver evidence showed 600–770 ms mid-song concealment; update bounded-fixture coverage.
+- [x] Test and revert 64-frame prefetch: receiver gaps remained and source-read causality was unproved. Retain lifecycle sender counters for the next diagnosis.
 
 - [x] Prove disabled RoutePlanner unnecessarily opens two TCP connections for two source requests.
 - [x] Use Mantle's pooled source/control and playback paths only when RoutePlanner is disabled; preserve enabled route isolation.
