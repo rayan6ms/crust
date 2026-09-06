@@ -17,6 +17,9 @@
 - [x] Test and revert 64-frame prefetch: receiver gaps remained and source-read causality was unproved. Retain lifecycle sender counters for the next diagnosis.
 - [x] Replace the remaining Tokio frame channel with a capacity-one rtrb ring and remove producer task waking from the audio callback; test startup cancellation and benchmark the timer cost.
 - [ ] Qualify the ring bridge on Oracle; CPU-bound source kill gate remains unchanged.
+- [x] Correlate a receiver gap against actual outgoing packet timings and correct Raydio's suppressed lifecycle-summary log filter.
+- [x] Reproduce a 3.94-second frame-source wait without Discord and independently decode the actual Oracle output: no mid-song silence, clipping, or malformed durations.
+- [ ] Measure bounded compressed-source staging before selecting a source-network repair; distinguish downstream gaps from source starvation.
 
 - [x] Prove disabled RoutePlanner unnecessarily opens two TCP connections for two source requests.
 - [x] Use Mantle's pooled source/control and playback paths only when RoutePlanner is disabled; preserve enabled route isolation.

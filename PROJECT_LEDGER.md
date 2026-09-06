@@ -79,3 +79,16 @@ tradeoff pending Oracle results: the ten-sender benchmark increases CPU from
 roughly 1% to 3.33% of one core but lowers warmed process PSS from 3,694 to
 2,696 KiB; allocations remain 1,491/1,500 frames and no new threads. The 14 bridge
 tests plus abort-before-start regression and Clippy pass. No six-hour claim.
+
+Ring live diagnostics (Raydio evidence/ORACLE-ENDURANCE.md): four short runs
+had no CPU source overruns, but receiver gaps remain. One 461 ms quiet interval
+had 200 outgoing packets in a surrounding four-second window, max 26.676 ms
+spacing, no sequence/timestamp gaps, and no Discord DAVE failures. A different
+stats-only run had source starvation and 3.45 s silent concealment. Raydio's
+log filter had suppressed this adapter's info-level shutdown counters; b446bd6
+corrects it. An isolated source pull reproduced a 3.94 s wait; independent
+libopus decoding of Oracle output found no mid-song silence or malformed
+20 ms frames. Socket-read traces did not reproduce that long wait. Compressed
+file staging is being benchmarked as a bounded experiment before changing the
+media implementation. Neither downstream delivery nor six-hour reliability is
+qualified by these short runs.
