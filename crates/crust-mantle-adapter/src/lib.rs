@@ -217,17 +217,26 @@ impl RealMantleAdapter {
         Self::new(planner, options, YoutubeAuthentication::default())
     }
 
-    /// Creates a routed YouTube manager and registers it for Mantle track serialization.
+    /// Creates a YouTube manager and registers it for Mantle track serialization.
     pub fn new(
         planner: RoutePlanner,
         options: YoutubeSourceOptions,
         authentication: YoutubeAuthentication,
     ) -> Result<Self, AdapterError> {
         let route_policy = Arc::new(CrustOutboundRoutePolicy::new(planner));
-        let mantle_policy: Arc<dyn OutboundRoutePolicy> = route_policy.clone();
+        // Routed clients intentionally cannot reuse a connection across route changes.
+        // A disabled planner needs the ordinary pooled client, not a no-op policy.
+        let manager = if route_policy.planner.is_enabled() {
+            YoutubeAudioSourceManager::with_route_policy(
+                options,
+                authentication,
+                route_policy.clone(),
+            )
+        } else {
+            YoutubeAudioSourceManager::new(options, authentication)
+        };
         let manager = Arc::new(
-            YoutubeAudioSourceManager::with_route_policy(options, authentication, mantle_policy)
-                .map_err(|_| invalid_operation("invalid Mantle YouTube configuration"))?,
+            manager.map_err(|_| invalid_operation("invalid Mantle YouTube configuration"))?,
         );
         let mut registry = SourceRegistry::new(SourceRegistryLimits::default());
         registry
@@ -1299,29 +1308,43 @@ fn open_playback(
             route_policy.report_source(map_youtube_source_outcome(error.kind()));
             map_youtube_error(error.kind())
         })?;
-    let mantle_policy: Arc<dyn OutboundRoutePolicy> = route_policy.clone();
     let opened = if formats.selected().kind() == Some(YoutubePlaybackFormatKind::HlsMpegTsAac) {
-        manager
-            .open_selected_live_playback_routed(
+        let session = if route_policy.planner.is_enabled() {
+            manager.open_selected_live_playback_routed(
                 &formats,
                 YoutubeLivePlaybackOptions::default(),
                 media_cancel,
-                mantle_policy,
+                route_policy.clone(),
             )
-            .map(|session| PlaybackSession::Live {
-                session: Box::new(session),
-                now: Duration::ZERO,
-            })
+        } else {
+            manager.open_selected_live_playback(
+                &formats,
+                YoutubeLivePlaybackOptions::default(),
+                media_cancel,
+            )
+        };
+        session.map(|session| PlaybackSession::Live {
+            session: Box::new(session),
+            now: Duration::ZERO,
+        })
     } else {
-        manager
-            .open_selected_playback_routed(
+        let session = if route_policy.planner.is_enabled() {
+            manager.open_selected_playback_routed(
                 &formats,
                 HttpRangeOptions::default(),
                 MediaLimits::default(),
                 media_cancel,
-                mantle_policy,
+                route_policy.clone(),
             )
-            .map(PlaybackSession::Finite)
+        } else {
+            manager.open_selected_playback(
+                &formats,
+                HttpRangeOptions::default(),
+                MediaLimits::default(),
+                media_cancel,
+            )
+        };
+        session.map(PlaybackSession::Finite)
     };
     match opened {
         Ok(session) => {
@@ -1924,6 +1947,87 @@ mod tests {
         assert!(planner.snapshot().unwrap().failing_addresses.is_empty());
         policy.report_outcome(selected, OutboundRouteOutcome::TransportFailure);
         assert_eq!(planner.snapshot().unwrap().failing_addresses.len(), 1);
+    }
+
+    #[test]
+    fn disabled_route_planner_reuses_source_http_connection() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut connections = 0;
+            let mut requests = 0;
+            while requests < 2 && Instant::now() < deadline {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    thread::sleep(Duration::from_millis(1));
+                    continue;
+                };
+                connections += 1;
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                while requests < 2 {
+                    let mut header = Vec::new();
+                    let mut byte = [0];
+                    while header.len() < 8192 && !header.ends_with(b"\r\n\r\n") {
+                        if stream.read_exact(&mut byte).is_err() {
+                            break;
+                        }
+                        header.push(byte[0]);
+                    }
+                    if !header.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                    let header = String::from_utf8(header).unwrap();
+                    let length: usize = header
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().unwrap())
+                        })
+                        .unwrap_or(0);
+                    assert!(length < 8192);
+                    stream.read_exact(&mut vec![0; length]).unwrap();
+                    let body = br#"{"playabilityStatus":{"status":"OK"},"videoDetails":{"videoId":"dQw4w9WgXcQ","title":"Fixture","author":"Artist","lengthSeconds":"213"}}"#;
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n", body.len()).unwrap();
+                    stream.write_all(body).unwrap();
+                    requests += 1;
+                }
+            }
+            (connections, requests)
+        });
+        let adapter = RealMantleAdapter::new(
+            RoutePlanner::disabled(),
+            YoutubeSourceOptions {
+                api_base_url: format!("http://{address}"),
+                http: RemoteHttpOptions {
+                    network_access: HttpNetworkAccess::AllowPrivateNetworks,
+                    max_retries: 0,
+                    request_timeout: Duration::from_secs(3),
+                    ..RemoteHttpOptions::default()
+                },
+                ..YoutubeSourceOptions::default()
+            },
+            YoutubeAuthentication::default(),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            assert!(
+                adapter
+                    .inner
+                    .manager
+                    .load(&SourceReference::new(Some("dQw4w9WgXcQ".into()), false))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(
+            server.join().unwrap(),
+            (1, 2),
+            "two source requests reuse one TCP connection"
+        );
     }
 
     #[test]
