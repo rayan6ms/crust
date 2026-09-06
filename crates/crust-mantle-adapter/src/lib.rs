@@ -41,9 +41,10 @@ use filters::CrustFilterFactory;
 const PLAYER_COMMAND_CAPACITY: usize = 32;
 const PLAYER_EVENT_CAPACITY: usize = 32;
 const FRAME_DURATION_MS: u16 = 20;
-// 320 ms of encoded audio absorbs finite-source range-request jitter. Full
-// means stop reading; never drop frames. Allocate only for active playback.
-const MEDIA_READ_AHEAD_FRAMES: usize = 16;
+// 1.28 s of encoded audio absorbs finite-source range-request jitter observed
+// on the Oracle Micro. Full means stop reading; never drop frames. Allocate
+// only for active playback (about 80 KiB at the maximum Opus packet size).
+const MEDIA_READ_AHEAD_FRAMES: usize = 64;
 
 /// Operator-facing source options mapped by the Crust server into Mantle's
 /// validated YouTube and HTTP policy. Codec and DSP settings remain Mantle-owned.
@@ -1457,14 +1458,14 @@ impl FixtureSession {
         let player = engine
             .create_player(manager)
             .map_err(|_| invalid_operation("Mantle fixture player failed"))?;
-        let frame_count = if metadata.identifier == "fixture:short" {
-            1
-        } else {
-            16
+        let frame_count = match metadata.identifier.as_str() {
+            "fixture:short" => 1,
+            "fixture:buffered" => MEDIA_READ_AHEAD_FRAMES,
+            _ => 16,
         };
         let frames = (0..frame_count).map(|sequence| {
             mantle_core::Frame::synthetic(
-                Duration::from_millis(sequence * u64::from(FRAME_DURATION_MS)),
+                Duration::from_millis(sequence as u64 * u64::from(FRAME_DURATION_MS)),
                 sequence.to_be_bytes().to_vec(),
             )
         });
@@ -1651,13 +1652,13 @@ mod tests {
         );
         assert!(actor.events.is_empty());
         assert_eq!(actor.status, PlayerStatus::Playing);
-        for expected in 0..16 {
+        for expected in 0..MEDIA_READ_AHEAD_FRAMES {
             let PlayerFramePoll::Frame(frame) = actor.next_frame().await.unwrap() else {
                 panic!("early EOF");
             };
-            assert_eq!(frame.sequence, expected);
+            assert_eq!(frame.sequence, expected as u64);
             assert_eq!(frame.payload.as_slice(), &expected.to_be_bytes());
-            assert_eq!(actor.position, Duration::from_millis(expected * 20));
+            assert_eq!(actor.position, Duration::from_millis(expected as u64 * 20));
             actor.start_read_ahead();
             actor.settle_read().await;
             assert!(
