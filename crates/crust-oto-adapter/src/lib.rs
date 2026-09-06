@@ -19,7 +19,7 @@ use crust::voice::{
     VoiceError, VoiceErrorKind, VoiceEvent, VoiceFrameSource, VoiceFuture, VoicePhase,
     VoiceSnapshot,
 };
-use futures_util::{StreamExt, stream::FuturesUnordered};
+use futures_util::{StreamExt, stream::FuturesUnordered, task::AtomicWaker};
 use oto::{FrameSource, FrameStatus, Oto, PacedAudioSender};
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
@@ -613,7 +613,8 @@ impl FrameBridge {
     ) -> (OtoFrameSource, BridgeProducer, Arc<BridgeShared>) {
         let (frames, receiver) = mpsc::channel(1);
         let shared = Arc::new(BridgeShared {
-            consumed: Notify::new(),
+            consumed: AtomicBool::new(false),
+            producer_waker: AtomicWaker::new(),
             changed: Notify::new(),
             state: AtomicU8::new(BRIDGE_RUNNING),
             failure: Mutex::new(None),
@@ -639,13 +640,35 @@ impl FrameBridge {
 }
 
 struct BridgeShared {
-    consumed: Notify,
+    consumed: AtomicBool,
+    producer_waker: AtomicWaker,
     changed: Notify,
     state: AtomicU8,
     failure: Mutex<Option<VoiceError>>,
 }
 
 impl BridgeShared {
+    // Exactly one producer waits for exactly one delivered frame. Notify uses
+    // a waiter-list mutex here, and an Oracle trace measured 2.19 ms inside
+    // notify_one on the audio callback. Register/recheck the atomic permit
+    // instead; an early consumption stays ready until the producer takes it.
+    fn frame_consumed(&self) {
+        self.consumed.store(true, Ordering::Release);
+        self.producer_waker.wake();
+    }
+
+    fn poll_consumed(&self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.consumed.swap(false, Ordering::AcqRel) {
+            return Poll::Ready(());
+        }
+        self.producer_waker.register(cx.waker());
+        if self.consumed.swap(false, Ordering::AcqRel) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+
     fn fail(&self, error: VoiceError) {
         *self
             .failure
@@ -682,11 +705,11 @@ impl FrameSource for OtoFrameSource {
                         VoiceErrorKind::Protocol,
                         "Oto frame capacity is smaller than the Crust Opus frame",
                     ));
-                    self.shared.consumed.notify_one();
+                    self.shared.frame_consumed();
                     return Poll::Ready(FrameStatus::Ended);
                 }
                 output[..payload.len()].copy_from_slice(payload);
-                self.shared.consumed.notify_one();
+                self.shared.frame_consumed();
                 Poll::Ready(FrameStatus::Frame { len: payload.len() })
             }
             Poll::Ready(None) => Poll::Ready(FrameStatus::Ended),
@@ -730,7 +753,7 @@ async fn run_producer(
         tokio::select! {
             biased;
             () = cancellation.cancelled() => return,
-            () = shared.consumed.notified() => {}
+            () = futures_util::future::poll_fn(|cx| shared.poll_consumed(cx)) => {}
         }
         if shared.state.load(Ordering::Acquire) != BRIDGE_RUNNING {
             return;
@@ -1158,6 +1181,27 @@ mod tests {
             session_id: VoiceSecret::new("session"),
             token: VoiceSecret::new("token"),
         }
+    }
+
+    #[tokio::test]
+    async fn consumption_permit_is_retained_and_replaces_the_producer_waker() {
+        let (_bridge, producer, shared) = FrameBridge::spawn(Arc::new(PendingSource));
+        let first = Arc::new(WakeCounter::default());
+        let second = Arc::new(WakeCounter::default());
+        let first_waker = Waker::from(Arc::clone(&first));
+        let second_waker = Waker::from(Arc::clone(&second));
+        let mut cx = Context::from_waker(&first_waker);
+        shared.frame_consumed();
+        assert_eq!(shared.poll_consumed(&mut cx), Poll::Ready(()));
+        assert_eq!(shared.poll_consumed(&mut cx), Poll::Pending);
+        let mut cx = Context::from_waker(&second_waker);
+        assert_eq!(shared.poll_consumed(&mut cx), Poll::Pending);
+        shared.frame_consumed();
+        assert_eq!(first.0.load(Ordering::Acquire), 0);
+        assert!(second.0.load(Ordering::Acquire) > 0);
+        assert_eq!(shared.poll_consumed(&mut cx), Poll::Ready(()));
+        assert_eq!(shared.poll_consumed(&mut cx), Poll::Pending);
+        producer.shutdown().await;
     }
 
     #[tokio::test]
