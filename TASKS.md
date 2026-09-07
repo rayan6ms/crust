@@ -30,3 +30,7 @@
 - [x] Test repeat sequence reset, stopped controls, cancellation preflight, replacement failure, explicit stop/shutdown, oversized fallback, and existing adapter conformance.
 - [x] Run final adapter/server Clippy and publish the integration pin.
 - [ ] Compare the complete Oracle source and receiver paths in Raydio.
+
+- [x] Use Oto's concrete owned frame channel, removing duplicate Crust queue/readiness/consumption implementation without exempting arbitrary callbacks.
+- [x] Preserve cancellation, retained source errors, frame ordering, replacement, and source-read acknowledgement: 14 adapter tests pass with the published Oto pin; Clippy passes with warnings denied.
+- [ ] Validate the committed owned-channel integration on Oracle using Raydio's receiver and host metrics.

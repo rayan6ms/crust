@@ -11,16 +11,20 @@ use std::fmt;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+#[cfg(test)]
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+#[cfg(test)]
+use crust::voice::TimedOpusFrame;
 use crust::voice::{
-    TimedOpusFrame, VoiceBackend, VoiceClose, VoiceConnection, VoiceConnectionInfo, VoiceCounters,
-    VoiceError, VoiceErrorKind, VoiceEvent, VoiceFrameSource, VoiceFuture, VoicePhase,
-    VoiceSnapshot,
+    VoiceBackend, VoiceClose, VoiceConnection, VoiceConnectionInfo, VoiceCounters, VoiceError,
+    VoiceErrorKind, VoiceEvent, VoiceFrameSource, VoiceFuture, VoicePhase, VoiceSnapshot,
 };
-use futures_util::{StreamExt, stream::FuturesUnordered, task::AtomicWaker};
-use oto::{FrameSource, FrameStatus, Oto, PacedAudioSender};
+use futures_util::{StreamExt, stream::FuturesUnordered};
+#[cfg(test)]
+use oto::{FrameSource, FrameStatus};
+use oto::{Oto, PacedAudioSender};
 #[cfg(test)]
 use tokio::sync::mpsc;
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore};
@@ -293,7 +297,7 @@ impl OtoVoiceConnection {
         // rollback signal.
         let (oto_source, producer, shared) = FrameBridge::spawn(source);
         let binding = if let Some(previous) = previous {
-            match previous.sender.replace_source(oto_source).await {
+            match previous.sender.replace_channel(oto_source).await {
                 Ok(_) => {
                     previous.producer.shutdown().await;
                     AudioBinding {
@@ -309,7 +313,7 @@ impl OtoVoiceConnection {
                 }
             }
         } else {
-            match self.connection.start_audio(oto_source).await {
+            match self.connection.start_audio_channel(oto_source).await {
                 Ok(sender) => AudioBinding {
                     sender,
                     producer,
@@ -638,10 +642,8 @@ impl FrameBridge {
     fn spawn(
         source: Arc<dyn VoiceFrameSource>,
     ) -> (OtoFrameSource, BridgeProducer, Arc<BridgeShared>) {
-        let (frames, receiver) = rtrb::RingBuffer::new(1);
+        let (frames, receiver) = oto::frame_channel();
         let shared = Arc::new(BridgeShared {
-            consumed: AtomicBool::new(false),
-            consumer_waker: AtomicWaker::new(),
             changed: Notify::new(),
             state: AtomicU8::new(BRIDGE_RUNNING),
             failure: Mutex::new(None),
@@ -657,10 +659,7 @@ impl FrameBridge {
             run_producer(source, frames, task_shared, task_cancellation).await;
         });
         (
-            OtoFrameSource {
-                frames: receiver,
-                shared: Arc::clone(&shared),
-            },
+            receiver,
             BridgeProducer {
                 cancellation,
                 task: Some(task),
@@ -671,22 +670,12 @@ impl FrameBridge {
 }
 
 struct BridgeShared {
-    consumed: AtomicBool,
-    consumer_waker: AtomicWaker,
     changed: Notify,
     state: AtomicU8,
     failure: Mutex<Option<VoiceError>>,
 }
 
 impl BridgeShared {
-    // Exactly one producer waits for exactly one delivered frame. Notify uses
-    // a waiter-list mutex here, and an Oracle trace measured 2.19 ms inside
-    // notify_one on the audio callback. An early consumption stays ready until
-    // the producer observes and takes this permit.
-    fn frame_consumed(&self) {
-        self.consumed.store(true, Ordering::Release);
-    }
-
     fn fail(&self, error: VoiceError) {
         *self
             .failure
@@ -704,50 +693,7 @@ impl BridgeShared {
     }
 }
 
-struct OtoFrameSource {
-    frames: rtrb::Consumer<TimedOpusFrame>,
-    shared: Arc<BridgeShared>,
-}
-
-impl OtoFrameSource {
-    fn try_frame(&mut self, output: &mut [u8]) -> Option<FrameStatus> {
-        match self.frames.pop() {
-            Ok(frame) => {
-                let payload = frame.payload();
-                if payload.len() > output.len() {
-                    self.shared.fail(VoiceError::new(
-                        VoiceErrorKind::Protocol,
-                        "Oto frame capacity is smaller than the Crust Opus frame",
-                    ));
-                    self.shared.frame_consumed();
-                    return Some(FrameStatus::Ended);
-                }
-                output[..payload.len()].copy_from_slice(payload);
-                self.shared.frame_consumed();
-                Some(FrameStatus::Frame { len: payload.len() })
-            }
-            Err(rtrb::PopError::Empty) => None,
-        }
-    }
-}
-
-impl FrameSource for OtoFrameSource {
-    fn poll_frame(&mut self, cx: &mut Context<'_>, output: &mut [u8]) -> Poll<FrameStatus> {
-        if let Some(frame) = self.try_frame(output) {
-            return Poll::Ready(frame);
-        }
-        self.shared.consumer_waker.register(cx.waker());
-        if let Some(frame) = self.try_frame(output) {
-            return Poll::Ready(frame);
-        }
-        if self.shared.state.load(Ordering::Acquire) != BRIDGE_RUNNING {
-            // Observe terminal publication before the final ring check so a
-            // cancellation racing publication cannot discard its queued frame.
-            return Poll::Ready(self.try_frame(output).unwrap_or(FrameStatus::Ended));
-        }
-        Poll::Pending
-    }
-}
+type OtoFrameSource = oto::FrameReader;
 
 struct ProducerCompletion(Arc<BridgeShared>);
 
@@ -759,13 +705,13 @@ impl Drop for ProducerCompletion {
             Ordering::AcqRel,
             Ordering::Acquire,
         );
-        self.0.consumer_waker.wake();
+        self.0.changed.notify_waiters();
     }
 }
 
 async fn run_producer(
     source: Arc<dyn VoiceFrameSource>,
-    mut frames: rtrb::Producer<TimedOpusFrame>,
+    mut frames: oto::FrameWriter,
     shared: Arc<BridgeShared>,
     cancellation: CancellationToken,
 ) {
@@ -787,37 +733,24 @@ async fn run_producer(
                 return;
             }
         };
-        if cancellation.is_cancelled() || frames.is_abandoned() {
-            return;
-        }
-        if frames.push(frame).is_err() {
-            // The producer waits for consumption before pulling again. Full
-            // here indicates a bridge bug, not permission to drop old media.
-            shared.fail(VoiceError::new(
-                VoiceErrorKind::Protocol,
-                "audio bridge capacity invariant failed",
-            ));
-            return;
-        }
-        shared.consumer_waker.wake();
-        tokio::select! {
+        let sent = tokio::select! {
             biased;
             () = cancellation.cancelled() => return,
-            () = wait_for_consumption(&shared) => {}
+            result = frames.send(frame.payload()) => result,
+        };
+        match sent {
+            Ok(()) => {}
+            Err(oto::FrameSendError::Closed) => return,
+            Err(error) => {
+                let message = match error {
+                    oto::FrameSendError::InvalidLength => "invalid encoded frame length",
+                    oto::FrameSendError::Closed => "audio frame channel closed",
+                    oto::FrameSendError::OutputTooSmall => "audio frame output buffer too small",
+                };
+                shared.fail(VoiceError::new(VoiceErrorKind::Protocol, message));
+                return;
+            }
         }
-        if shared.state.load(Ordering::Acquire) != BRIDGE_RUNNING {
-            return;
-        }
-    }
-}
-
-async fn wait_for_consumption(shared: &BridgeShared) {
-    // Do not wake a Tokio task from Oto's real-time audio callback: runtime
-    // waker paths may contend with scheduler locks for milliseconds. This
-    // bounded bridge-side wait checks the atomic permit at 1 ms resolution;
-    // source polling itself remains readiness-driven and never runs here.
-    while !shared.consumed.swap(false, Ordering::AcqRel) {
-        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 
@@ -1259,15 +1192,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consumption_permit_is_retained_without_audio_thread_wakeup() {
-        let (_bridge, producer, shared) = FrameBridge::spawn(Arc::new(PendingSource));
-        shared.frame_consumed();
-        assert!(shared.consumed.swap(false, Ordering::AcqRel));
-        assert!(!shared.consumed.swap(false, Ordering::AcqRel));
-        producer.shutdown().await;
-    }
-
-    #[tokio::test]
     async fn pending_consumer_wakes_when_the_producer_is_cancelled() {
         let (mut bridge, producer, _) = FrameBridge::spawn(Arc::new(PendingSource));
         let counter = Arc::new(WakeCounter::default());
@@ -1290,11 +1214,13 @@ mod tests {
             polls: Arc::new(AtomicUsize::new(0)),
         });
         let (mut bridge, producer, _) = FrameBridge::spawn(source);
-        send.send(Some(frame(7))).await.unwrap();
-        eventually(|| bridge.frames.slots() != 0).await;
         let counter = Arc::new(WakeCounter::default());
         let waker = Waker::from(Arc::clone(&counter));
         let mut output = [0_u8; 16];
+        assert_eq!(poll(&mut bridge, &waker, &mut output), Poll::Pending);
+        send.send(Some(frame(7))).await.unwrap();
+        eventually(|| counter.0.load(Ordering::Acquire) > 0).await;
+        counter.0.store(0, Ordering::Release);
         while tokio::task::coop::has_budget_remaining() {
             tokio::task::coop::consume_budget().await;
         }
@@ -1483,6 +1409,7 @@ mod tests {
             poll(&mut bridge, &waker, &mut output),
             Poll::Ready(FrameStatus::Ended)
         );
+        eventually(|| shared.state.load(Ordering::Acquire) == BRIDGE_FAILED).await;
         assert_eq!(
             shared
                 .take_failure()
