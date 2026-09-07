@@ -19,9 +19,14 @@
 - [ ] Qualify the ring bridge on Oracle; CPU-bound source kill gate remains unchanged.
 - [x] Correlate a receiver gap against actual outgoing packet timings and correct Raydio's suppressed lifecycle-summary log filter.
 - [x] Reproduce a 3.94-second frame-source wait without Discord and independently decode the actual Oracle output: no mid-song silence, clipping, or malformed durations.
-- [ ] Measure bounded compressed-source staging before selecting a source-network repair; distinguish downstream gaps from source starvation.
+- [x] Measure bounded compressed-source staging: max source read 244.864 to 0.957 ms; keep downstream gaps separately qualified.
 
 - [x] Prove disabled RoutePlanner unnecessarily opens two TCP connections for two source requests.
 - [x] Use Mantle's pooled source/control and playback paths only when RoutePlanner is disabled; preserve enabled route isolation.
 - [x] Run regression, adapter/filter tests, and Clippy.
 - [x] Compare pooled playback on Oracle; retain the proved connection reuse reduction without claiming an audio speedup.
+
+- [x] Integrate opt-in staging and retain one completed compressed input per player, with fresh playback state and cancellation on repeat.
+- [x] Test repeat sequence reset, stopped controls, cancellation preflight, replacement failure, explicit stop/shutdown, oversized fallback, and existing adapter conformance.
+- [x] Run final adapter/server Clippy and publish the integration pin.
+- [ ] Compare the complete Oracle source and receiver paths in Raydio.

@@ -1677,7 +1677,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 [[package]]
 name = "mantle-audio"
 version = "0.0.0"
-source = "git+https://github.com/rayan6ms/mantle?rev=8be808baf31b667af42da0246d8f1cfaf4d2105d#8be808baf31b667af42da0246d8f1cfaf4d2105d"
+source = "git+https://github.com/rayan6ms/mantle?rev=6366cc60a46df7712f1e41219050dedc4cd190cc#6366cc60a46df7712f1e41219050dedc4cd190cc"
 dependencies = [
  "mantle-opus",
  "rtrb",
@@ -1687,12 +1687,12 @@ dependencies = [
 [[package]]
 name = "mantle-core"
 version = "0.0.0"
-source = "git+https://github.com/rayan6ms/mantle?rev=8be808baf31b667af42da0246d8f1cfaf4d2105d#8be808baf31b667af42da0246d8f1cfaf4d2105d"
+source = "git+https://github.com/rayan6ms/mantle?rev=6366cc60a46df7712f1e41219050dedc4cd190cc#6366cc60a46df7712f1e41219050dedc4cd190cc"
 
 [[package]]
 name = "mantle-media"
 version = "0.0.0"
-source = "git+https://github.com/rayan6ms/mantle?rev=8be808baf31b667af42da0246d8f1cfaf4d2105d#8be808baf31b667af42da0246d8f1cfaf4d2105d"
+source = "git+https://github.com/rayan6ms/mantle?rev=6366cc60a46df7712f1e41219050dedc4cd190cc#6366cc60a46df7712f1e41219050dedc4cd190cc"
 dependencies = [
  "aes 0.9.2",
  "cbc",
@@ -1713,7 +1713,7 @@ dependencies = [
 [[package]]
 name = "mantle-opus"
 version = "0.0.0"
-source = "git+https://github.com/rayan6ms/mantle?rev=8be808baf31b667af42da0246d8f1cfaf4d2105d#8be808baf31b667af42da0246d8f1cfaf4d2105d"
+source = "git+https://github.com/rayan6ms/mantle?rev=6366cc60a46df7712f1e41219050dedc4cd190cc#6366cc60a46df7712f1e41219050dedc4cd190cc"
 dependencies = [
  "opus-head-sys",
 ]
@@ -1721,7 +1721,7 @@ dependencies = [
 [[package]]
 name = "mantle-xaac"
 version = "0.0.0"
-source = "git+https://github.com/rayan6ms/mantle?rev=8be808baf31b667af42da0246d8f1cfaf4d2105d#8be808baf31b667af42da0246d8f1cfaf4d2105d"
+source = "git+https://github.com/rayan6ms/mantle?rev=6366cc60a46df7712f1e41219050dedc4cd190cc#6366cc60a46df7712f1e41219050dedc4cd190cc"
 
 [[package]]
 name = "matchers"

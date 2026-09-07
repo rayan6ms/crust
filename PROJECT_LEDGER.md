@@ -92,3 +92,12 @@ libopus decoding of Oracle output found no mid-song silence or malformed
 file staging is being benchmarked as a bounded experiment before changing the
 media implementation. Neither downstream delivery nor six-hour reliability is
 qualified by these short runs.
+
+Bounded staging integration: Mantle 6366cc60 stages small compressed finite
+objects through its existing HTTP policy. Crust defaults remain streaming;
+Raydio opts in. Natural EOF retains at most one compressed object and releases
+media processing state; repeat opens a fresh demuxer/decoder with a new token.
+Whole-session post-EOF seek was rejected after actual WebM and PCM evidence;
+no new hot-path synchronization was added. Adapter suite: 22 passed, two
+existing manual benchmarks excluded. Mantle exact Opus/AAC repeat verifies
+origin shutdown and independent cancellation. Oracle integration is pending.

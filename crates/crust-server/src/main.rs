@@ -20,6 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown_timeout = limits.shutdown_timeout();
     let route_planner = config.route_planner()?;
     let mantle_options = MantleAdapterOptions {
+        staging_max_bytes: 0,
         allow_youtube_search: config.search.youtube_enabled,
         max_playlist_pages: config.search.youtube_playlist_load_limit,
         connect_timeout: config.http_source.timeouts.connect,

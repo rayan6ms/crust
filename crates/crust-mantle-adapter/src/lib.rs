@@ -24,11 +24,11 @@ use mantle_core::{
 };
 use mantle_media::{
     HttpRangeOptions, MediaCancellation, MediaLimits, OutboundRoute, OutboundRouteContext,
-    OutboundRouteOutcome, OutboundRoutePolicy, RemoteHttpOptions, YoutubeAudioSourceManager,
-    YoutubeAuthentication, YoutubeErrorKind, YoutubeLivePlaybackOptions, YoutubeLivePlaybackPoll,
-    YoutubeLivePlaybackSession, YoutubePlaybackError, YoutubePlaybackErrorKind,
-    YoutubePlaybackFormatKind, YoutubePlaybackMode, YoutubePlaybackSession, YoutubeSourceItem,
-    YoutubeSourceOptions, YoutubeSourceTrack,
+    OutboundRouteOutcome, OutboundRoutePolicy, RemoteHttpOptions, StagedPlaybackInput,
+    YoutubeAudioSourceManager, YoutubeAuthentication, YoutubeErrorKind, YoutubeLivePlaybackOptions,
+    YoutubeLivePlaybackPoll, YoutubeLivePlaybackSession, YoutubePlaybackError,
+    YoutubePlaybackErrorKind, YoutubePlaybackFormatKind, YoutubePlaybackMode,
+    YoutubePlaybackSession, YoutubeSourceItem, YoutubeSourceOptions, YoutubeSourceTrack,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -49,6 +49,9 @@ const MEDIA_READ_AHEAD_FRAMES: usize = 16;
 /// validated YouTube and HTTP policy. Codec and DSP settings remain Mantle-owned.
 #[derive(Clone, Copy, Debug)]
 pub struct MantleAdapterOptions {
+    /// Stage compressed objects up to this size; zero disables it, maximum 64 MiB.
+    /// Larger objects and live sources continue streaming.
+    pub staging_max_bytes: u64,
     pub allow_youtube_search: bool,
     pub max_playlist_pages: usize,
     pub connect_timeout: Duration,
@@ -58,6 +61,7 @@ pub struct MantleAdapterOptions {
 impl Default for MantleAdapterOptions {
     fn default() -> Self {
         Self {
+            staging_max_bytes: 0,
             allow_youtube_search: true,
             max_playlist_pages: 6,
             connect_timeout: Duration::from_secs(10),
@@ -178,6 +182,7 @@ impl SourceManager<YoutubeSourceItem> for SharedYoutubeManager {
 }
 
 struct AdapterInner {
+    staging_max_bytes: u64,
     manager: Arc<YoutubeAudioSourceManager>,
     registry: Arc<SourceRegistry<YoutubeSourceItem>>,
     route_policy: Arc<CrustOutboundRoutePolicy>,
@@ -204,6 +209,9 @@ impl RealMantleAdapter {
         planner: RoutePlanner,
         settings: MantleAdapterOptions,
     ) -> Result<Self, AdapterError> {
+        if settings.staging_max_bytes > 64 * 1024 * 1024 {
+            return Err(invalid_operation("source staging ceiling exceeds 64 MiB"));
+        }
         let options = YoutubeSourceOptions {
             allow_search: settings.allow_youtube_search,
             max_playlist_pages: settings.max_playlist_pages,
@@ -214,7 +222,11 @@ impl RealMantleAdapter {
             },
             ..YoutubeSourceOptions::default()
         };
-        Self::new(planner, options, YoutubeAuthentication::default())
+        let mut adapter = Self::new(planner, options, YoutubeAuthentication::default())?;
+        Arc::get_mut(&mut adapter.inner)
+            .expect("new adapter is uniquely owned")
+            .staging_max_bytes = settings.staging_max_bytes;
+        Ok(adapter)
     }
 
     /// Creates a YouTube manager and registers it for Mantle track serialization.
@@ -244,6 +256,7 @@ impl RealMantleAdapter {
             .map_err(|_| invalid_operation("failed to register Mantle YouTube source"))?;
         Ok(Self {
             inner: Arc::new(AdapterInner {
+                staging_max_bytes: 0,
                 manager,
                 registry: Arc::new(registry),
                 route_policy,
@@ -358,6 +371,7 @@ impl MantleAdapter for RealMantleAdapter {
                 Arc::clone(&inner.manager),
                 Arc::clone(&inner.registry),
                 Arc::clone(&inner.route_policy),
+                inner.staging_max_bytes,
                 inner.shutdown.child_token(),
             );
             inner
@@ -522,6 +536,33 @@ enum PlaybackSession {
     },
     #[cfg(test)]
     Fixture(Box<FixtureSession>),
+}
+
+// Exactly one completed compressed input per player, without decoder/DSP state.
+enum CompletedInput {
+    Staged(StagedPlaybackInput),
+    #[cfg(test)]
+    Fixture(Box<TrackMetadata>),
+}
+
+impl CompletedInput {
+    fn open(self, cancellation: CancellationToken) -> Result<PlaybackSession, AdapterError> {
+        if cancellation.is_cancelled() {
+            return Err(cancelled());
+        }
+        match self {
+            Self::Staged(input) => input
+                .open(MediaCancellation::linked(move || {
+                    cancellation.is_cancelled()
+                }))
+                .map(PlaybackSession::Finite)
+                .map_err(map_playback_error),
+            #[cfg(test)]
+            Self::Fixture(metadata) => FixtureSession::new(&metadata)
+                .map(Box::new)
+                .map(PlaybackSession::Fixture),
+        }
+    }
 }
 
 type EncodedPlaybackFrame = (OpusPacket, Duration);
@@ -690,6 +731,8 @@ enum PlayerCommand {
 }
 
 struct PlayerActor {
+    staging_max_bytes: u64,
+    completed_input: Option<(EncodedTrack, CompletedInput)>,
     manager: Arc<YoutubeAudioSourceManager>,
     registry: Arc<SourceRegistry<YoutubeSourceItem>>,
     route_policy: Arc<CrustOutboundRoutePolicy>,
@@ -904,6 +947,7 @@ impl PlayerActor {
                 self.settle_read().await;
                 self.clear_read_ahead();
                 self.session = None;
+                self.completed_input = None;
                 self.track = None;
                 self.status = PlayerStatus::Shutdown;
                 let _ = reply.send(Ok(()));
@@ -916,6 +960,9 @@ impl PlayerActor {
         track: MediaTrack,
         cancellation: CancellationToken,
     ) -> Result<(), AdapterError> {
+        if cancellation.is_cancelled() {
+            return Err(cancelled());
+        }
         if self.events.len().saturating_add(2) > PLAYER_EVENT_CAPACITY {
             return Err(overloaded());
         }
@@ -924,9 +971,26 @@ impl PlayerActor {
         let registry = Arc::clone(&self.registry);
         let policy = Arc::clone(&self.route_policy);
         let encoded = track.encoded.clone();
+        let completed = self.completed_input.take();
+        let staging_max_bytes = self.staging_max_bytes;
         let cancellation_for_open = cancellation.clone();
         let mut session = tokio::task::spawn_blocking(move || {
-            open_playback(manager, registry, policy, encoded, cancellation_for_open)
+            if cancellation_for_open.is_cancelled() {
+                return Err(cancelled());
+            }
+            if let Some((previous, input)) = completed
+                && previous == encoded
+            {
+                return input.open(cancellation_for_open);
+            }
+            open_playback(
+                manager,
+                registry,
+                policy,
+                encoded,
+                cancellation_for_open,
+                staging_max_bytes,
+            )
         })
         .await
         .map_err(|_| invalid_operation("Mantle playback worker failed"))??;
@@ -974,7 +1038,28 @@ impl PlayerActor {
         if self.track.is_some() && self.events.len() == PLAYER_EVENT_CAPACITY {
             return Err(overloaded());
         }
-        self.session = None;
+        // Natural EOF retains compressed bytes only. Stop, replacement, error,
+        // shutdown, and the owning player's idle cleanup release the object.
+        let completed = self.session.take().and_then(|session| match session {
+            PlaybackSession::Finite(session) => {
+                session.into_staged_input().map(CompletedInput::Staged)
+            }
+            PlaybackSession::Live { .. } => None,
+            #[cfg(test)]
+            PlaybackSession::Fixture(_) => self
+                .track
+                .as_ref()
+                .filter(|track| track.metadata.identifier == "fixture:staged")
+                .map(|track| CompletedInput::Fixture(Box::new(track.metadata.clone()))),
+        });
+        self.completed_input =
+            if matches!(reason, TrackEndReason::Finished) && self.staging_max_bytes != 0 {
+                self.track
+                    .as_ref()
+                    .and_then(|track| completed.map(|input| (track.encoded.clone(), input)))
+            } else {
+                None
+            };
         self.clear_read_ahead();
         self.buffered = VecDeque::new();
         self.processing = ProcessingMode::Passthrough;
@@ -1064,10 +1149,13 @@ impl RealMantlePlayer {
         manager: Arc<YoutubeAudioSourceManager>,
         registry: Arc<SourceRegistry<YoutubeSourceItem>>,
         route_policy: Arc<CrustOutboundRoutePolicy>,
+        staging_max_bytes: u64,
         shutdown: CancellationToken,
     ) -> Arc<Self> {
         let (commands, receiver) = mpsc::channel(PLAYER_COMMAND_CAPACITY);
         let actor = PlayerActor {
+            staging_max_bytes,
+            completed_input: None,
             manager,
             registry,
             route_policy,
@@ -1286,6 +1374,7 @@ fn open_playback(
     route_policy: Arc<CrustOutboundRoutePolicy>,
     encoded: EncodedTrack,
     cancellation: CancellationToken,
+    staging_max_bytes: u64,
 ) -> Result<PlaybackSession, AdapterError> {
     #[cfg(test)]
     if let Ok(track) = decode_fixture_track(&encoded) {
@@ -1331,7 +1420,10 @@ fn open_playback(
         let session = if route_policy.planner.is_enabled() {
             manager.open_selected_playback_routed(
                 &formats,
-                HttpRangeOptions::default(),
+                HttpRangeOptions {
+                    staging_max_bytes,
+                    ..HttpRangeOptions::default()
+                },
                 MediaLimits::default(),
                 media_cancel,
                 route_policy.clone(),
@@ -1339,7 +1431,10 @@ fn open_playback(
         } else {
             manager.open_selected_playback(
                 &formats,
-                HttpRangeOptions::default(),
+                HttpRangeOptions {
+                    staging_max_bytes,
+                    ..HttpRangeOptions::default()
+                },
                 MediaLimits::default(),
                 media_cancel,
             )
@@ -1617,6 +1712,8 @@ mod tests {
         let track = fixture_track("fixture:buffered").unwrap();
         let session = FixtureSession::new(&track.metadata).unwrap();
         PlayerActor {
+            staging_max_bytes: 0,
+            completed_input: None,
             manager: Arc::clone(&adapter.inner.manager),
             registry: Arc::clone(&adapter.inner.registry),
             route_policy: Arc::clone(&adapter.inner.route_policy),
@@ -1634,6 +1731,87 @@ mod tests {
             read_ahead_halted: false,
             processing: ProcessingMode::Passthrough,
         }
+    }
+
+    fn staged_fixture_actor() -> PlayerActor {
+        let mut actor = buffered_fixture_actor();
+        actor.staging_max_bytes = 16 * 1024 * 1024;
+        let track = actor.track.as_mut().unwrap();
+        track.metadata.identifier = "fixture:staged".into();
+        // Reopening this identity normally fails. Success therefore requires
+        // consuming the completed input, not the regular source opener.
+        track.encoded = EncodedTrack::new("requires-completed-input");
+        actor
+    }
+
+    #[tokio::test]
+    async fn completed_staged_input_repeats_and_resets_sequence_without_reopening_source() {
+        let mut actor = staged_fixture_actor();
+        let track = actor.track.clone().unwrap();
+        for _ in 0..16 {
+            assert!(matches!(
+                actor.next_frame().await.unwrap(),
+                PlayerFramePoll::Frame(_)
+            ));
+        }
+        assert!(matches!(
+            actor.next_frame().await.unwrap(),
+            PlayerFramePoll::Ended
+        ));
+        assert!(actor.session.is_none(), "EOF must release decoder buffers");
+        assert!(actor.completed_input.is_some());
+        actor.play(track, CancellationToken::new()).await.unwrap();
+        let PlayerFramePoll::Frame(frame) = actor.next_frame().await.unwrap() else {
+            panic!("repeat has no frame");
+        };
+        assert_eq!(frame.sequence, 0);
+        actor.stop(TrackEndReason::Stopped).unwrap();
+        assert!(actor.session.is_none());
+        assert!(actor.completed_input.is_none());
+    }
+
+    #[tokio::test]
+    async fn staged_input_cleanup_cancellation_and_stopped_controls() {
+        let mut actor = staged_fixture_actor();
+        let track = actor.track.clone().unwrap();
+        actor.stop(TrackEndReason::Finished).unwrap();
+        let (reply, result) = oneshot::channel();
+        actor
+            .handle(PlayerCommand::Seek {
+                position: Duration::ZERO,
+                reply,
+            })
+            .await;
+        assert!(result.await.unwrap().is_err());
+        let token = CancellationToken::new();
+        token.cancel();
+        assert!(actor.play(track.clone(), token).await.is_err());
+        assert!(
+            actor.completed_input.is_some(),
+            "cancelled preflight must preserve cache"
+        );
+        let mut invalid = track;
+        invalid.encoded = EncodedTrack::new("invalid");
+        assert!(actor.play(invalid, CancellationToken::new()).await.is_err());
+        assert!(
+            actor.completed_input.is_none(),
+            "replacement failure must release old cache"
+        );
+        let mut actor = staged_fixture_actor();
+        actor.stop(TrackEndReason::Finished).unwrap();
+        let (reply, result) = oneshot::channel();
+        actor.handle(PlayerCommand::Shutdown { reply }).await;
+        result.await.unwrap().unwrap();
+        assert!(actor.completed_input.is_none());
+    }
+
+    #[tokio::test]
+    async fn completed_streaming_fallback_does_not_retain_a_decoder_or_source() {
+        let mut actor = buffered_fixture_actor();
+        actor.staging_max_bytes = 16 * 1024 * 1024;
+        actor.stop(TrackEndReason::Finished).unwrap();
+        assert!(actor.session.is_none());
+        assert!(actor.completed_input.is_none());
     }
 
     #[tokio::test]
