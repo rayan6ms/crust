@@ -767,7 +767,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 [[package]]
 name = "davey"
 version = "0.1.4"
-source = "git+https://github.com/rayan6ms/oto?rev=3b770a93453b767e0c399a8e5dc23349205de280#3b770a93453b767e0c399a8e5dc23349205de280"
+source = "git+https://github.com/rayan6ms/oto?rev=3d651c6ecc53a1ac4620eea231b8f9d777038dae#3d651c6ecc53a1ac4620eea231b8f9d777038dae"
 dependencies = [
  "aead 0.5.2",
  "aes 0.8.4",
@@ -1940,7 +1940,7 @@ dependencies = [
 [[package]]
 name = "openmls_rust_crypto"
 version = "0.5.1"
-source = "git+https://github.com/rayan6ms/oto?rev=3b770a93453b767e0c399a8e5dc23349205de280#3b770a93453b767e0c399a8e5dc23349205de280"
+source = "git+https://github.com/rayan6ms/oto?rev=3d651c6ecc53a1ac4620eea231b8f9d777038dae#3d651c6ecc53a1ac4620eea231b8f9d777038dae"
 dependencies = [
  "aes-gcm 0.10.3",
  "chacha20poly1305 0.10.1",
@@ -1989,7 +1989,7 @@ dependencies = [
 [[package]]
 name = "oto"
 version = "1.0.0"
-source = "git+https://github.com/rayan6ms/oto?rev=3b770a93453b767e0c399a8e5dc23349205de280#3b770a93453b767e0c399a8e5dc23349205de280"
+source = "git+https://github.com/rayan6ms/oto?rev=3d651c6ecc53a1ac4620eea231b8f9d777038dae#3d651c6ecc53a1ac4620eea231b8f9d777038dae"
 dependencies = [
  "aes-gcm 0.11.1",
  "chacha20poly1305 0.11.0",
@@ -2007,7 +2007,7 @@ dependencies = [
 [[package]]
 name = "oto-testkit"
 version = "1.0.0"
-source = "git+https://github.com/rayan6ms/oto?rev=3b770a93453b767e0c399a8e5dc23349205de280#3b770a93453b767e0c399a8e5dc23349205de280"
+source = "git+https://github.com/rayan6ms/oto?rev=3d651c6ecc53a1ac4620eea231b8f9d777038dae#3d651c6ecc53a1ac4620eea231b8f9d777038dae"
 dependencies = [
  "aes-gcm 0.11.1",
  "chacha20poly1305 0.11.0",
