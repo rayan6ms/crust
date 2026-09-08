@@ -34,3 +34,5 @@
 - [x] Use Oto's concrete owned frame channel, removing duplicate Crust queue/readiness/consumption implementation without exempting arbitrary callbacks.
 - [x] Preserve cancellation, retained source errors, frame ordering, replacement, and source-read acknowledgement: 14 adapter tests pass with the published Oto pin; Clippy passes with warnings denied.
 - [ ] Validate the committed owned-channel integration on Oracle using Raydio's receiver and host metrics.
+
+- [x] Pin Oto d95798f: owned-channel consumption wakes its producer immediately; generic callbacks retain the timer fallback. All 14 adapter tests and all-target Clippy pass. Oto benchmark records 2633 to 501 producer polls over 250 frames; live audio qualification remains pending.
