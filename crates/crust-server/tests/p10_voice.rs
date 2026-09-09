@@ -153,6 +153,67 @@ async fn player_volume_reaches_media_and_survives_filter_replacement_without_wir
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn volume_and_filters_preserve_voice_source_and_terminal_delivery() {
+    let mantle = Arc::new(FakeMantle::default());
+    let voice = Arc::new(FakeVoiceBackend::new(64, 4));
+    let harness = Harness::new(Arc::clone(&mantle), Arc::clone(&voice)).await;
+    let (mut socket, session_id) = open_session(harness.address, "300000000000000714").await;
+    let path = format!("/v4/sessions/{session_id}/players/800000000000000714");
+    let (status, _) = patch_json(
+        &harness.app,
+        &path,
+        json!({
+            "track":{"identifier":"fixture:short"},
+            "voice":{"token":"test-token","endpoint":"voice.example.invalid",
+                "sessionId":"test-session","channelId":"900000000000000714"}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let connection = voice.latest_connection().unwrap();
+    assert_eq!(
+        connection.pull_frame().await.unwrap().unwrap().sequence(),
+        0
+    );
+    for update in [
+        json!({"volume":70}),
+        json!({"volume":70}),
+        json!({"filters":{"volume":0.5}}),
+        json!({"filters":{}}),
+    ] {
+        assert_eq!(
+            patch_json(&harness.app, &path, update).await.0,
+            StatusCode::OK
+        );
+    }
+    assert_eq!(mantle.last_filters().unwrap().player_volume, Some(70));
+    assert_eq!(
+        connection.pull_frame().await.unwrap().unwrap().sequence(),
+        1
+    );
+    assert!(connection.pull_frame().await.unwrap().is_none());
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let message = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let message: Value = serde_json::from_str(&message).unwrap();
+            if message["type"] == "TrackEndEvent" {
+                break message;
+            }
+        }
+    })
+    .await
+    .expect("controls must not invalidate the active source's EOF generation");
+    assert_eq!(ended["reason"], "finished");
+    assert_eq!(
+        connection.source_generation(),
+        1,
+        "gain updates must not replace the paced source"
+    );
+    socket.close(None).await.unwrap();
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn server_shutdown_deadline_includes_voice_backend_teardown() {
     let mut config = ServerConfig::default();
     config.listen_address = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -249,7 +310,7 @@ async fn player_routes_voice_updates_and_media_discontinuities_through_one_backe
             .0,
         StatusCode::OK
     );
-    assert_eq!(connection.source_generation(), 4);
+    assert_eq!(connection.source_generation(), 3);
 
     let (_, moved) = patch_json(
         &harness.app,
@@ -265,7 +326,7 @@ async fn player_routes_voice_updates_and_media_discontinuities_through_one_backe
     )
     .await;
     assert_eq!(moved["voice"]["channelId"], "900000000000000711");
-    assert_eq!(connection.source_generation(), 5);
+    assert_eq!(connection.source_generation(), 4);
     assert!(voice.records().contains(&FakeVoiceRecord::Update {
         guild_id: 800000000000000710,
         user_id: 300000000000000710,

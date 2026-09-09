@@ -846,6 +846,12 @@ impl PlayerActor {
     }
 
     async fn apply_filters(&mut self, update: FilterUpdate) {
+        // An identical filter replacement would reset codec/DSP state. Check
+        // after earlier queued updates have committed, preserving control order.
+        if *update.configuration == self.filters {
+            let _ = update.reply.send(Ok(()));
+            return;
+        }
         let result = if self.session.is_some() {
             let installed = update.configuration.clone();
             self.with_settled_session(move |session| session.set_filters(&installed))
@@ -911,7 +917,11 @@ impl PlayerActor {
                 configuration,
                 reply,
             } => {
-                if self.reading.is_some() {
+                if self.pending_filters.is_empty() && *configuration == self.filters {
+                    // A no-op needs neither I/O completion nor new codec state.
+                    // Do not shortcut a restoration behind an accepted update.
+                    let _ = reply.send(Ok(()));
+                } else if self.reading.is_some() {
                     if self.pending_filters.len() == PLAYER_COMMAND_CAPACITY {
                         let _ = reply.send(Err(overloaded()));
                     } else {
@@ -1963,6 +1973,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn identical_filters_do_not_wait_for_a_source_read_but_queued_changes_stay_ordered() {
+        let mut actor = buffered_fixture_actor();
+        let session = actor.session.take().unwrap();
+        let (release, wait) = oneshot::channel();
+        actor.reading = Some(tokio::spawn(async move {
+            let _ = wait.await;
+            (session, Err(load_failed()))
+        }));
+        let (reply, mut response) = oneshot::channel();
+        actor
+            .handle(PlayerCommand::SetFilters {
+                configuration: Box::default(),
+                reply,
+            })
+            .await;
+        assert_eq!(
+            response.try_recv(),
+            Ok(Ok(())),
+            "unchanged filters must not wait for I/O or reset codecs"
+        );
+        let changed = FilterConfiguration {
+            player_volume: Some(70),
+            ..Default::default()
+        };
+        let (reply, first) = oneshot::channel();
+        actor
+            .handle(PlayerCommand::SetFilters {
+                configuration: Box::new(changed),
+                reply,
+            })
+            .await;
+        let (reply, mut second) = oneshot::channel();
+        actor
+            .handle(PlayerCommand::SetFilters {
+                configuration: Box::default(),
+                reply,
+            })
+            .await;
+        assert!(matches!(
+            second.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        release.send(()).unwrap();
+        actor.settle_read().await;
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+        assert_eq!(actor.filters, FilterConfiguration::default());
+    }
+
+    #[tokio::test]
     async fn filter_update_waiting_on_a_source_read_does_not_block_buffered_audio() {
         let mut actor = buffered_fixture_actor();
         for _ in 0..8 {
@@ -1981,7 +2041,10 @@ mod tests {
         let (reply, mut response) = oneshot::channel();
         {
             let mut update = Box::pin(actor.handle(PlayerCommand::SetFilters {
-                configuration: Box::default(),
+                configuration: Box::new(FilterConfiguration {
+                    player_volume: Some(70),
+                    ..Default::default()
+                }),
                 reply,
             }));
             assert!(

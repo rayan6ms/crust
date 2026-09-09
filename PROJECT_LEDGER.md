@@ -101,3 +101,26 @@ Whole-session post-EOF seek was rejected after actual WebM and PCM evidence;
 no new hot-path synchronization was added. Adapter suite: 22 passed, two
 existing manual benchmarks excluded. Mantle exact Opus/AAC repeat verifies
 origin shutdown and independent cancellation. Oracle integration is pending.
+
+September 9 control continuity: Raydio's six-hour recurring ~976 ms tail must
+not be described as a one-second reload defect: independent decoding measures
+~938 ms silence in the source. No trimming, crossfade, bitrate, DAVE or pacing
+change is justified by that observation.
+
+A separate control-path reproduction found every gain/filter update rebinding
+the Oto source, unnecessarily cancelling an in-flight producer. Four updates
+formerly advanced source generation 1 to 5; they now keep generation 1. Frame
+sequence and natural EOF still pass through the same source. Real timeline and
+voice changes still replace it. Identical filter settings also used to reset
+Mantle codec/DSP state and wait for a pending read. They now acknowledge without
+reset/I/O; changes already queued ahead of a restoration still apply in order.
+
+Raydio's source_packets audit plays the same staged input twice at volume 70,
+restating that volume 106 times in play two. Before: 8,238 of 10,653 encoded
+packets differ. After: zero differ, frame counts unchanged, and the unmodified
+play digest matches across builds. Independent libopus decoding has zero
+clipping, malformed durations, nonfinite samples or mid-track quiet >=20 ms in
+these samples. This demonstrates preservation of unchanged audio processing;
+it is not proof of live transport quality or an explanation of the six-hour
+network incidents. Workspace tests: 152 passed, four existing manual benchmarks
+ignored. Raydio retains full comparison evidence and handles Oracle validation.

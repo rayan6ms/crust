@@ -36,3 +36,12 @@
 - [ ] Validate the committed owned-channel integration on Oracle using Raydio's receiver and host metrics.
 
 - [x] Pin Oto d95798f: owned-channel consumption wakes its producer immediately; generic callbacks retain the timer fallback. All 14 adapter tests and all-target Clippy pass. Oto benchmark records 2633 to 501 producer polls over 250 frames; live audio qualification remains pending.
+
+## Raydio control continuity (September 9)
+
+- [x] Reproduce four unnecessary voice-source replacements across four gain/filter updates.
+- [x] Preserve the paced source for gain/filter controls; retain replacement for transport, seek, pause/resume and track changes.
+- [x] Reproduce redundant filters waiting on a pending read; skip identical committed settings without reordering queued changes.
+- [x] Compare two full plays of the same staged input at volume 70: identical updates change 8,238 packets before, zero after, out of 10,653 frames.
+- [x] Run workspace regression/conformance tests: 152 pass, four existing manual benchmarks ignored.
+- [ ] Verify the integrated candidate with a fresh Discord receiver on Oracle; source-only comparisons do not establish delivery quality.

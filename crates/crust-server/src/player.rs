@@ -1110,12 +1110,10 @@ async fn apply_update(
         }
     }
 
-    let refresh_audio = voice_changed
-        || filters_changed
-        || volume_changed
-        || pause_changed
-        || position_changed
-        || replace_allowed;
+    // Mantle applies gain/filters to the existing frame stream without resetting
+    // its sequence. Rebinding here cancels the old producer and can discard its
+    // in-flight frame. Only actual timeline/transport changes need a new source.
+    let refresh_audio = voice_changed || pause_changed || position_changed || replace_allowed;
     let voice_connection = state.voice_connection.clone();
     let mantle_for_snapshot = state.mantle.clone();
     let audio_action = if refresh_audio {
