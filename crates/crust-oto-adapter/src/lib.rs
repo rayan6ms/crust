@@ -142,6 +142,8 @@ impl OtoVoiceBackend {
             audio: Mutex::new(AudioSlot::Idle),
             audio_changed: Notify::new(),
             snapshot_sender: Mutex::new(None),
+            diagnostic_started: tokio::time::Instant::now(),
+            diagnostic_minute: AtomicU64::new(0),
             channel_id: AtomicU64::new(channel_id),
             closed: AtomicBool::new(false),
             shutdown_serial: AsyncMutex::new(()),
@@ -229,6 +231,8 @@ struct OtoVoiceConnection {
     audio: Mutex<AudioSlot>,
     audio_changed: Notify,
     snapshot_sender: Mutex<Option<PacedAudioSender>>,
+    diagnostic_started: tokio::time::Instant,
+    diagnostic_minute: AtomicU64,
     channel_id: AtomicU64,
     closed: AtomicBool,
     shutdown_serial: AsyncMutex<()>,
@@ -433,6 +437,16 @@ impl OtoVoiceConnection {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .map(PacedAudioSender::state);
+        // Piggyback on existing snapshots: at most one bounded log per minute,
+        // no observer task, extra polling, packet tracing or hot-path logging.
+        if tracing::enabled!(tracing::Level::INFO) {
+            let minute = self.diagnostic_started.elapsed().as_secs() / 60;
+            if self.diagnostic_minute.fetch_max(minute, Ordering::Relaxed) < minute {
+                tracing::info!(connection_generation = connection.generation().get(),
+                    connection_phase = ?connection.phase(), failure = ?connection.failure(),
+                    audio = ?audio, "voice diagnostic checkpoint");
+            }
+        }
         let stats = audio.map_or_else(oto::AudioStats::default, |audio| audio.stats());
         VoiceSnapshot {
             phase: map_phase(connection.phase()),
@@ -472,6 +486,7 @@ impl OtoVoiceConnection {
                 tracing::warn!(
                     ?failure,
                     dave_failure = ?state.dave_failure(),
+                    dave_context = ?state.dave_context(),
                     source_overruns = state.stats().source_overruns(),
                     frames_sent = state.stats().frames_sent(),
                     frames_unavailable = state.stats().frames_unavailable(),
@@ -635,6 +650,7 @@ fn report_stopped_sender(sender: &PacedAudioSender) {
         phase = ?state.phase(),
         failure = ?state.failure(),
         dave_failure = ?state.dave_failure(),
+                    dave_context = ?state.dave_context(),
         "audio sender stopped"
     );
 }
