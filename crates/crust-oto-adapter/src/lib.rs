@@ -471,6 +471,7 @@ impl OtoVoiceConnection {
                 let failure = state.failure();
                 tracing::warn!(
                     ?failure,
+                    dave_failure = ?state.dave_failure(),
                     source_overruns = state.stats().source_overruns(),
                     frames_sent = state.stats().frames_sent(),
                     frames_unavailable = state.stats().frames_unavailable(),
@@ -527,6 +528,7 @@ impl OtoVoiceConnection {
                     return Ok(Some(VoiceEvent::Closed(map_close(reason))));
                 }
                 Ok(oto::ConnectionEvent::Failure(failure)) => {
+                    tracing::warn!(?failure, "voice connection failure");
                     // Oto publishes a durable failure snapshot when a voice
                     // gateway requires fresh Discord voice information. That
                     // state is recoverable by replacing the connection
@@ -632,6 +634,7 @@ fn report_stopped_sender(sender: &PacedAudioSender) {
         max_lateness_us = stats.max_lateness().as_micros(),
         phase = ?state.phase(),
         failure = ?state.failure(),
+        dave_failure = ?state.dave_failure(),
         "audio sender stopped"
     );
 }
