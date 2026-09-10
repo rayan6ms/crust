@@ -536,6 +536,20 @@ impl OtoVoiceConnection {
                 event = events.recv() => event,
             };
             match event {
+                Ok(oto::ConnectionEvent::DaveStateChanged {
+                    generation,
+                    opcode,
+                    before,
+                    after,
+                }) => {
+                    tracing::info!(
+                        connection_generation = generation.get(),
+                        opcode,
+                        ?before,
+                        ?after,
+                        "DAVE lifecycle transition"
+                    );
+                }
                 Ok(oto::ConnectionEvent::StateChanged { phase, .. }) => {
                     return Ok(Some(VoiceEvent::PhaseChanged(map_phase(phase))));
                 }
