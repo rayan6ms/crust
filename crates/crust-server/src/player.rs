@@ -5,7 +5,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -74,6 +74,7 @@ struct ExecutorInner {
     senders: Vec<(mpsc::Sender<PlayerCommand>, mpsc::Sender<PlayerHandle>)>,
     adapter: Option<Arc<dyn MantleAdapter>>,
     voice: Option<Arc<dyn VoiceBackend>>,
+    track_stuck_threshold: Duration,
     cancellation: CancellationToken,
     workers: Mutex<Option<Vec<JoinHandle<()>>>>,
 }
@@ -190,6 +191,8 @@ struct PlayerInner {
     cached_update: Mutex<Arc<str>>,
     cancellation: CancellationToken,
     voice_monitor: Mutex<Option<VoiceMonitor>>,
+    track_stuck_threshold: Duration,
+    current_audio_generation: AtomicU64,
 }
 
 struct VoiceMonitor {
@@ -271,7 +274,7 @@ enum PlayerCommand {
 impl PlayerExecutor {
     #[must_use]
     pub(crate) fn new(
-        shard_count: usize,
+        config: &crate::config::ServerConfig,
         command_capacity: usize,
         max_players: usize,
         json_policy: JsonPolicy,
@@ -279,6 +282,8 @@ impl PlayerExecutor {
         adapter: Option<Arc<dyn MantleAdapter>>,
         voice: Option<Arc<dyn VoiceBackend>>,
     ) -> Self {
+        let shard_count = config.player_executor_shards;
+        let track_stuck_threshold = config.media.track_stuck_threshold;
         assert!(shard_count > 0);
         assert!(command_capacity > 0);
         assert!(max_players > 0);
@@ -313,6 +318,7 @@ impl PlayerExecutor {
                 senders,
                 adapter,
                 voice,
+                track_stuck_threshold,
                 cancellation,
                 workers: Mutex::new(Some(workers)),
             }),
@@ -332,6 +338,7 @@ impl PlayerExecutor {
             guild_id,
             sender.clone(),
             shutdown_sender.clone(),
+            self.inner.track_stuck_threshold,
         )
     }
 
@@ -363,6 +370,7 @@ impl PlayerHandle {
         guild_id: String,
         sender: mpsc::Sender<PlayerCommand>,
         shutdown_sender: mpsc::Sender<PlayerHandle>,
+        track_stuck_threshold: Duration,
     ) -> Self {
         let cached_update = Arc::from(
             json!({
@@ -386,6 +394,8 @@ impl PlayerHandle {
                 cached_update: Mutex::new(cached_update),
                 cancellation: CancellationToken::new(),
                 voice_monitor: Mutex::new(None),
+                track_stuck_threshold,
+                current_audio_generation: AtomicU64::new(0),
             }),
         }
     }
@@ -1143,6 +1153,10 @@ async fn apply_update(
             .checked_add(1)
             .ok_or(PlayerError::Media("audio source generation exhausted"))?;
         let generation = state.audio_generation;
+        handle
+            .inner
+            .current_audio_generation
+            .store(generation, Ordering::Release);
         voice_connection.as_ref().map(|connection| {
             if state.track.is_some() && !state.paused {
                 state.mantle.as_ref().map_or_else(
@@ -1154,6 +1168,18 @@ async fn apply_update(
                             handle: handle.clone(),
                             session: session.clone(),
                             generation,
+                            track: state
+                                .track
+                                .as_ref()
+                                .expect("checked active track")
+                                .media
+                                .clone(),
+                            user_data: state
+                                .track
+                                .as_ref()
+                                .expect("checked active track")
+                                .user_data
+                                .clone(),
                         }),
                     },
                 )
@@ -1304,7 +1330,7 @@ async fn voice_ready(
     if !handle.inner.deferred_audio.swap(false, Ordering::AcqRel) {
         return Ok(());
     }
-    let (mantle, generation) = {
+    let (mantle, generation, track, user_data) = {
         let mut state = handle.inner.state.lock().await;
         if state.destroyed
             || handle.inner.cancellation.is_cancelled()
@@ -1319,20 +1345,28 @@ async fn voice_ready(
         let Some(mantle) = state.mantle.clone() else {
             return Ok(());
         };
-        if state.track.is_none() {
+        let Some(track) = state.track.as_ref() else {
             return Ok(());
-        }
+        };
+        let media = track.media.clone();
+        let user_data = track.user_data.clone();
         state.audio_generation = state
             .audio_generation
             .checked_add(1)
             .ok_or(PlayerError::Media("audio source generation exhausted"))?;
-        (mantle, state.audio_generation)
+        (mantle, state.audio_generation, media, user_data)
     };
+    handle
+        .inner
+        .current_audio_generation
+        .store(generation, Ordering::Release);
     let source = Arc::new(MantleVoiceSource {
         mantle,
         handle: handle.clone(),
         session: session.clone(),
         generation,
+        track,
+        user_data,
     });
     match connection
         .set_source(source, handle.inner.cancellation.child_token())
@@ -1352,6 +1386,8 @@ struct MantleVoiceSource {
     handle: PlayerHandle,
     session: SessionHandle,
     generation: u64,
+    track: MediaTrack,
+    user_data: JsonObject,
 }
 
 impl VoiceFrameSource for MantleVoiceSource {
@@ -1360,7 +1396,51 @@ impl VoiceFrameSource for MantleVoiceSource {
         cancellation: CancellationToken,
     ) -> VoiceFuture<'_, Result<Option<TimedOpusFrame>, VoiceError>> {
         Box::pin(async move {
-            let frame = match self.mantle.next_frame(cancellation.clone()).await {
+            let frame_result = observe_source_read(
+                self.mantle.next_frame(cancellation.clone()),
+                self.handle.inner.track_stuck_threshold,
+                cancellation.clone(),
+                || {
+                    if self.handle.inner.cancellation.is_cancelled()
+                        || self
+                            .handle
+                            .inner
+                            .current_audio_generation
+                            .load(Ordering::Acquire)
+                            != self.generation
+                    {
+                        return;
+                    }
+                    let threshold_ms =
+                        u64::try_from(self.handle.inner.track_stuck_threshold.as_millis())
+                            .unwrap_or(u64::MAX);
+                    let payload = Arc::from(
+                        event_value(
+                            &self.handle.inner.guild_id,
+                            MediaEvent::TrackStuck {
+                                track: self.track.clone(),
+                                threshold_ms,
+                            },
+                            &self.user_data,
+                        )
+                        .to_string(),
+                    );
+                    if self.session.publish_critical(payload).is_err() {
+                        // SessionHandle closes an overflowing critical queue;
+                        // never log its payload (track URLs may be sensitive).
+                        tracing::warn!(
+                            "track-stuck event could not enter the bounded critical queue"
+                        );
+                    }
+                    tracing::warn!(
+                        phase = "source_read",
+                        threshold_ms,
+                        "source read exceeded configured stuck threshold"
+                    );
+                },
+            )
+            .await;
+            let frame = match frame_result {
                 Ok(frame) => frame
                     .map(|frame| {
                         TimedOpusFrame::from_packet(
@@ -1408,6 +1488,38 @@ impl VoiceFrameSource for MantleVoiceSource {
     }
 }
 
+// A timer exists only while the consumer requests a frame. Intentional pause,
+// DAVE readiness waits and a full bridge do not issue requests and cannot be
+// mistaken for a source stall. Keep the same read alive after one event; a
+// resumed read returns its exact frame and the next demand starts a new budget.
+async fn observe_source_read<T>(
+    next: impl std::future::Future<Output = Result<T, crust::media::AdapterError>>,
+    threshold: Duration,
+    cancellation: CancellationToken,
+    on_stuck: impl FnOnce(),
+) -> Result<T, crust::media::AdapterError> {
+    tokio::pin!(next);
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return Err(crust::media::AdapterError::new(AdapterErrorKind::Cancelled, "source read cancelled")),
+        result = &mut next => return result,
+        () = tokio::time::sleep(threshold) => on_stuck(),
+    }
+    let started = tokio::time::Instant::now();
+    let result = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(crust::media::AdapterError::new(AdapterErrorKind::Cancelled, "source read cancelled")),
+        result = &mut next => result,
+    };
+    tracing::info!(
+        phase = "source_read",
+        recovered = result.is_ok(),
+        blocked_ms = (threshold + started.elapsed()).as_millis() as u64,
+        "stalled source read completed"
+    );
+    result
+}
+
 impl PlayerHandle {
     async fn report_source_terminal(
         &self,
@@ -1452,6 +1564,25 @@ fn validate_filters(filters: &Filters) -> Result<(), PlayerError> {
                     "equalizer band must be between 0 and 14",
                 ));
             }
+        }
+    }
+    if let PatchField::Value(karaoke) = filters.karaoke {
+        if ![
+            karaoke.level,
+            karaoke.mono_level,
+            karaoke.filter_band,
+            karaoke.filter_width,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
+            || !(0.0..=1.0).contains(&karaoke.level)
+            || !(0.0..=1.0).contains(&karaoke.mono_level)
+            || !(0.0..=24_000.0).contains(&karaoke.filter_band)
+            || !(0.0..=24_000.0).contains(&karaoke.filter_width)
+        {
+            return Err(PlayerError::Invalid(
+                "karaoke parameters are outside the supported finite range",
+            ));
         }
     }
     if let PatchField::Value(timescale) = filters.timescale
@@ -1786,6 +1917,10 @@ async fn voice_closed(
             .audio_generation
             .checked_add(1)
             .ok_or(PlayerError::Media("audio source generation exhausted"))?;
+        handle
+            .inner
+            .current_audio_generation
+            .store(state.audio_generation, Ordering::Release);
     }
 
     handle.stop_voice_monitor();
@@ -2139,4 +2274,68 @@ fn timestamp_ms() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod source_progress_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[tokio::test(start_paused = true)]
+    async fn threshold_observes_one_incident_and_keeps_the_exact_pending_frame() {
+        for threshold in [Duration::from_millis(25), Duration::from_secs(10)] {
+            let (send, receive) = oneshot::channel::<u64>();
+            let incidents = AtomicUsize::new(0);
+            let cancellation = CancellationToken::new();
+            let read = observe_source_read(
+                async { Ok(receive.await.unwrap()) },
+                threshold,
+                cancellation,
+                || {
+                    incidents.fetch_add(1, Ordering::Relaxed);
+                },
+            );
+            tokio::pin!(read);
+            assert!(futures_util::poll!(&mut read).is_pending());
+            tokio::time::advance(threshold - Duration::from_millis(1)).await;
+            assert!(futures_util::poll!(&mut read).is_pending());
+            assert_eq!(incidents.load(Ordering::Relaxed), 0);
+            tokio::time::advance(Duration::from_millis(1)).await;
+            assert!(futures_util::poll!(&mut read).is_pending());
+            assert_eq!(incidents.load(Ordering::Relaxed), 1);
+            tokio::time::advance(threshold * 3).await;
+            assert!(futures_util::poll!(&mut read).is_pending());
+            assert_eq!(incidents.load(Ordering::Relaxed), 1);
+            send.send(42).unwrap();
+            assert_eq!(read.await.unwrap(), 42);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_frames_eof_and_cancelled_demands_do_not_emit_stuck() {
+        let threshold = Duration::from_millis(25);
+        for frame in [Some(42), None] {
+            let next = observe_source_read(
+                async { Ok(frame) },
+                threshold,
+                CancellationToken::new(),
+                || panic!("ready frame/EOF is not stuck"),
+            );
+            // Waiting with no polled consumer demand creates no timer.
+            tokio::time::advance(Duration::from_secs(100)).await;
+            assert_eq!(next.await.unwrap(), frame);
+        }
+        let cancellation = CancellationToken::new();
+        let read = observe_source_read(
+            std::future::pending::<Result<(), crust::media::AdapterError>>(),
+            threshold,
+            cancellation.clone(),
+            || panic!("cancelled source is not stuck"),
+        );
+        tokio::pin!(read);
+        assert!(futures_util::poll!(&mut read).is_pending());
+        cancellation.cancel();
+        tokio::time::advance(threshold * 2).await;
+        assert_eq!(read.await.unwrap_err().kind, AdapterErrorKind::Cancelled);
+    }
 }

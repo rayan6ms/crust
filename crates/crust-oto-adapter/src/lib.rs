@@ -21,7 +21,7 @@ use crust::voice::{
     VoiceBackend, VoiceClose, VoiceConnection, VoiceConnectionInfo, VoiceCounters, VoiceError,
     VoiceErrorKind, VoiceEvent, VoiceFrameSource, VoiceFuture, VoicePhase, VoiceSnapshot,
 };
-use futures_util::{StreamExt, stream::FuturesUnordered};
+use futures_util::{FutureExt, StreamExt, stream::FuturesUnordered};
 #[cfg(test)]
 use oto::{FrameSource, FrameStatus};
 use oto::{Oto, PacedAudioSender};
@@ -136,7 +136,9 @@ impl OtoVoiceBackend {
                 return Err(map_oto_error(error));
             }
         };
-        let connection = Arc::new(OtoVoiceConnection {
+        let connection = Arc::new_cyclic(|this| OtoVoiceConnection {
+            this: this.clone(),
+            operation: AsyncMutex::new(None),
             connection,
             events: AsyncMutex::new(events),
             audio: Mutex::new(AudioSlot::Idle),
@@ -164,7 +166,7 @@ impl OtoVoiceBackend {
             }
         };
         if !registered {
-            let _ = connection.shutdown_inner().await;
+            let _ = connection.operate(AudioOperation::Shutdown).await;
             return Err(shutdown_error());
         }
         Ok(connection)
@@ -174,24 +176,27 @@ impl OtoVoiceBackend {
         let _shutdown = self.inner.shutdown_serial.lock().await;
         self.inner.shutdown.cancel();
         let connections = {
-            let mut registered = self
+            let registered = self
                 .inner
                 .connections
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let connections = registered
+            registered
                 .iter()
                 .filter_map(Weak::upgrade)
-                .collect::<Vec<_>>();
-            registered.clear();
-            connections
+                .collect::<Vec<_>>()
         };
-        collect_shutdowns(
-            connections
-                .into_iter()
-                .map(|connection| async move { connection.shutdown_inner().await }),
-        )
-        .await
+        let result =
+            collect_shutdowns(connections.into_iter().map(|connection| async move {
+                connection.operate(AudioOperation::Shutdown).await
+            }))
+            .await;
+        self.inner
+            .connections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        result
     }
 }
 
@@ -225,7 +230,15 @@ impl VoiceBackend for OtoVoiceBackend {
     }
 }
 
+enum AudioOperation {
+    Source(Arc<dyn VoiceFrameSource>, CancellationToken),
+    Stop,
+    Shutdown,
+}
+
 struct OtoVoiceConnection {
+    this: Weak<OtoVoiceConnection>,
+    operation: AsyncMutex<Option<JoinHandle<Result<(), VoiceError>>>>,
     connection: oto::VoiceConnection,
     events: AsyncMutex<oto::EventSubscriber>,
     audio: Mutex<AudioSlot>,
@@ -263,6 +276,52 @@ struct AudioBinding {
 }
 
 impl OtoVoiceConnection {
+    // Keep each admitted lifecycle future owned until it completes. Dropping a
+    // public waiter leaves the join handle here; the next operation joins it
+    // before modifying the slot. There is no permanent worker or per-frame task.
+    async fn operate(&self, operation: AudioOperation) -> Result<(), VoiceError> {
+        let mut active = self.operation.lock().await;
+        if let Some(task) = active.as_mut() {
+            let _ = task.await;
+            active.take();
+        }
+        let owner = self.this.upgrade().ok_or_else(shutdown_error)?;
+        *active = Some(tokio::spawn(async move {
+            let result = std::panic::AssertUnwindSafe(async {
+                match operation {
+                    AudioOperation::Source(source, cancellation) => {
+                        owner.set_source_inner(source, cancellation).await
+                    }
+                    AudioOperation::Stop => owner.stop_audio_inner().await,
+                    AudioOperation::Shutdown => owner.shutdown_inner().await,
+                }
+            })
+            .catch_unwind()
+            .await;
+            match result {
+                Ok(result) => result,
+                Err(_) => {
+                    owner.closed.store(true, Ordering::Release);
+                    owner.finish_audio(AudioSlot::Closed);
+                    owner
+                        .snapshot_sender
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                    let _ = owner.connection.shutdown().await;
+                    Err(VoiceError::new(
+                        VoiceErrorKind::Shutdown,
+                        "audio lifecycle task failed",
+                    ))
+                }
+            }
+        }));
+        let result = active.as_mut().expect("admitted lifecycle task").await;
+        active.take();
+        result
+            .map_err(|_| VoiceError::new(VoiceErrorKind::Shutdown, "audio lifecycle task failed"))?
+    }
+
     async fn set_source_inner(
         &self,
         source: Arc<dyn VoiceFrameSource>,
@@ -620,11 +679,14 @@ impl VoiceConnection for OtoVoiceConnection {
         source: Arc<dyn VoiceFrameSource>,
         cancellation: CancellationToken,
     ) -> VoiceFuture<'_, Result<(), VoiceError>> {
-        Box::pin(async move { self.set_source_inner(source, cancellation).await })
+        Box::pin(async move {
+            self.operate(AudioOperation::Source(source, cancellation))
+                .await
+        })
     }
 
     fn stop_audio(&self) -> VoiceFuture<'_, Result<(), VoiceError>> {
-        Box::pin(async move { self.stop_audio_inner().await })
+        Box::pin(async move { self.operate(AudioOperation::Stop).await })
     }
 
     fn snapshot(&self) -> VoiceFuture<'_, Result<VoiceSnapshot, VoiceError>> {
@@ -639,11 +701,11 @@ impl VoiceConnection for OtoVoiceConnection {
     }
 
     fn disconnect(&self) -> VoiceFuture<'_, Result<(), VoiceError>> {
-        Box::pin(async move { self.shutdown_inner().await })
+        Box::pin(async move { self.operate(AudioOperation::Shutdown).await })
     }
 
     fn shutdown(&self) -> VoiceFuture<'_, Result<(), VoiceError>> {
-        Box::pin(async move { self.shutdown_inner().await })
+        Box::pin(async move { self.operate(AudioOperation::Shutdown).await })
     }
 }
 
@@ -1451,6 +1513,56 @@ mod tests {
             VoiceErrorKind::Protocol
         );
         producer.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dropped_lifecycle_waiters_complete_before_replacement_and_shutdown() {
+        let (gateway, udp) = peer(FakeVoiceGatewayConfig::local()).await;
+        let oto = Oto::builder()
+            .test_tls_config(gateway.tls().client_config())
+            .build()
+            .unwrap();
+        let backend = OtoVoiceBackend::new(oto, 2, 1);
+        let connection = backend
+            .connect(voice_info(&gateway, 3), CancellationToken::new())
+            .await
+            .unwrap();
+        for operation in 0..4 {
+            if operation != 0 {
+                connection
+                    .set_source(Arc::new(PendingSource), CancellationToken::new())
+                    .await
+                    .unwrap();
+            }
+            let mut future = match operation {
+                0 | 1 => connection.set_source(Arc::new(PendingSource), CancellationToken::new()),
+                2 => connection.stop_audio(),
+                _ => connection.shutdown(),
+            };
+            std::future::poll_fn(|cx| {
+                assert!(future.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            drop(future);
+            if operation < 3 {
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    connection.set_source(Arc::new(PendingSource), CancellationToken::new()),
+                )
+                .await
+                .expect("abandoned waiter cannot strand Busy")
+                .unwrap();
+            }
+        }
+        let (first, second) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(connection.shutdown(), backend.shutdown())
+        })
+        .await
+        .expect("shutdown completion remains durable");
+        first.unwrap();
+        second.unwrap();
+        drop((connection, backend, gateway, udp));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

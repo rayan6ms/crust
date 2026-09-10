@@ -108,7 +108,7 @@ impl AppState {
         let source_requests = Arc::new(Semaphore::new(limits.max_concurrent_source_requests.get()));
         let outbound_connections = Arc::new(Semaphore::new(limits.max_outbound_connections.get()));
         let players = PlayerExecutor::new(
-            config.player_executor_shards,
+            &config,
             limits.player_command_capacity.get(),
             limits.max_players.get(),
             JsonPolicy::from(&limits),

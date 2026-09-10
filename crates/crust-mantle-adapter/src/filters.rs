@@ -33,7 +33,7 @@ impl PcmFilterFactory for CrustFilterFactory {
             equalizer.build(format, builder)?;
         }
         if let Some(karaoke) = config.karaoke {
-            builder.push(KaraokeFilter::new(karaoke, format.sample_rate()))?;
+            builder.push(KaraokeFilter::new(karaoke, format.sample_rate())?)?;
         }
         if let Some(timescale) = config
             .timescale
@@ -137,19 +137,37 @@ struct KaraokeFilter {
 }
 
 impl KaraokeFilter {
-    fn new(config: Karaoke, sample_rate: u32) -> Self {
+    fn new(config: Karaoke, sample_rate: u32) -> Result<Self, AudioFrameError> {
+        if !config.level.is_finite()
+            || !config.mono_level.is_finite()
+            || !config.filter_band.is_finite()
+            || !config.filter_width.is_finite()
+            || !(0.0..=1.0).contains(&config.level)
+            || !(0.0..=1.0).contains(&config.mono_level)
+            || !(0.0..=sample_rate as f32 / 2.0).contains(&config.filter_band)
+            || !(0.0..=sample_rate as f32 / 2.0).contains(&config.filter_width)
+        {
+            return Err(AudioFrameError::InvalidFilterConfiguration(
+                "invalid karaoke parameters",
+            ));
+        }
         let rate = sample_rate as f32;
         let c = (-2.0 * PI * config.filter_width / rate).exp();
         let b = -4.0 * c / (1.0 + c) * (2.0 * PI * config.filter_band / rate).cos();
-        let a = (1.0 - b * b / (4.0 * c)).sqrt() * (1.0 - c);
-        Self {
+        let a = (1.0 - b * b / (4.0 * c)).max(0.0).sqrt() * (1.0 - c);
+        if ![a, b, c].iter().all(|v| v.is_finite()) {
+            return Err(AudioFrameError::InvalidFilterConfiguration(
+                "nonfinite karaoke coefficients",
+            ));
+        }
+        Ok(Self {
             config,
             a,
             b,
             c,
             y1: 0.0,
             y2: 0.0,
-        }
+        })
     }
 }
 
@@ -1063,8 +1081,8 @@ mod tests {
         Modulation, Timescale,
     };
     use mantle_audio::{
-        COMPATIBLE_PCM_SAMPLES, COMPATIBLE_SAMPLE_RATE, FilterPipeline, PcmFormat, PcmFrame,
-        StreamingPcmPoll,
+        AudioFrameError, COMPATIBLE_PCM_SAMPLES, COMPATIBLE_SAMPLE_RATE, FilterPipeline, PcmFormat,
+        PcmFrame, StreamingPcmPoll,
     };
 
     use super::{
@@ -1139,6 +1157,69 @@ mod tests {
     }
 
     #[test]
+    fn karaoke_rejects_invalid_parameters_and_boundary_filters_remain_finite() {
+        let valid = Karaoke {
+            level: 1.0,
+            mono_level: 1.0,
+            filter_band: 220.0,
+            filter_width: 100.0,
+        };
+        for invalid in [
+            Karaoke {
+                filter_width: 1_000_000.0,
+                ..valid
+            },
+            Karaoke {
+                filter_width: f32::NAN,
+                ..valid
+            },
+            Karaoke {
+                filter_band: f32::INFINITY,
+                ..valid
+            },
+            Karaoke {
+                filter_band: -1.0,
+                ..valid
+            },
+            Karaoke {
+                level: 1.01,
+                ..valid
+            },
+            Karaoke {
+                mono_level: -0.01,
+                ..valid
+            },
+        ] {
+            assert!(matches!(
+                KaraokeFilter::new(invalid, 48_000),
+                Err(AudioFrameError::InvalidFilterConfiguration(_))
+            ));
+        }
+        for band in [0.0, 220.0, 24_000.0] {
+            for width in [0.0, 100.0, 24_000.0] {
+                let mut filter = KaraokeFilter::new(
+                    Karaoke {
+                        filter_band: band,
+                        filter_width: width,
+                        ..valid
+                    },
+                    48_000,
+                )
+                .unwrap();
+                let mut pcm = frame(&[0.25; mantle_audio::COMPATIBLE_PCM_SAMPLES]);
+                for _ in 0..500 {
+                    pcm.samples_mut().fill(0.25);
+                    filter.process(&mut pcm).unwrap();
+                    assert!(
+                        pcm.samples().iter().all(|s| s.is_finite()),
+                        "band={band} width={width}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn player_volume_matches_frozen_lavaplayer_signed_pcm_oracle_without_allocations() {
         // Lavaplayer 2.2.6 PcmVolumeProcessor.applyVolume(100, volume, samples),
         // executed independently against the reference JAR on 2026-09-05.
@@ -1204,7 +1285,8 @@ mod tests {
                 filter_width: 100.0,
             },
             COMPATIBLE_SAMPLE_RATE,
-        );
+        )
+        .unwrap();
         let mut karaoke_frame = frame(&[1.0, 1.0]);
         karaoke.process(&mut karaoke_frame).unwrap();
         assert!((karaoke_frame.samples()[0] - 0.000_383_999_43).abs() < 1.0e-7);

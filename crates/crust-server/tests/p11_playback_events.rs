@@ -42,6 +42,21 @@ impl Harness {
         voice: Arc<FakeVoiceBackend>,
         player_update_interval: Duration,
     ) -> Self {
+        Self::with_stuck_threshold(
+            mantle,
+            voice,
+            player_update_interval,
+            Duration::from_secs(10),
+        )
+        .await
+    }
+
+    async fn with_stuck_threshold(
+        mantle: Arc<FakeMantle>,
+        voice: Arc<FakeVoiceBackend>,
+        player_update_interval: Duration,
+        threshold: Duration,
+    ) -> Self {
         let mut config = ServerConfig::default()
             .with_password("test-password")
             .unwrap();
@@ -52,6 +67,7 @@ impl Harness {
         config.player_executor_shards = 1;
         config.player_command_capacity = 16;
         config.player_update_interval = player_update_interval;
+        config.media.track_stuck_threshold = threshold;
         let mantle: Arc<dyn MantleAdapter> = mantle;
         let voice: Arc<dyn VoiceBackend> = voice;
         let server = CrustServer::bind_with_backends(config, mantle, voice)
@@ -74,6 +90,110 @@ impl Harness {
         self.shutdown.cancel();
         self.task.await.unwrap().unwrap();
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configured_stuck_detection_preserves_frame_and_rejects_stale_sources() {
+    let voice = Arc::new(FakeVoiceBackend::new(32, 2));
+    let mantle = Arc::new(FakeMantle::default());
+    let threshold = Duration::from_millis(40);
+    let harness = Harness::with_stuck_threshold(
+        Arc::clone(&mantle),
+        Arc::clone(&voice),
+        Duration::from_secs(30),
+        threshold,
+    )
+    .await;
+    let (mut socket, session_id) = open_session(harness.address, "300000000000000899").await;
+    let path = format!("/v4/sessions/{session_id}/players/800000000000000899");
+    assert_eq!(
+        json_request(
+            &harness.app,
+            patch(
+                &path,
+                json!({
+                    "track": {"identifier": "fixture:slow-frame", "userData": {"marker":"stalled"}},
+                    "voice": voice_state("900000000000000899")
+                })
+            )
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(next_json(&mut socket).await["type"], "TrackStartEvent");
+    assert_eq!(next_json(&mut socket).await["op"], "playerUpdate");
+    let connection = voice.latest_connection().unwrap();
+    for sequence in 0..2 {
+        let pending = {
+            let connection = Arc::clone(&connection);
+            tokio::spawn(async move { connection.pull_frame().await })
+        };
+        let event = next_json(&mut socket).await;
+        assert_eq!(event["type"], "TrackStuckEvent");
+        assert_eq!(event["thresholdMs"], 40);
+        assert_eq!(event["track"]["userData"]["marker"], "stalled");
+        let frame = pending.await.unwrap().unwrap().unwrap();
+        assert_eq!(frame.sequence(), sequence);
+    }
+    assert!(
+        tokio::time::timeout(threshold * 2, next_json(&mut socket))
+            .await
+            .is_err(),
+        "one event per blocked demand"
+    );
+    let stale = connection.pull_frame();
+    tokio::pin!(stale);
+    assert!(futures_util::poll!(&mut stale).is_pending());
+    assert_eq!(
+        json_request(&harness.app, patch(&path, json!({"paused":true})))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (old_result, no_event) = tokio::join!(
+        &mut stale,
+        tokio::time::timeout(Duration::from_millis(250), next_json(&mut socket))
+    );
+    assert!(old_result.unwrap().is_none());
+    assert!(
+        no_event.is_err(),
+        "stale pending demand must not emit after generation change"
+    );
+    assert!(connection.pull_frame().await.unwrap().is_none());
+    assert!(
+        tokio::time::timeout(threshold * 2, next_json(&mut socket))
+            .await
+            .is_err(),
+        "pause has no source demand"
+    );
+    // Invalid DSP configuration must leave the accepted filter chain intact.
+    assert_eq!(
+        json_request(
+            &harness.app,
+            patch(&path, json!({"filters":{"volume":0.5}}))
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(next_json(&mut socket).await["op"], "playerUpdate");
+    let before = mantle.last_filters().unwrap();
+    assert_eq!(
+        json_request(
+            &harness.app,
+            patch(
+                &path,
+                json!({"filters":{"karaoke":{"filterWidth":1_000_000.0}}})
+            )
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(mantle.last_filters().unwrap(), before);
+    socket.close(None).await.unwrap();
+    harness.stop().await;
 }
 
 async fn open_session(address: SocketAddr, user_id: &str) -> (Socket, String) {

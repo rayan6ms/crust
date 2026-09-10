@@ -613,6 +613,20 @@ impl MantlePlayer for FakePlayer {
     ) -> AdapterFuture<'_, Result<Option<MediaFrame>, AdapterError>> {
         Box::pin(async move {
             self.check(&cancellation)?;
+            let slow = self
+                .state
+                .lock()
+                .expect("player lock poisoned")
+                .track
+                .as_ref()
+                .is_some_and(|track| track.metadata.identifier == "fixture:slow-frame");
+            if slow {
+                tokio::select! {
+                    () = cancellation.cancelled() => return Err(cancelled()),
+                    () = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
+                }
+                self.check(&cancellation)?;
+            }
             let mut state = self.state.lock().expect("player lock poisoned");
             if state.status != PlayerStatus::Playing {
                 return Ok(None);
