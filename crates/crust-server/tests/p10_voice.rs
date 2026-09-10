@@ -393,6 +393,169 @@ async fn non_snowflake_session_identity_fails_before_credentials_reach_the_backe
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_at_eof_preserves_terminal_generation() {
+    let mantle = Arc::new(FakeMantle::default());
+    let voice = Arc::new(FakeVoiceBackend::new(32, 2));
+    let harness = Harness::new(Arc::clone(&mantle), Arc::clone(&voice)).await;
+    let (mut socket, session_id) = open_session(harness.address, "300000000000000713").await;
+    let path = format!("/v4/sessions/{session_id}/players/800000000000000713");
+    let (status, _) = patch_json(
+        &harness.app,
+        &path,
+        json!({
+            "track": {"identifier":"fixture:short", "userData":{"raydioGeneration":103}},
+            "voice":{"token":"test-token","endpoint":"voice.example.invalid",
+                "sessionId":"test-session","channelId":"900000000000000713"}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let connection = voice.latest_connection().unwrap();
+    assert!(connection.pull_frame().await.unwrap().is_some());
+    // Hold a real GET snapshot in the executor while media reaches EOF.
+    mantle.hold_snapshots();
+    let app = harness.app.clone();
+    let request = Request::get(&path)
+        .header("authorization", "test-password")
+        .body(Body::empty())
+        .unwrap();
+    let snapshot = tokio::spawn(async move { app.oneshot(request).await.unwrap() });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while mantle.active_snapshots() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(connection.pull_frame().await.unwrap().is_some());
+    assert!(connection.pull_frame().await.unwrap().is_none());
+    mantle.release_snapshots();
+    let response = snapshot.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap()).unwrap();
+    assert!(
+        body["track"].is_null(),
+        "GET should show the completed track"
+    );
+    let end = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let message = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            let message: Value = serde_json::from_str(&message).unwrap();
+            if message["type"] == "TrackEndEvent" {
+                break message;
+            }
+        }
+    })
+    .await
+    .expect("EOF must publish without another control request");
+    assert_eq!(end["reason"], "finished");
+    assert_eq!(end["track"]["userData"]["raydioGeneration"], 103);
+    socket.close(None).await.unwrap();
+    harness.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn controls_overtaking_eof_keep_old_and_new_generations_separate() {
+    for action in ["replace", "stop", "seek"] {
+        let stop = action != "replace";
+        let mantle = Arc::new(FakeMantle::default());
+        let voice = Arc::new(FakeVoiceBackend::new(32, 2));
+        let harness = Harness::new(Arc::clone(&mantle), Arc::clone(&voice)).await;
+        let (mut socket, session_id) = open_session(harness.address, "300000000000000714").await;
+        let path = format!("/v4/sessions/{session_id}/players/800000000000000714");
+        let (status, player) = patch_json(
+            &harness.app,
+            &path,
+            json!({
+                "track":{"identifier":"fixture:short","userData":{"raydioGeneration":103}},
+                "voice":{"token":"test-token","endpoint":"voice.example.invalid",
+                    "sessionId":"test-session","channelId":"900000000000000714"}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let connection = voice.latest_connection().unwrap();
+        assert!(connection.pull_frame().await.unwrap().is_some());
+        mantle.hold_snapshots();
+        let app = harness.app.clone();
+        let request = Request::get(&path)
+            .header("authorization", "test-password")
+            .body(Body::empty())
+            .unwrap();
+        let snapshot = tokio::spawn(async move { app.oneshot(request).await.unwrap() });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while mantle.active_snapshots() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // Poll each request until it queues behind the held snapshot. The
+        // terminal callback is queued last, without depending on wall time.
+        let request = Request::get(&path)
+            .header("authorization", "test-password")
+            .body(Body::empty())
+            .unwrap();
+        let mut repeated_snapshot = Box::pin(harness.app.clone().oneshot(request));
+        assert!(futures_util::poll!(repeated_snapshot.as_mut()).is_pending());
+        let update = if action == "seek" {
+            json!({"position":0})
+        } else if stop {
+            json!({"track":{"encoded":null}})
+        } else {
+            json!({"track":{"encoded":player["track"]["encoded"],"userData":{"raydioGeneration":104}}})
+        };
+        let mut control = Box::pin(patch_json(&harness.app, &path, update));
+        assert!(futures_util::poll!(control.as_mut()).is_pending());
+        assert!(connection.pull_frame().await.unwrap().is_some());
+        assert!(connection.pull_frame().await.unwrap().is_none());
+        mantle.release_snapshots();
+        for response in [snapshot.await.unwrap(), repeated_snapshot.await.unwrap()] {
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 65536).await.unwrap())
+                    .unwrap();
+            assert!(body["track"].is_null());
+        }
+        let (status, player) = control.await;
+        assert_eq!(status, StatusCode::OK);
+        if stop {
+            assert!(player["track"].is_null());
+        } else {
+            assert_eq!(player["track"]["userData"]["raydioGeneration"], 104);
+            assert!(connection.pull_frame().await.unwrap().is_some());
+            assert!(connection.pull_frame().await.unwrap().is_some());
+            assert!(connection.pull_frame().await.unwrap().is_none());
+        }
+        let ends = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let mut ends = Vec::new();
+            while ends.len() < if stop { 1 } else { 2 } {
+                let message = socket.next().await.unwrap().unwrap().into_text().unwrap();
+                let message: Value = serde_json::from_str(&message).unwrap();
+                if message["type"] == "TrackEndEvent" {
+                    assert_eq!(message["reason"], "finished");
+                    ends.push(message["track"]["userData"]["raydioGeneration"].clone());
+                }
+            }
+            ends
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            ends,
+            if stop {
+                vec![json!(103)]
+            } else {
+                vec![json!(103), json!(104)]
+            }
+        );
+        socket.close(None).await.unwrap();
+        harness.stop().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn natural_source_end_publishes_track_end_without_another_rest_command() {
     let voice = Arc::new(FakeVoiceBackend::new(32, 2));
     let harness = Harness::new(Arc::new(FakeMantle::default()), Arc::clone(&voice)).await;

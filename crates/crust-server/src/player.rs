@@ -210,6 +210,10 @@ struct PlayerState {
     voice_connection: Option<Arc<dyn VoiceConnection>>,
     audio_generation: u64,
     track: Option<ActiveTrack>,
+    // A snapshot may see EOF before SourceTerminal runs. Keep the old event
+    // identity until its queued events are published, independently of the
+    // public track (which must already be null). At most one track is retained.
+    terminal_track: Option<ActiveTrack>,
     volume: i32,
     paused: bool,
     position_ms: u64,
@@ -607,6 +611,7 @@ impl Default for PlayerState {
             voice_connection: None,
             audio_generation: 0,
             track: None,
+            terminal_track: None,
             volume: 100,
             paused: false,
             position_ms: 0,
@@ -950,6 +955,22 @@ async fn apply_update(
                 .await
                 .map_err(map_adapter_error)?,
         );
+    }
+
+    // A control can overtake EOF after a snapshot observed completion. Drain
+    // the old event before it changes either the track identity or the audio
+    // generation (a seek/voice update can invalidate SourceTerminal too).
+    if let Some(terminal) = &state.terminal_track {
+        drain_events(
+            handle,
+            session,
+            &state.mantle,
+            &terminal.user_data,
+            None,
+            None,
+        )
+        .await?;
+        state.terminal_track = None;
     }
 
     if volume_changed || filters_changed {
@@ -1679,14 +1700,12 @@ async fn source_terminal(
         let Some(mantle) = state.mantle.clone() else {
             return Ok(());
         };
+        let event_track = state.track.as_ref().or(state.terminal_track.as_ref());
         (
             mantle,
             state.voice_connection.clone(),
-            state.track.as_ref().map(|track| track.media.clone()),
-            state
-                .track
-                .as_ref()
-                .map_or_else(JsonObject::new, |track| track.user_data.clone()),
+            event_track.map(|track| track.media.clone()),
+            event_track.map_or_else(JsonObject::new, |track| track.user_data.clone()),
         )
     };
 
@@ -1736,6 +1755,7 @@ async fn source_terminal(
         return Ok(());
     }
     apply_mantle_snapshot(&mut state, mantle_snapshot);
+    state.terminal_track = None;
     cache_update(handle, &state, voice_snapshot.as_ref());
     drop(state);
     session
@@ -1852,6 +1872,7 @@ async fn destroy(
         handle.inner.cancellation.cancel();
         state.destroyed = true;
         state.track = None;
+        state.terminal_track = None;
         state.outbound_connection = None;
         handle
             .inner
@@ -1889,7 +1910,9 @@ fn apply_mantle_snapshot(state: &mut PlayerState, snapshot: crust::media::Player
     if snapshot.track.is_none()
         && matches!(snapshot.status, PlayerStatus::Idle | PlayerStatus::Stopped)
     {
-        state.track = None;
+        if let Some(track) = state.track.take() {
+            state.terminal_track = Some(track);
+        }
         state.outbound_connection = None;
     }
 }
