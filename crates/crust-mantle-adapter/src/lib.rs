@@ -39,6 +39,7 @@ mod filters;
 use filters::CrustFilterFactory;
 
 const PLAYER_COMMAND_CAPACITY: usize = 32;
+const DEFERRED_CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
 const PLAYER_EVENT_CAPACITY: usize = 32;
 const FRAME_DURATION_MS: u16 = 20;
 // 320 ms of encoded audio absorbs finite-source range-request jitter. Full
@@ -190,6 +191,18 @@ struct AdapterInner {
     players: Mutex<Vec<Weak<RealMantlePlayer>>>,
 }
 
+struct LoadCancellationGuard {
+    signal: SourceCancellation,
+    watcher: JoinHandle<()>,
+}
+
+impl Drop for LoadCancellationGuard {
+    fn drop(&mut self) {
+        self.signal.cancel();
+        self.watcher.abort();
+    }
+}
+
 /// Real production adapter. All source HTTP, decode, filtering, and Opus work stays in Mantle.
 #[derive(Clone)]
 pub struct RealMantleAdapter {
@@ -290,6 +303,7 @@ impl MantleAdapter for RealMantleAdapter {
             let identifier = request.identifier;
             let mantle_cancel = SourceCancellation::new();
             let worker_cancel = mantle_cancel.clone();
+            let guard_signal = mantle_cancel.clone();
             let cancellation_watcher = tokio::spawn({
                 let shutdown = inner.shutdown.clone();
                 async move {
@@ -300,6 +314,10 @@ impl MantleAdapter for RealMantleAdapter {
                     mantle_cancel.cancel();
                 }
             });
+            let mut guard = LoadCancellationGuard {
+                signal: guard_signal,
+                watcher: cancellation_watcher,
+            };
             let result = tokio::task::spawn_blocking(move || {
                 route_policy.begin_operation();
                 let reference = SourceReference::new(Some(identifier), false);
@@ -320,8 +338,8 @@ impl MantleAdapter for RealMantleAdapter {
             })
             .await
             .map_err(|_| invalid_operation("Mantle load worker failed"));
-            cancellation_watcher.abort();
-            let _ = cancellation_watcher.await;
+            guard.watcher.abort();
+            let _ = (&mut guard.watcher).await;
             result?
         })
     }
@@ -374,11 +392,12 @@ impl MantleAdapter for RealMantleAdapter {
                 inner.staging_max_bytes,
                 inner.shutdown.child_token(),
             );
-            inner
+            let mut tracked = inner
                 .players
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(Arc::downgrade(&player));
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            tracked.retain(|entry| entry.strong_count() != 0);
+            tracked.push(Arc::downgrade(&player));
             Ok(player as Arc<dyn MantlePlayer>)
         })
     }
@@ -703,17 +722,21 @@ enum PlayerCommand {
     },
     Pause {
         paused: bool,
+        cancellation: CancellationToken,
         reply: oneshot::Sender<Result<(), AdapterError>>,
     },
     Seek {
         position: Duration,
+        cancellation: CancellationToken,
         reply: oneshot::Sender<Result<(), AdapterError>>,
     },
     Stop {
+        cancellation: CancellationToken,
         reply: oneshot::Sender<Result<(), AdapterError>>,
     },
     SetFilters {
         configuration: Box<FilterConfiguration>,
+        cancellation: CancellationToken,
         reply: oneshot::Sender<Result<(), AdapterError>>,
     },
     Snapshot {
@@ -730,7 +753,68 @@ enum PlayerCommand {
     },
 }
 
+impl PlayerCommand {
+    fn abandoned(&self) -> bool {
+        match self {
+            Self::Play {
+                cancellation,
+                reply,
+                ..
+            }
+            | Self::Seek {
+                cancellation,
+                reply,
+                ..
+            }
+            | Self::Stop {
+                cancellation,
+                reply,
+            }
+            | Self::Pause {
+                cancellation,
+                reply,
+                ..
+            }
+            | Self::SetFilters {
+                cancellation,
+                reply,
+                ..
+            } => cancellation.is_cancelled() || reply.is_closed(),
+            Self::Shutdown { reply } => reply.is_closed(),
+            Self::Snapshot { reply } => reply.is_closed(),
+            Self::NextFrame { reply } => reply.is_closed(),
+            Self::NextEvent { reply } => reply.is_closed(),
+        }
+    }
+
+    fn reject(self, error: AdapterError) {
+        match self {
+            Self::Play { reply, .. }
+            | Self::Pause { reply, .. }
+            | Self::Seek { reply, .. }
+            | Self::Stop { reply, .. }
+            | Self::SetFilters { reply, .. }
+            | Self::Shutdown { reply } => {
+                let _ = reply.send(Err(error));
+            }
+            Self::Snapshot { reply } => {
+                let _ = reply.send(Err(error));
+            }
+            Self::NextFrame { reply } => {
+                let _ = reply.send(Err(error));
+            }
+            Self::NextEvent { reply } => {
+                let _ = reply.send(Err(error));
+            }
+        }
+    }
+}
+
 struct PlayerActor {
+    pending_frame: Option<oneshot::Sender<Result<PlayerFramePoll, AdapterError>>>,
+    deferred_controls: VecDeque<(tokio::time::Instant, PlayerCommand)>,
+    discard_read: bool,
+    media_cancellation: Option<CancellationToken>,
     staging_max_bytes: u64,
     completed_input: Option<(EncodedTrack, CompletedInput)>,
     manager: Arc<YoutubeAudioSourceManager>,
@@ -761,16 +845,65 @@ struct BufferedFrame {
 type ReadResult = (PlaybackSession, Result<BufferedFrame, AdapterError>);
 
 struct FilterUpdate {
+    deadline: tokio::time::Instant,
     configuration: Box<FilterConfiguration>,
+    cancellation: CancellationToken,
     reply: oneshot::Sender<Result<(), AdapterError>>,
+}
+
+impl Drop for PlayerActor {
+    fn drop(&mut self) {
+        if let Some(cancellation) = &self.media_cancellation {
+            cancellation.cancel();
+        }
+        if let Some(reading) = &self.reading {
+            reading.abort();
+        }
+    }
 }
 
 impl PlayerActor {
     async fn run(mut self, mut commands: mpsc::Receiver<PlayerCommand>) {
         loop {
+            if self.reading.is_none()
+                && let Some((deadline, command)) = self.deferred_controls.pop_front()
+            {
+                if tokio::time::Instant::now() >= deadline {
+                    command.reject(overloaded());
+                } else {
+                    self.handle(command).await;
+                }
+                continue;
+            }
+            if self.reading.is_none()
+                && let Some(reply) = self.pending_frame.take()
+            {
+                self.handle(PlayerCommand::NextFrame { reply }).await;
+                continue;
+            }
+            let control_deadline = self
+                .deferred_controls
+                .front()
+                .map(|(deadline, _)| *deadline)
+                .into_iter()
+                .chain(self.pending_filters.front().map(|update| update.deadline))
+                .min();
             self.start_read_ahead();
             tokio::select! {
                 biased;
+                () = async {
+                    if let Some(deadline) = control_deadline { tokio::time::sleep_until(deadline).await; }
+                    else { std::future::pending::<()>().await; }
+                } => {
+                    if self.deferred_controls.front().is_some_and(|(deadline, _)| *deadline <= tokio::time::Instant::now())
+                        && let Some((_, command)) = self.deferred_controls.pop_front() {
+                        command.reject(overloaded());
+                    }
+                    if self.pending_filters.front().is_some_and(|update| update.deadline <= tokio::time::Instant::now())
+                        && let Some(update) = self.pending_filters.pop_front() {
+                        let _ = update.reply.send(Err(overloaded()));
+                    }
+                }
                 command = commands.recv() => {
                     let Some(command) = command else { break; };
                     let terminal = matches!(command, PlayerCommand::Shutdown { .. });
@@ -813,6 +946,9 @@ impl PlayerActor {
     }
 
     fn accept_read(&mut self, result: Result<ReadResult, tokio::task::JoinError>) {
+        if std::mem::take(&mut self.discard_read) {
+            return;
+        }
         let frame = match result {
             Ok((session, frame)) => {
                 self.session = Some(session);
@@ -846,6 +982,14 @@ impl PlayerActor {
     }
 
     async fn apply_filters(&mut self, update: FilterUpdate) {
+        if update.cancellation.is_cancelled() || update.reply.is_closed() {
+            let _ = update.reply.send(Err(cancelled()));
+            return;
+        }
+        if tokio::time::Instant::now() >= update.deadline {
+            let _ = update.reply.send(Err(overloaded()));
+            return;
+        }
         // An identical filter replacement would reset codec/DSP state. Check
         // after earlier queued updates have committed, preserving control order.
         if *update.configuration == self.filters {
@@ -875,6 +1019,26 @@ impl PlayerActor {
     }
 
     async fn handle(&mut self, command: PlayerCommand) {
+        if command.abandoned() {
+            command.reject(cancelled());
+            return;
+        }
+        if self.reading.is_some()
+            && matches!(
+                command,
+                PlayerCommand::Seek { .. } | PlayerCommand::Play { .. }
+            )
+        {
+            if self.deferred_controls.len() == PLAYER_COMMAND_CAPACITY {
+                command.reject(overloaded());
+            } else {
+                self.deferred_controls.push_back((
+                    tokio::time::Instant::now() + DEFERRED_CONTROL_TIMEOUT,
+                    command,
+                ));
+            }
+            return;
+        }
         match command {
             PlayerCommand::Play {
                 track,
@@ -884,7 +1048,7 @@ impl PlayerActor {
                 let result = self.play(*track, cancellation).await;
                 let _ = reply.send(result);
             }
-            PlayerCommand::Pause { paused, reply } => {
+            PlayerCommand::Pause { paused, reply, .. } => {
                 let result = if self.track.is_none() {
                     Err(invalid_operation("no active track"))
                 } else {
@@ -898,9 +1062,18 @@ impl PlayerActor {
                 };
                 let _ = reply.send(result);
             }
-            PlayerCommand::Seek { position, reply } => {
+            PlayerCommand::Seek {
+                position,
+                cancellation,
+                reply,
+            } => {
                 let result = self
-                    .with_session(move |session| session.seek(position))
+                    .with_session(move |session| {
+                        if cancellation.is_cancelled() {
+                            return Err(cancelled());
+                        }
+                        session.seek(position)
+                    })
                     .await;
                 if let Ok(position) = result {
                     self.position = position;
@@ -908,13 +1081,25 @@ impl PlayerActor {
                 }
                 let _ = reply.send(result.map(|_| ()));
             }
-            PlayerCommand::Stop { reply } => {
-                self.settle_read().await;
+            PlayerCommand::Stop { reply, .. } => {
                 let result = self.stop(TrackEndReason::Stopped);
+                // The in-flight read remains owned and joined by run(), but it
+                // cannot restore stopped media or block the stop acknowledgement.
+                if result.is_ok() {
+                    self.discard_read = self.reading.is_some();
+                    for (_, deferred) in self.deferred_controls.drain(..) {
+                        deferred.reject(cancelled());
+                    }
+                    self.apply_pending_filters().await;
+                    if let Some(frame) = self.pending_frame.take() {
+                        let _ = frame.send(Ok(PlayerFramePoll::Ended));
+                    }
+                }
                 let _ = reply.send(result);
             }
             PlayerCommand::SetFilters {
                 configuration,
+                cancellation,
                 reply,
             } => {
                 if self.pending_filters.is_empty() && *configuration == self.filters {
@@ -926,13 +1111,17 @@ impl PlayerActor {
                         let _ = reply.send(Err(overloaded()));
                     } else {
                         self.pending_filters.push_back(FilterUpdate {
+                            deadline: tokio::time::Instant::now() + DEFERRED_CONTROL_TIMEOUT,
                             configuration,
+                            cancellation,
                             reply,
                         });
                     }
                 } else {
                     self.apply_filters(FilterUpdate {
+                        deadline: tokio::time::Instant::now() + DEFERRED_CONTROL_TIMEOUT,
                         configuration,
+                        cancellation,
                         reply,
                     })
                     .await;
@@ -947,6 +1136,20 @@ impl PlayerActor {
                 }));
             }
             PlayerCommand::NextFrame { reply } => {
+                if self.reading.is_some() && self.buffered.is_empty() {
+                    // Retain one demand until read completion. No polling timer
+                    // and no actor-wide wait while Stop/Pause are queued.
+                    if self
+                        .pending_frame
+                        .as_ref()
+                        .is_some_and(|pending| !pending.is_closed())
+                    {
+                        let _ = reply.send(Err(overloaded()));
+                    } else {
+                        self.pending_frame = Some(reply);
+                    }
+                    return;
+                }
                 let result = self.next_frame().await;
                 let _ = reply.send(result);
             }
@@ -954,7 +1157,19 @@ impl PlayerActor {
                 let _ = reply.send(Ok(self.events.pop_front()));
             }
             PlayerCommand::Shutdown { reply } => {
-                self.settle_read().await;
+                if let Some(frame) = self.pending_frame.take() {
+                    let _ = frame.send(Err(shutdown()));
+                }
+                self.discard_read = self.reading.is_some();
+                if let Some(cancellation) = self.media_cancellation.take() {
+                    cancellation.cancel();
+                }
+                for (_, deferred) in self.deferred_controls.drain(..) {
+                    deferred.reject(shutdown());
+                }
+                for pending in self.pending_filters.drain(..) {
+                    let _ = pending.reply.send(Err(shutdown()));
+                }
                 self.clear_read_ahead();
                 self.session = None;
                 self.completed_input = None;
@@ -983,7 +1198,9 @@ impl PlayerActor {
         let encoded = track.encoded.clone();
         let completed = self.completed_input.take();
         let staging_max_bytes = self.staging_max_bytes;
-        let cancellation_for_open = cancellation.clone();
+        let media_cancellation = cancellation.child_token();
+        let opening_guard = media_cancellation.clone().drop_guard();
+        let cancellation_for_open = media_cancellation.clone();
         let mut session = tokio::task::spawn_blocking(move || {
             if cancellation_for_open.is_cancelled() {
                 return Err(cancelled());
@@ -1008,6 +1225,9 @@ impl PlayerActor {
             return Err(cancelled());
         }
         session.set_filters(&self.filters)?;
+        if cancellation.is_cancelled() {
+            return Err(cancelled());
+        }
         if let Some(previous) = self.track.replace(track.clone()) {
             self.events.push_back(MediaEvent::TrackEnd {
                 track: previous,
@@ -1036,6 +1256,10 @@ impl PlayerActor {
         self.clear_read_ahead();
         self.buffered.reserve(MEDIA_READ_AHEAD_FRAMES);
         self.processing = session.mode();
+        if let Some(previous) = self.media_cancellation.replace(media_cancellation) {
+            previous.cancel();
+        }
+        opening_guard.disarm();
         self.session = Some(session);
         self.paused = false;
         self.status = PlayerStatus::Playing;
@@ -1047,6 +1271,9 @@ impl PlayerActor {
     fn stop(&mut self, reason: TrackEndReason) -> Result<(), AdapterError> {
         if self.track.is_some() && self.events.len() == PLAYER_EVENT_CAPACITY {
             return Err(overloaded());
+        }
+        if let Some(cancellation) = self.media_cancellation.take() {
+            cancellation.cancel();
         }
         // Natural EOF retains compressed bytes only. Stop, replacement, error,
         // shutdown, and the owning player's idle cleanup release the object.
@@ -1164,6 +1391,10 @@ impl RealMantlePlayer {
     ) -> Arc<Self> {
         let (commands, receiver) = mpsc::channel(PLAYER_COMMAND_CAPACITY);
         let actor = PlayerActor {
+            pending_frame: None,
+            deferred_controls: VecDeque::new(),
+            discard_read: false,
+            media_cancellation: None,
             staging_max_bytes,
             completed_input: None,
             manager,
@@ -1274,6 +1505,7 @@ impl MantlePlayer for RealMantlePlayer {
         Box::pin(async move {
             self.request(Some(&cancellation), |reply| PlayerCommand::Pause {
                 paused,
+                cancellation: cancellation.clone(),
                 reply,
             })
             .await
@@ -1288,6 +1520,7 @@ impl MantlePlayer for RealMantlePlayer {
         Box::pin(async move {
             self.request(Some(&cancellation), |reply| PlayerCommand::Seek {
                 position: Duration::from_millis(position_ms),
+                cancellation: cancellation.clone(),
                 reply,
             })
             .await
@@ -1296,8 +1529,11 @@ impl MantlePlayer for RealMantlePlayer {
 
     fn stop(&self, cancellation: CancellationToken) -> AdapterFuture<'_, Result<(), AdapterError>> {
         Box::pin(async move {
-            self.request(Some(&cancellation), |reply| PlayerCommand::Stop { reply })
-                .await
+            self.request(Some(&cancellation), |reply| PlayerCommand::Stop {
+                cancellation: cancellation.clone(),
+                reply,
+            })
+            .await
         })
     }
 
@@ -1309,6 +1545,7 @@ impl MantlePlayer for RealMantlePlayer {
         Box::pin(async move {
             self.request(Some(&cancellation), |reply| PlayerCommand::SetFilters {
                 configuration: Box::new(configuration),
+                cancellation: cancellation.clone(),
                 reply,
             })
             .await
@@ -1702,6 +1939,188 @@ fn decode_fixture_track(encoded: &EncodedTrack) -> Result<MediaTrack, AdapterErr
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn player_churn_reaps_dead_allocations() {
+        let adapter = RealMantleAdapter::with_defaults(RoutePlanner::disabled()).unwrap();
+        for _ in 0..1000 {
+            let player = adapter
+                .create_player(CancellationToken::new())
+                .await
+                .unwrap();
+            player.shutdown().await.unwrap();
+            drop(player);
+        }
+        let tracked = adapter.inner.players.lock().unwrap();
+        assert_eq!(tracked.len(), 1);
+        assert_eq!(tracked[0].strong_count(), 0);
+        assert!(tracked.capacity() <= 4);
+    }
+
+    #[tokio::test]
+    async fn stop_acknowledges_without_waiting_for_read_and_stale_result_is_discarded() {
+        let mut actor = buffered_fixture_actor();
+        let session = actor.session.take().unwrap();
+        let (release, wait) = oneshot::channel();
+        actor.reading = Some(tokio::spawn(async move {
+            wait.await.unwrap();
+            (session, Err(load_failed()))
+        }));
+        let (reply, result) = oneshot::channel();
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            actor.handle(PlayerCommand::Stop {
+                cancellation: CancellationToken::new(),
+                reply,
+            }),
+        )
+        .await
+        .unwrap();
+        result.await.unwrap().unwrap();
+        assert_eq!(actor.status, PlayerStatus::Stopped);
+        release.send(()).unwrap();
+        actor.settle_read().await;
+        assert!(actor.session.is_none());
+        assert!(actor.buffered.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_frame_does_not_block_stop_in_running_actor() {
+        let mut actor = buffered_fixture_actor();
+        let session = actor.session.take().unwrap();
+        let (release, wait) = oneshot::channel();
+        actor.reading = Some(tokio::spawn(async move {
+            wait.await.unwrap();
+            (session, Err(load_failed()))
+        }));
+        let (commands, receiver) = mpsc::channel(PLAYER_COMMAND_CAPACITY);
+        let task = tokio::spawn(actor.run(receiver));
+        let (reply, frame) = oneshot::channel();
+        commands
+            .send(PlayerCommand::NextFrame { reply })
+            .await
+            .unwrap();
+        let (reply, stopped) = oneshot::channel();
+        commands
+            .send(PlayerCommand::Stop {
+                cancellation: CancellationToken::new(),
+                reply,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(100), stopped)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            frame.await.unwrap().unwrap(),
+            PlayerFramePoll::Ended
+        ));
+        release.send(()).unwrap();
+        let (reply, shutdown) = oneshot::channel();
+        commands
+            .send(PlayerCommand::Shutdown { reply })
+            .await
+            .unwrap();
+        shutdown.await.unwrap().unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn blocked_controls_expire_without_mutating_media() {
+        let mut actor = buffered_fixture_actor();
+        let session = actor.session.take().unwrap();
+        let (release, wait) = oneshot::channel();
+        actor.reading = Some(tokio::spawn(async move {
+            wait.await.unwrap();
+            (session, Err(load_failed()))
+        }));
+        let (commands, receiver) = mpsc::channel(PLAYER_COMMAND_CAPACITY);
+        let task = tokio::spawn(actor.run(receiver));
+        let (reply, seek) = oneshot::channel();
+        commands
+            .send(PlayerCommand::Seek {
+                position: Duration::from_secs(60),
+                cancellation: CancellationToken::new(),
+                reply,
+            })
+            .await
+            .unwrap();
+        let (reply, filters) = oneshot::channel();
+        commands
+            .send(PlayerCommand::SetFilters {
+                configuration: Box::new(FilterConfiguration {
+                    player_volume: Some(42),
+                    ..Default::default()
+                }),
+                cancellation: CancellationToken::new(),
+                reply,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), seek)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(overloaded())
+        );
+        assert_eq!(filters.await.unwrap(), Err(overloaded()));
+        let (reply, snapshot) = oneshot::channel();
+        commands
+            .send(PlayerCommand::Snapshot { reply })
+            .await
+            .unwrap();
+        assert_eq!(snapshot.await.unwrap().unwrap().position_ms, 0);
+        release.send(()).unwrap();
+        let (reply, shutdown) = oneshot::channel();
+        commands
+            .send(PlayerCommand::Shutdown { reply })
+            .await
+            .unwrap();
+        shutdown.await.unwrap().unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_queued_seek_never_changes_position() {
+        let mut actor = buffered_fixture_actor();
+        actor.start_read_ahead();
+        let cancellation = CancellationToken::new();
+        let (reply, result) = oneshot::channel();
+        actor
+            .handle(PlayerCommand::Seek {
+                position: Duration::from_millis(120),
+                cancellation: cancellation.clone(),
+                reply,
+            })
+            .await;
+        cancellation.cancel();
+        actor.settle_read().await;
+        let (_, deferred) = actor.deferred_controls.pop_front().unwrap();
+        actor.handle(deferred).await;
+        assert_eq!(result.await.unwrap(), Err(cancelled()));
+        assert_eq!(actor.position, Duration::ZERO);
+        let PlayerFramePoll::Frame(frame) = actor.next_frame().await.unwrap() else {
+            panic!("frame lost");
+        };
+        assert_eq!(frame.payload.as_slice(), &0_u64.to_be_bytes());
+    }
+
+    #[tokio::test]
+    async fn dropping_load_guard_cancels_worker_and_reaps_watcher() {
+        let signal = SourceCancellation::new();
+        let watcher = tokio::spawn(std::future::pending());
+        let abort = watcher.abort_handle();
+        drop(LoadCancellationGuard {
+            signal: signal.clone(),
+            watcher,
+        });
+        tokio::task::yield_now().await;
+        assert!(signal.is_cancelled());
+        assert!(abort.is_finished());
+    }
+
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -1722,6 +2141,10 @@ mod tests {
         let track = fixture_track("fixture:buffered").unwrap();
         let session = FixtureSession::new(&track.metadata).unwrap();
         PlayerActor {
+            pending_frame: None,
+            deferred_controls: VecDeque::new(),
+            discard_read: false,
+            media_cancellation: None,
             staging_max_bytes: 0,
             completed_input: None,
             manager: Arc::clone(&adapter.inner.manager),
@@ -1789,6 +2212,7 @@ mod tests {
         actor
             .handle(PlayerCommand::Seek {
                 position: Duration::ZERO,
+                cancellation: CancellationToken::new(),
                 reply,
             })
             .await;
@@ -1882,6 +2306,7 @@ mod tests {
         let (reply, response) = oneshot::channel();
         actor
             .handle(PlayerCommand::Pause {
+                cancellation: CancellationToken::new(),
                 paused: true,
                 reply,
             })
@@ -1898,6 +2323,7 @@ mod tests {
         let (reply, response) = oneshot::channel();
         actor
             .handle(PlayerCommand::Pause {
+                cancellation: CancellationToken::new(),
                 paused: false,
                 reply,
             })
@@ -1908,7 +2334,12 @@ mod tests {
         };
         assert_eq!(frame.payload.as_slice(), &0_u64.to_be_bytes());
         let (reply, response) = oneshot::channel();
-        actor.handle(PlayerCommand::Stop { reply }).await;
+        actor
+            .handle(PlayerCommand::Stop {
+                cancellation: CancellationToken::new(),
+                reply,
+            })
+            .await;
         response.await.unwrap().unwrap();
         assert!(actor.buffered.is_empty());
         assert!(actor.reading.is_none());
@@ -1942,6 +2373,7 @@ mod tests {
         let (reply, mut response) = oneshot::channel();
         {
             let mut pause = Box::pin(actor.handle(PlayerCommand::Pause {
+                cancellation: CancellationToken::new(),
                 paused: true,
                 reply,
             }));
@@ -1952,6 +2384,7 @@ mod tests {
         let (reply, response) = oneshot::channel();
         actor
             .handle(PlayerCommand::Pause {
+                cancellation: CancellationToken::new(),
                 paused: false,
                 reply,
             })
@@ -1985,6 +2418,7 @@ mod tests {
         actor
             .handle(PlayerCommand::SetFilters {
                 configuration: Box::default(),
+                cancellation: CancellationToken::new(),
                 reply,
             })
             .await;
@@ -2001,6 +2435,7 @@ mod tests {
         actor
             .handle(PlayerCommand::SetFilters {
                 configuration: Box::new(changed),
+                cancellation: CancellationToken::new(),
                 reply,
             })
             .await;
@@ -2008,6 +2443,7 @@ mod tests {
         actor
             .handle(PlayerCommand::SetFilters {
                 configuration: Box::default(),
+                cancellation: CancellationToken::new(),
                 reply,
             })
             .await;
@@ -2045,6 +2481,7 @@ mod tests {
                     player_volume: Some(70),
                     ..Default::default()
                 }),
+                cancellation: CancellationToken::new(),
                 reply,
             }));
             assert!(
@@ -2082,6 +2519,7 @@ mod tests {
                         player_volume: Some(volume as u16),
                         ..FilterConfiguration::default()
                     }),
+                    cancellation: CancellationToken::new(),
                     reply,
                 })
                 .await;
@@ -2091,13 +2529,19 @@ mod tests {
         actor
             .handle(PlayerCommand::SetFilters {
                 configuration: Box::default(),
+                cancellation: CancellationToken::new(),
                 reply,
             })
             .await;
         assert_eq!(response.await.unwrap(), Err(overloaded()));
         assert_eq!(actor.pending_filters.len(), PLAYER_COMMAND_CAPACITY);
         let (reply, response) = oneshot::channel();
-        actor.handle(PlayerCommand::Stop { reply }).await;
+        actor
+            .handle(PlayerCommand::Stop {
+                cancellation: CancellationToken::new(),
+                reply,
+            })
+            .await;
         response.await.unwrap().unwrap();
         for response in replies {
             response.await.unwrap().unwrap();
@@ -2122,9 +2566,13 @@ mod tests {
         actor
             .handle(PlayerCommand::Seek {
                 position: Duration::from_millis(120),
+                cancellation: CancellationToken::new(),
                 reply,
             })
             .await;
+        actor.settle_read().await;
+        let (_, deferred) = actor.deferred_controls.pop_front().expect("seek deferred");
+        actor.handle(deferred).await;
         response.await.unwrap().unwrap();
         assert!(actor.buffered.is_empty());
         assert!(actor.reading.is_none());

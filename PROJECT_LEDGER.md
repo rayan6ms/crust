@@ -1,3 +1,23 @@
+# Dependency lifecycle audit resolved (2026-09-10)
+
+Finite source reads remain owned by the actor, but a pending NextFrame no longer
+blocks Stop or Pause. Stop invalidates a stalled read and cancels its source;
+completion cannot restore stopped audio. Deferred Play/Seek/filter controls are
+bounded at 32 and rejected after one second behind a read. Cancelled tokens and
+closed replies reject stale mutations. This bound covers the queue behind an
+in-flight read; an already started source open/seek still has its configured I/O
+timeout. Actor destruction cancels media and aborts a queued read worker.
+
+Adapter loads own a Drop guard that cancels source work and aborts the watcher.
+Player insertion prunes dead Weak entries: 1,000 create/shutdown/drop cycles leave
+one dead entry and capacity <=4 instead of 1,000 retained Arc allocations.
+Regression tests cover actor-level Stop with pending frame demand, delayed stale
+read, queued cancellation, expiry, churn and watcher cleanup. Pins include
+Mantle's non-destructive filter/EOF fixes and Oto's attachment/pacer rollback and
+bounded active-send gap evidence. Full workspace tests pass; detailed counts,
+release checks and live qualification are in Raydio's dependency-fixes evidence.
+No cloud performance or six-hour reliability result is claimed here.
+
 # Active integration findings
 
 Raydio's original one-frame handoff exposed synchronous finite-source HTTP range
