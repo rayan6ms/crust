@@ -1566,8 +1566,8 @@ fn validate_filters(filters: &Filters) -> Result<(), PlayerError> {
             }
         }
     }
-    if let PatchField::Value(karaoke) = filters.karaoke {
-        if ![
+    if let PatchField::Value(karaoke) = filters.karaoke
+        && (![
             karaoke.level,
             karaoke.mono_level,
             karaoke.filter_band,
@@ -1578,12 +1578,11 @@ fn validate_filters(filters: &Filters) -> Result<(), PlayerError> {
             || !(0.0..=1.0).contains(&karaoke.level)
             || !(0.0..=1.0).contains(&karaoke.mono_level)
             || !(0.0..=24_000.0).contains(&karaoke.filter_band)
-            || !(0.0..=24_000.0).contains(&karaoke.filter_width)
-        {
-            return Err(PlayerError::Invalid(
-                "karaoke parameters are outside the supported finite range",
-            ));
-        }
+            || !(0.0..=24_000.0).contains(&karaoke.filter_width))
+    {
+        return Err(PlayerError::Invalid(
+            "karaoke parameters are outside the supported finite range",
+        ));
     }
     if let PatchField::Value(timescale) = filters.timescale
         && (timescale.speed <= 0.0 || timescale.pitch <= 0.0 || timescale.rate <= 0.0)

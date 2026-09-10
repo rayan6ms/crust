@@ -9,13 +9,13 @@ publish = false
 [dependencies]
 crust = { path = "../crust" }
 futures-util.workspace = true
-oto = { git = "https://github.com/rayan6ms/oto", rev = "e1d3792" }
+oto = { git = "https://github.com/rayan6ms/oto", rev = "e1bdc068a656d8c0e6eb291d4183617df362d9b2" }
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-oto = { git = "https://github.com/rayan6ms/oto", rev = "e1d3792", features = ["testkit"] }
-oto-testkit = { git = "https://github.com/rayan6ms/oto", rev = "e1d3792" }
+oto = { git = "https://github.com/rayan6ms/oto", rev = "e1bdc068a656d8c0e6eb291d4183617df362d9b2", features = ["testkit"] }
+oto-testkit = { git = "https://github.com/rayan6ms/oto", rev = "e1bdc068a656d8c0e6eb291d4183617df362d9b2" }
 serde_json.workspace = true
 stats_alloc = "0.1.10"

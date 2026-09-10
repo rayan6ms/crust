@@ -1565,6 +1565,56 @@ mod tests {
         drop((connection, backend, gateway, udp));
     }
 
+    #[tokio::test]
+    async fn dropped_stop_during_silence_drain_cannot_strand_busy() {
+        let (gateway, udp) = peer(FakeVoiceGatewayConfig::local()).await;
+        let oto = Oto::builder()
+            .test_tls_config(gateway.tls().client_config())
+            .build()
+            .unwrap();
+        let backend = OtoVoiceBackend::new(oto, 2, 1);
+        let connection = backend
+            .connect(voice_info(&gateway, 3), CancellationToken::new())
+            .await
+            .unwrap();
+        connection
+            .set_source(
+                Arc::new(BenchmarkSource {
+                    sequence: AtomicU64::new(0),
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        eventually_sent(&connection, 2).await;
+        let concrete = backend.inner.connections.lock().unwrap()[0]
+            .upgrade()
+            .unwrap();
+        let mut stopping = connection.stop_audio();
+        assert!(futures_util::poll!(&mut stopping).is_pending());
+        eventually(|| matches!(*concrete.audio.lock().unwrap(), AudioSlot::Busy)).await;
+        drop(stopping);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            connection.set_source(
+                Arc::new(BenchmarkSource {
+                    sequence: AtomicU64::new(0),
+                }),
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("admitted Stop completes without its waiter")
+        .unwrap();
+        eventually_sent(&connection, 2).await;
+        tokio::time::timeout(Duration::from_secs(2), backend.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(*concrete.audio.lock().unwrap(), AudioSlot::Closed));
+        drop((concrete, connection, backend, gateway, udp));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn real_adapter_connects_idles_sends_replaces_stops_and_shuts_down() {
         let (gateway, udp) = peer(FakeVoiceGatewayConfig::local()).await;
