@@ -584,6 +584,7 @@ impl OtoVoiceConnection {
                 r.timestamp,
                 r.sequence,
                 r.silence,
+                r.timing.as_micros(),
             ));
         }
         if !records.is_empty() {
@@ -593,7 +594,7 @@ impl OtoVoiceConnection {
                 .unwrap_or_default()
                 .as_micros();
             tracing::info!(epoch_us = %epoch_us, dropped = trace.dropped(), records = ?records,
-                "RTP send trace: index,elapsed_us,connection,source,ssrc,timestamp,sequence,silence");
+                "RTP send trace: index,elapsed_us,connection,source,ssrc,timestamp,sequence,silence,timing_v1[scheduled,wake_us,source_us,dave_wait_us,dave_wall_us,dave_cpu_us,crypto_us,udp_us]");
         }
     }
 

@@ -37,4 +37,4 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 
 [patch.crates-io]
 # Cargo only applies patches declared by the root workspace.
-openmls_rust_crypto = { git = "https://github.com/rayan6ms/oto", rev = "e3812da26d7f8da5e99bf4f328b8a0987c268c13" }
+openmls_rust_crypto = { git = "https://github.com/rayan6ms/oto", rev = "4f68e8c7bf17c76c3cf7d6b5467c437fb304fe85" }
