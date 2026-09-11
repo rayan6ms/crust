@@ -39,6 +39,7 @@ const PRODUCER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 #[derive(Clone)]
 pub struct OtoVoiceBackend {
     inner: Arc<BackendInner>,
+    send_trace_enabled: bool,
 }
 
 struct BackendInner {
@@ -80,6 +81,7 @@ impl OtoVoiceBackend {
             "max_concurrent_connects must be nonzero"
         );
         Self {
+            send_trace_enabled: false,
             inner: Arc::new(BackendInner {
                 oto,
                 shutdown: CancellationToken::new(),
@@ -99,6 +101,14 @@ impl OtoVoiceBackend {
             .build()
             .map(|oto| Self::new(oto, max_connections, max_concurrent_connects))
             .map_err(map_oto_error)
+    }
+
+    /// Opt-in short diagnostic runs only: export bounded RTP header/timing batches
+    /// from existing snapshots. No payloads, keys, or per-packet log calls.
+    #[must_use]
+    pub fn with_send_trace(mut self) -> Self {
+        self.send_trace_enabled = true;
+        self
     }
 
     async fn connect_inner(
@@ -144,6 +154,8 @@ impl OtoVoiceBackend {
             audio: Mutex::new(AudioSlot::Idle),
             audio_changed: Notify::new(),
             snapshot_sender: Mutex::new(None),
+            send_trace_enabled: self.send_trace_enabled,
+            send_trace: Mutex::new(None),
             diagnostic_started: tokio::time::Instant::now(),
             diagnostic_minute: AtomicU64::new(0),
             channel_id: AtomicU64::new(channel_id),
@@ -244,6 +256,8 @@ struct OtoVoiceConnection {
     audio: Mutex<AudioSlot>,
     audio_changed: Notify,
     snapshot_sender: Mutex<Option<PacedAudioSender>>,
+    send_trace_enabled: bool,
+    send_trace: Mutex<Option<oto::SendTrace>>,
     diagnostic_started: tokio::time::Instant,
     diagnostic_minute: AtomicU64,
     channel_id: AtomicU64,
@@ -377,11 +391,25 @@ impl OtoVoiceConnection {
             }
         } else {
             match self.connection.start_audio_channel(oto_source).await {
-                Ok(sender) => AudioBinding {
-                    sender,
-                    producer,
-                    shared,
-                },
+                Ok(sender) => {
+                    if self.send_trace_enabled {
+                        match sender.start_send_trace(1024).await {
+                            Ok(trace) => {
+                                *self
+                                    .send_trace
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(trace);
+                            }
+                            Err(error) => tracing::warn!(?error, "sender trace unavailable"),
+                        }
+                    }
+                    AudioBinding {
+                        sender,
+                        producer,
+                        shared,
+                    }
+                }
                 Err(error) => {
                     producer.shutdown().await;
                     self.finish_audio(AudioSlot::Idle);
@@ -422,6 +450,11 @@ impl OtoVoiceConnection {
             }
         };
         let stop_result = binding.sender.stop().await.map_err(map_oto_error);
+        self.drain_send_trace();
+        self.send_trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         report_stopped_sender(&binding.sender);
         binding.producer.shutdown().await;
         *self
@@ -469,6 +502,11 @@ impl OtoVoiceConnection {
             match slot {
                 Some(Some(binding)) => {
                     let _ = binding.sender.stop().await;
+                    self.drain_send_trace();
+                    self.send_trace
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
                     report_stopped_sender(&binding.sender);
                     binding.producer.shutdown().await;
                     break;
@@ -489,6 +527,7 @@ impl OtoVoiceConnection {
     }
 
     fn snapshot_inner(&self) -> VoiceSnapshot {
+        self.drain_send_trace();
         let connection = self.connection.state();
         let audio = self
             .snapshot_sender
@@ -516,6 +555,45 @@ impl OtoVoiceConnection {
                 nulled: stats.frames_unavailable(),
                 deficit: stats.skipped_deadlines(),
             },
+        }
+    }
+
+    fn drain_send_trace(&self) {
+        if !self.send_trace_enabled {
+            return;
+        }
+        let mut guard = self
+            .send_trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(trace) = guard.as_mut() else {
+            return;
+        };
+        // Bound work even if snapshots were suspended. Overflow is explicit.
+        let mut records = Vec::with_capacity(64);
+        for _ in 0..1024 {
+            let Some(r) = trace.pop() else {
+                break;
+            };
+            records.push((
+                r.index,
+                r.elapsed_micros,
+                r.connection_generation,
+                r.source_generation,
+                r.ssrc,
+                r.timestamp,
+                r.sequence,
+                r.silence,
+            ));
+        }
+        if !records.is_empty() {
+            let epoch_us = trace
+                .started_at()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros();
+            tracing::info!(epoch_us = %epoch_us, dropped = trace.dropped(), records = ?records,
+                "RTP send trace: index,elapsed_us,connection,source,ssrc,timestamp,sequence,silence");
         }
     }
 
@@ -1622,7 +1700,7 @@ mod tests {
             .test_tls_config(gateway.tls().client_config())
             .build()
             .unwrap();
-        let backend = OtoVoiceBackend::new(oto, 2, 1);
+        let backend = OtoVoiceBackend::new(oto, 2, 1).with_send_trace();
         let connection = backend
             .connect(voice_info(&gateway, 3), CancellationToken::new())
             .await
@@ -1706,6 +1784,13 @@ mod tests {
         assert_eq!(counters.deficit, 0);
         connection.stop_audio().await.unwrap();
         eventually(|| udp.capture().len() >= 8).await;
+        let concrete = backend.inner.connections.lock().unwrap()[0]
+            .upgrade()
+            .unwrap();
+        assert!(
+            concrete.send_trace.lock().unwrap().is_none(),
+            "stop must release trace storage"
+        );
 
         backend.shutdown().await.unwrap();
         assert_eq!(

@@ -9,9 +9,9 @@ publish = false
 [dependencies]
 base64.workspace = true
 crust = { path = "../crust" }
-mantle-audio = { git = "https://github.com/rayan6ms/mantle", rev = "dcb93766c68492ea9e0041e48325c1de6b6b2b44" }
-mantle-core = { git = "https://github.com/rayan6ms/mantle", rev = "dcb93766c68492ea9e0041e48325c1de6b6b2b44" }
-mantle-media = { git = "https://github.com/rayan6ms/mantle", rev = "dcb93766c68492ea9e0041e48325c1de6b6b2b44" }
+mantle-audio = { git = "https://github.com/rayan6ms/mantle", rev = "5b7caf0b6db492e8a56abac1bd4d36da76d5c8c5" }
+mantle-core = { git = "https://github.com/rayan6ms/mantle", rev = "5b7caf0b6db492e8a56abac1bd4d36da76d5c8c5" }
+mantle-media = { git = "https://github.com/rayan6ms/mantle", rev = "5b7caf0b6db492e8a56abac1bd4d36da76d5c8c5" }
 serde_json.workspace = true
 microfft = { version = "0.6.0", default-features = false, features = ["size-1024"] }
 micromath = "2.1.0"
