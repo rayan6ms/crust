@@ -193,6 +193,7 @@ struct PlayerInner {
     voice_monitor: Mutex<Option<VoiceMonitor>>,
     track_stuck_threshold: Duration,
     current_audio_generation: AtomicU64,
+    audio_paused: tokio::sync::watch::Sender<bool>,
 }
 
 struct VoiceMonitor {
@@ -396,6 +397,7 @@ impl PlayerHandle {
                 voice_monitor: Mutex::new(None),
                 track_stuck_threshold,
                 current_audio_generation: AtomicU64::new(0),
+                audio_paused: tokio::sync::watch::channel(false).0,
             }),
         }
     }
@@ -1022,13 +1024,20 @@ async fn apply_update(
         || (!replacing && matches!(update.position, PatchField::Value(_)) && state.track.is_some());
     if !replacing {
         if let PatchField::Value(paused) = update.paused {
+            if paused {
+                handle.inner.audio_paused.send_replace(true);
+            }
             if let Some(mantle) = &state.mantle {
                 mantle
                     .pause(paused, handle.inner.cancellation.child_token())
                     .await
-                    .map_err(map_adapter_error)?;
+                    .map_err(|error| {
+                        handle.inner.audio_paused.send_replace(state.paused);
+                        map_adapter_error(error)
+                    })?;
             }
             state.paused = paused;
+            handle.inner.audio_paused.send_replace(paused);
         }
         if let PatchField::Value(position) = update.position
             && state.track.is_some()
@@ -1144,7 +1153,12 @@ async fn apply_update(
     // Mantle applies gain/filters to the existing frame stream without resetting
     // its sequence. Rebinding here cancels the old producer and can discard its
     // in-flight frame. Only actual timeline/transport changes need a new source.
-    let refresh_audio = voice_changed || pause_changed || position_changed || replace_allowed;
+    let retained_pause = state
+        .voice_connection
+        .as_ref()
+        .is_some_and(|voice| voice.retains_paused_source());
+    let refresh_audio =
+        voice_changed || (pause_changed && !retained_pause) || position_changed || replace_allowed;
     let voice_connection = state.voice_connection.clone();
     let mantle_for_snapshot = state.mantle.clone();
     let audio_action = if refresh_audio {
@@ -1158,12 +1172,13 @@ async fn apply_update(
             .current_audio_generation
             .store(generation, Ordering::Release);
         voice_connection.as_ref().map(|connection| {
-            if state.track.is_some() && !state.paused {
+            if state.track.is_some() && (!state.paused || retained_pause) {
                 state.mantle.as_ref().map_or_else(
                     || VoiceAudioAction::Stop(Arc::clone(connection)),
                     |mantle| VoiceAudioAction::Set {
                         connection: Arc::clone(connection),
                         source: Arc::new(MantleVoiceSource {
+                            deferred_terminal: retained_pause,
                             mantle: Arc::clone(mantle),
                             handle: handle.clone(),
                             session: session.clone(),
@@ -1190,6 +1205,8 @@ async fn apply_update(
     } else {
         None
     };
+    let paused = state.paused;
+    handle.inner.audio_paused.send_replace(paused);
     drop(state);
     if voice_changed && let Some(connection) = &voice_connection {
         handle.start_voice_monitor(session.clone(), Arc::clone(connection));
@@ -1207,6 +1224,15 @@ async fn apply_update(
         } else {
             return Err(map_voice_error(error));
         }
+    }
+    if retained_pause
+        && (pause_changed || refresh_audio)
+        && let Some(connection) = &voice_connection
+    {
+        connection
+            .set_paused(paused)
+            .await
+            .map_err(map_voice_error)?;
     }
     let mantle_snapshot = if let Some(mantle) = mantle_for_snapshot {
         Some(mantle.snapshot().await.map_err(map_adapter_error)?)
@@ -1361,6 +1387,7 @@ async fn voice_ready(
         .current_audio_generation
         .store(generation, Ordering::Release);
     let source = Arc::new(MantleVoiceSource {
+        deferred_terminal: connection.retains_paused_source(),
         mantle,
         handle: handle.clone(),
         session: session.clone(),
@@ -1382,6 +1409,7 @@ async fn voice_ready(
 }
 
 struct MantleVoiceSource {
+    deferred_terminal: bool,
     mantle: Arc<dyn MantlePlayer>,
     handle: PlayerHandle,
     session: SessionHandle,
@@ -1391,98 +1419,130 @@ struct MantleVoiceSource {
 }
 
 impl VoiceFrameSource for MantleVoiceSource {
+    fn drained(
+        &self,
+        failure: Option<VoiceError>,
+        cancellation: CancellationToken,
+    ) -> VoiceFuture<'_, ()> {
+        Box::pin(self.handle.report_source_terminal(
+            self.session.clone(),
+            self.generation,
+            failure,
+            cancellation,
+        ))
+    }
+
     fn next_frame(
         &self,
         cancellation: CancellationToken,
     ) -> VoiceFuture<'_, Result<Option<TimedOpusFrame>, VoiceError>> {
         Box::pin(async move {
-            let frame_result = observe_source_read(
-                self.mantle.next_frame(cancellation.clone()),
-                self.handle.inner.track_stuck_threshold,
-                cancellation.clone(),
-                || {
-                    if self.handle.inner.cancellation.is_cancelled()
-                        || self
-                            .handle
-                            .inner
-                            .current_audio_generation
-                            .load(Ordering::Acquire)
-                            != self.generation
-                    {
-                        return;
+            let mut paused = self.handle.inner.audio_paused.subscribe();
+            loop {
+                if self.deferred_terminal && *paused.borrow() {
+                    tokio::select! {
+                        () = cancellation.cancelled() => return Ok(None),
+                        result = paused.changed() => if result.is_err() { return Ok(None); },
                     }
-                    let threshold_ms =
-                        u64::try_from(self.handle.inner.track_stuck_threshold.as_millis())
-                            .unwrap_or(u64::MAX);
-                    let payload = Arc::from(
-                        event_value(
-                            &self.handle.inner.guild_id,
-                            MediaEvent::TrackStuck {
-                                track: self.track.clone(),
-                                threshold_ms,
-                            },
-                            &self.user_data,
-                        )
-                        .to_string(),
-                    );
-                    if self.session.publish_critical(payload).is_err() {
-                        // SessionHandle closes an overflowing critical queue;
-                        // never log its payload (track URLs may be sensitive).
-                        tracing::warn!(
-                            "track-stuck event could not enter the bounded critical queue"
-                        );
-                    }
-                    tracing::warn!(
-                        phase = "source_read",
-                        threshold_ms,
-                        "source read exceeded configured stuck threshold"
-                    );
-                },
-            )
-            .await;
-            let frame = match frame_result {
-                Ok(frame) => frame
-                    .map(|frame| {
-                        TimedOpusFrame::from_packet(
-                            frame.sequence,
-                            Duration::from_millis(frame.sequence.saturating_mul(20)),
-                            Duration::from_millis(u64::from(frame.duration_ms)),
-                            frame.payload,
-                        )
-                        .map_err(|_| {
-                            VoiceError::new(
-                                VoiceErrorKind::Protocol,
-                                "Mantle produced an invalid Discord Opus frame",
+                    continue;
+                }
+                let frame_result = observe_source_read(
+                    self.mantle.next_frame(cancellation.clone()),
+                    self.handle.inner.track_stuck_threshold,
+                    cancellation.clone(),
+                    || {
+                        if (self.deferred_terminal && *self.handle.inner.audio_paused.borrow())
+                            || self.handle.inner.cancellation.is_cancelled()
+                            || self
+                                .handle
+                                .inner
+                                .current_audio_generation
+                                .load(Ordering::Acquire)
+                                != self.generation
+                        {
+                            return;
+                        }
+                        let threshold_ms =
+                            u64::try_from(self.handle.inner.track_stuck_threshold.as_millis())
+                                .unwrap_or(u64::MAX);
+                        let payload = Arc::from(
+                            event_value(
+                                &self.handle.inner.guild_id,
+                                MediaEvent::TrackStuck {
+                                    track: self.track.clone(),
+                                    threshold_ms,
+                                },
+                                &self.user_data,
                             )
+                            .to_string(),
+                        );
+                        if self.session.publish_critical(payload).is_err() {
+                            // SessionHandle closes an overflowing critical queue;
+                            // never log its payload (track URLs may be sensitive).
+                            tracing::warn!(
+                                "track-stuck event could not enter the bounded critical queue"
+                            );
+                        }
+                        tracing::warn!(
+                            phase = "source_read",
+                            threshold_ms,
+                            "source read exceeded configured stuck threshold"
+                        );
+                    },
+                )
+                .await;
+                let frame = match frame_result {
+                    Ok(frame) => frame
+                        .map(|frame| {
+                            TimedOpusFrame::from_packet(
+                                frame.sequence,
+                                Duration::from_millis(frame.sequence.saturating_mul(20)),
+                                Duration::from_millis(u64::from(frame.duration_ms)),
+                                frame.payload,
+                            )
+                            .map_err(|_| {
+                                VoiceError::new(
+                                    VoiceErrorKind::Protocol,
+                                    "Mantle produced an invalid Discord Opus frame",
+                                )
+                            })
                         })
-                    })
-                    .transpose(),
-                Err(error) => Err(map_adapter_voice_error(error)),
-            };
-            match frame {
-                Ok(Some(frame)) => Ok(Some(frame)),
-                Ok(None) => {
-                    self.handle
-                        .report_source_terminal(
-                            self.session.clone(),
-                            self.generation,
-                            None,
-                            cancellation,
-                        )
-                        .await;
-                    Ok(None)
+                        .transpose(),
+                    Err(error) => Err(map_adapter_voice_error(error)),
+                };
+                if self.deferred_terminal {
+                    // Some media adapters report None while paused. Only genuine EOF
+                    // may reach the queue-drain hook; pause is a retained demand.
+                    if matches!(frame, Ok(None)) && *paused.borrow() {
+                        continue;
+                    }
+                    return frame;
                 }
-                Err(error) => {
-                    self.handle
-                        .report_source_terminal(
-                            self.session.clone(),
-                            self.generation,
-                            Some(error.clone()),
-                            cancellation,
-                        )
-                        .await;
-                    Err(error)
-                }
+                return match frame {
+                    Ok(Some(frame)) => Ok(Some(frame)),
+                    Ok(None) => {
+                        self.handle
+                            .report_source_terminal(
+                                self.session.clone(),
+                                self.generation,
+                                None,
+                                cancellation,
+                            )
+                            .await;
+                        Ok(None)
+                    }
+                    Err(error) => {
+                        self.handle
+                            .report_source_terminal(
+                                self.session.clone(),
+                                self.generation,
+                                Some(error.clone()),
+                                cancellation,
+                            )
+                            .await;
+                        Err(error)
+                    }
+                };
             }
         })
     }
@@ -1885,6 +1945,15 @@ async fn source_terminal(
         return Ok(());
     }
     apply_mantle_snapshot(&mut state, mantle_snapshot);
+    if state
+        .voice_connection
+        .as_ref()
+        .is_some_and(|voice| voice.retains_paused_source())
+    {
+        state.track = None;
+        state.outbound_connection = None;
+        state.position_ms = 0;
+    }
     state.terminal_track = None;
     cache_update(handle, &state, voice_snapshot.as_ref());
     drop(state);
@@ -2039,7 +2108,25 @@ async fn destroy(
 }
 
 fn apply_mantle_snapshot(state: &mut PlayerState, snapshot: crust::media::PlayerSnapshot) {
-    state.position_ms = snapshot.position_ms;
+    if state
+        .voice_connection
+        .as_ref()
+        .is_some_and(|voice| voice.retains_paused_source())
+        && snapshot.track.is_none()
+        && state.track.is_some()
+    {
+        // Mantle EOF precedes UDP drain; source_terminal owns the final transition.
+        return;
+    }
+    let buffered_ms = if cfg!(feature = "experimental-audio-worker") {
+        state
+            .voice_connection
+            .as_ref()
+            .map_or(0, |voice| voice.buffered_duration().as_millis() as u64)
+    } else {
+        0
+    };
+    state.position_ms = snapshot.position_ms.saturating_sub(buffered_ms);
     state.paused = snapshot.status == PlayerStatus::Paused;
     if snapshot.track.is_none()
         && matches!(snapshot.status, PlayerStatus::Idle | PlayerStatus::Stopped)

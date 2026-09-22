@@ -876,6 +876,9 @@ impl PlayerActor {
                 continue;
             }
             if self.reading.is_none()
+                && !(cfg!(feature = "experimental-audio-worker")
+                    && self.paused
+                    && self.track.is_some())
                 && let Some(reply) = self.pending_frame.take()
             {
                 self.handle(PlayerCommand::NextFrame { reply }).await;
@@ -1136,7 +1139,11 @@ impl PlayerActor {
                 }));
             }
             PlayerCommand::NextFrame { reply } => {
-                if self.reading.is_some() && self.buffered.is_empty() {
+                if (self.reading.is_some() && self.buffered.is_empty())
+                    || (cfg!(feature = "experimental-audio-worker")
+                        && self.paused
+                        && self.track.is_some())
+                {
                     // Retain one demand until read completion. No polling timer
                     // and no actor-wide wait while Stop/Pause are queued.
                     if self

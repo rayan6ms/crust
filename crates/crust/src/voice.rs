@@ -202,9 +202,19 @@ impl std::error::Error for VoiceFrameError {}
 /// The future must wait for source readiness instead of maintaining a 20 ms
 /// polling timer. `Ok(None)` permanently ends the current source generation;
 /// restarting or replacing playback attaches a new source. A backend may keep
-/// at most one prefetched frame while adapting this contract to its synchronous
-/// send scheduler.
+/// a bounded number of prefetched frames. Buffered backends call `drained` only
+/// after all preceding frames were sent, before publishing natural completion.
 pub trait VoiceFrameSource: Send + Sync {
+    /// Terminal notification after the sender has transmitted the queued tail.
+    /// Cancellation or replacement must not call this hook.
+    fn drained(
+        &self,
+        _failure: Option<VoiceError>,
+        _cancellation: CancellationToken,
+    ) -> VoiceFuture<'_, ()> {
+        Box::pin(async {})
+    }
+
     fn next_frame(
         &self,
         cancellation: CancellationToken,
@@ -284,6 +294,25 @@ impl std::error::Error for VoiceError {}
 /// The backend owns network pacing and may stage exactly one frame while
 /// adapting the asynchronous [`VoiceFrameSource`] to its transport scheduler.
 pub trait VoiceConnection: Send + Sync {
+    /// Buffered media already consumed from the source but not yet sent.
+    fn buffered_duration(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// Whether pause can retain the attached source and its bounded audio queue.
+    fn retains_paused_source(&self) -> bool {
+        false
+    }
+    /// Acknowledged pause/resume without replacing the source.
+    fn set_paused(&self, _paused: bool) -> VoiceFuture<'_, Result<(), VoiceError>> {
+        Box::pin(async {
+            Err(VoiceError::new(
+                VoiceErrorKind::Protocol,
+                "retained pause unsupported",
+            ))
+        })
+    }
+
     fn update(
         &self,
         info: VoiceConnectionInfo,

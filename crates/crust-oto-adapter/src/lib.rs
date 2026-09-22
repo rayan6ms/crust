@@ -243,6 +243,7 @@ impl VoiceBackend for OtoVoiceBackend {
 }
 
 enum AudioOperation {
+    Pause(bool),
     Source(Arc<dyn VoiceFrameSource>, CancellationToken),
     Stop,
     Shutdown,
@@ -306,6 +307,7 @@ impl OtoVoiceConnection {
                     AudioOperation::Source(source, cancellation) => {
                         owner.set_source_inner(source, cancellation).await
                     }
+                    AudioOperation::Pause(paused) => owner.pause_audio_inner(paused).await,
                     AudioOperation::Stop => owner.stop_audio_inner().await,
                     AudioOperation::Shutdown => owner.shutdown_inner().await,
                 }
@@ -422,6 +424,18 @@ impl OtoVoiceConnection {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(binding.sender.clone());
         self.finish_audio(AudioSlot::Attached(binding));
+        Ok(())
+    }
+
+    async fn pause_audio_inner(&self, paused: bool) -> Result<(), VoiceError> {
+        let sender = self
+            .snapshot_sender
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(sender) = sender {
+            sender.set_paused(paused).await.map_err(map_oto_error)?;
+        }
         Ok(())
     }
 
@@ -542,7 +556,9 @@ impl OtoVoiceConnection {
             if self.diagnostic_minute.fetch_max(minute, Ordering::Relaxed) < minute {
                 tracing::info!(connection_generation = connection.generation().get(),
                     connection_phase = ?connection.phase(), failure = ?connection.failure(),
-                    audio = ?audio, "voice diagnostic checkpoint");
+                    audio = ?audio, audio_queue_pending_ms = self.buffered_duration().as_millis() as u64,
+                    isolated_audio_worker = cfg!(feature = "experimental-audio-worker"),
+                    "voice diagnostic checkpoint");
             }
         }
         let stats = audio.map_or_else(oto::AudioStats::default, |audio| audio.stats());
@@ -731,6 +747,26 @@ impl OtoVoiceConnection {
 }
 
 impl VoiceConnection for OtoVoiceConnection {
+    fn buffered_duration(&self) -> Duration {
+        let audio = self
+            .audio
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &*audio {
+            AudioSlot::Attached(binding) => {
+                Duration::from_millis(binding.shared.backlog.pending().saturating_mul(20))
+            }
+            _ => Duration::ZERO,
+        }
+    }
+
+    fn retains_paused_source(&self) -> bool {
+        cfg!(feature = "experimental-audio-worker")
+    }
+    fn set_paused(&self, paused: bool) -> VoiceFuture<'_, Result<(), VoiceError>> {
+        Box::pin(self.operate(AudioOperation::Pause(paused)))
+    }
+
     fn update(
         &self,
         info: VoiceConnectionInfo,
@@ -816,8 +852,20 @@ impl FrameBridge {
     fn spawn(
         source: Arc<dyn VoiceFrameSource>,
     ) -> (OtoFrameSource, BridgeProducer, Arc<BridgeShared>) {
-        let (frames, receiver) = oto::frame_channel();
+        Self::spawn_with_buffer(source, cfg!(feature = "experimental-audio-worker"))
+    }
+
+    fn spawn_with_buffer(
+        source: Arc<dyn VoiceFrameSource>,
+        buffered: bool,
+    ) -> (OtoFrameSource, BridgeProducer, Arc<BridgeShared>) {
+        let (frames, receiver) = if buffered {
+            oto::buffered_frame_channel()
+        } else {
+            oto::frame_channel()
+        };
         let shared = Arc::new(BridgeShared {
+            backlog: frames.backlog(),
             changed: Notify::new(),
             state: AtomicU8::new(BRIDGE_RUNNING),
             failure: Mutex::new(None),
@@ -844,6 +892,7 @@ impl FrameBridge {
 }
 
 struct BridgeShared {
+    backlog: oto::FrameBacklog,
     changed: Notify,
     state: AtomicU8,
     failure: Mutex<Option<VoiceError>>,
@@ -890,20 +939,48 @@ async fn run_producer(
     cancellation: CancellationToken,
 ) {
     loop {
+        if frames.is_buffered()
+            && tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return,
+                result = frames.wait_capacity() => result,
+            }
+            .is_err()
+        {
+            return;
+        }
         let source_cancellation = cancellation.clone();
         let result = tokio::select! {
             biased;
             () = cancellation.cancelled() => return,
+            error = frames.closed(), if frames.is_buffered() => {
+                if error != oto::FrameSendError::Closed {
+                    shared.fail(VoiceError::new(VoiceErrorKind::Protocol, "audio frame output buffer too small"));
+                }
+                return;
+            }
             result = source.next_frame(source_cancellation) => result,
         };
         let frame = match result {
             Ok(Some(frame)) => frame,
-            Ok(None) => {
-                shared.state.store(BRIDGE_ENDED, Ordering::Release);
-                return;
-            }
-            Err(error) => {
-                shared.fail(error);
+            terminal => {
+                let failure = terminal.err();
+                if frames.is_buffered() {
+                    let drained = tokio::select! {
+                        biased;
+                        () = cancellation.cancelled() => return,
+                        result = frames.drain() => result,
+                    };
+                    if drained.is_err() {
+                        return;
+                    }
+                    source.drained(failure.clone(), cancellation.clone()).await;
+                }
+                if let Some(error) = failure {
+                    shared.fail(error);
+                } else {
+                    shared.state.store(BRIDGE_ENDED, Ordering::Release);
+                }
                 return;
             }
         };
@@ -1352,7 +1429,8 @@ mod tests {
 
     #[tokio::test]
     async fn abort_before_producer_starts_wakes_pending_consumer() {
-        let (mut bridge, producer, _) = FrameBridge::spawn(Arc::new(PendingSource));
+        let (mut bridge, producer, _) =
+            FrameBridge::spawn_with_buffer(Arc::new(PendingSource), false);
         let counter = Arc::new(WakeCounter::default());
         let waker = Waker::from(Arc::clone(&counter));
         let mut output = [0_u8; 16];
@@ -1367,7 +1445,8 @@ mod tests {
 
     #[tokio::test]
     async fn pending_consumer_wakes_when_the_producer_is_cancelled() {
-        let (mut bridge, producer, _) = FrameBridge::spawn(Arc::new(PendingSource));
+        let (mut bridge, producer, _) =
+            FrameBridge::spawn_with_buffer(Arc::new(PendingSource), false);
         let counter = Arc::new(WakeCounter::default());
         let waker = Waker::from(Arc::clone(&counter));
         let mut output = [0_u8; 16];
@@ -1387,7 +1466,7 @@ mod tests {
             frames: AsyncMutex::new(receive),
             polls: Arc::new(AtomicUsize::new(0)),
         });
-        let (mut bridge, producer, _) = FrameBridge::spawn(source);
+        let (mut bridge, producer, _) = FrameBridge::spawn_with_buffer(source, false);
         let counter = Arc::new(WakeCounter::default());
         let waker = Waker::from(Arc::clone(&counter));
         let mut output = [0_u8; 16];
@@ -1414,7 +1493,7 @@ mod tests {
             frames: AsyncMutex::new(receive),
             polls: Arc::new(AtomicUsize::new(0)),
         });
-        let (mut bridge, producer, _) = FrameBridge::spawn(source);
+        let (mut bridge, producer, _) = FrameBridge::spawn_with_buffer(source, false);
         let publishing = tokio::spawn(async move {
             for sequence in 0..4096 {
                 send.send(Some(frame(sequence))).await.unwrap();
@@ -1449,7 +1528,7 @@ mod tests {
             frames: AsyncMutex::new(receive),
             polls: Arc::clone(&polls),
         });
-        let (mut bridge, producer, _shared) = FrameBridge::spawn(source);
+        let (mut bridge, producer, _shared) = FrameBridge::spawn_with_buffer(source, false);
         send.send(Some(frame(1))).await.unwrap();
         send.send(Some(frame(2))).await.unwrap();
         tokio::task::yield_now().await;
@@ -1481,7 +1560,7 @@ mod tests {
             frames: AsyncMutex::new(receive),
             polls: Arc::new(AtomicUsize::new(0)),
         });
-        let (mut bridge, producer, _shared) = FrameBridge::spawn(source);
+        let (mut bridge, producer, _shared) = FrameBridge::spawn_with_buffer(source, false);
         let first = Arc::new(WakeCounter::default());
         let second = Arc::new(WakeCounter::default());
         let first_waker = Waker::from(Arc::clone(&first));
@@ -1514,7 +1593,7 @@ mod tests {
             frames: AsyncMutex::new(receive),
             polls: Arc::new(AtomicUsize::new(0)),
         });
-        let (mut bridge, producer, _shared) = FrameBridge::spawn(source);
+        let (mut bridge, producer, _shared) = FrameBridge::spawn_with_buffer(source, false);
         let counter = Arc::new(WakeCounter::default());
         let waker = Waker::from(Arc::clone(&counter));
         let mut output = [0_u8; 16];
@@ -1536,7 +1615,8 @@ mod tests {
 
     #[tokio::test]
     async fn source_failure_is_retained_for_typed_event_delivery() {
-        let (mut bridge, producer, shared) = FrameBridge::spawn(Arc::new(FailingSource));
+        let (mut bridge, producer, shared) =
+            FrameBridge::spawn_with_buffer(Arc::new(FailingSource), false);
         let counter = Arc::new(WakeCounter::default());
         let waker = Waker::from(Arc::clone(&counter));
         let mut output = [0_u8; 16];
@@ -1562,7 +1642,7 @@ mod tests {
             frames: AsyncMutex::new(receive),
             polls: Arc::new(AtomicUsize::new(0)),
         });
-        let (mut bridge, producer, shared) = FrameBridge::spawn(source);
+        let (mut bridge, producer, shared) = FrameBridge::spawn_with_buffer(source, false);
         send.send(Some(
             TimedOpusFrame::new(
                 1,
@@ -1592,6 +1672,69 @@ mod tests {
             VoiceErrorKind::Protocol
         );
         producer.shutdown().await;
+    }
+
+    #[cfg(feature = "experimental-audio-worker")]
+    #[tokio::test]
+    async fn queued_tail_survives_pause_and_terminal_follows_udp_drain() {
+        struct Finite {
+            sequence: AtomicU64,
+            drained: AtomicBool,
+        }
+        impl VoiceFrameSource for Finite {
+            fn next_frame(
+                &self,
+                _: CancellationToken,
+            ) -> VoiceFuture<'_, Result<Option<TimedOpusFrame>, VoiceError>> {
+                Box::pin(async move {
+                    let n = self.sequence.fetch_add(1, Ordering::AcqRel);
+                    Ok((n < 8).then(|| frame(n)))
+                })
+            }
+            fn drained(
+                &self,
+                failure: Option<VoiceError>,
+                _: CancellationToken,
+            ) -> VoiceFuture<'_, ()> {
+                Box::pin(async move {
+                    assert!(failure.is_none());
+                    self.drained.store(true, Ordering::Release);
+                })
+            }
+        }
+        let (gateway, udp) = peer(FakeVoiceGatewayConfig::local()).await;
+        let oto = Oto::builder()
+            .test_tls_config(gateway.tls().client_config())
+            .build()
+            .unwrap();
+        let backend = OtoVoiceBackend::new(oto, 2, 1);
+        let connection = backend
+            .connect(voice_info(&gateway, 3), CancellationToken::new())
+            .await
+            .unwrap();
+        let source = Arc::new(Finite {
+            sequence: AtomicU64::new(0),
+            drained: AtomicBool::new(false),
+        });
+        connection
+            .set_source(source.clone(), CancellationToken::new())
+            .await
+            .unwrap();
+        eventually_sent(&connection, 1).await;
+        connection.set_paused(true).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !source.drained.load(Ordering::Acquire),
+            "EOF cannot discard the unsent tail"
+        );
+        assert!(connection.buffered_duration() > Duration::ZERO);
+        connection.set_paused(false).await.unwrap();
+        eventually(|| source.drained.load(Ordering::Acquire)).await;
+        assert_eq!(connection.snapshot().await.unwrap().counters.sent, 8);
+        assert_eq!(connection.buffered_duration(), Duration::ZERO);
+        connection.shutdown().await.unwrap();
+        backend.shutdown().await.unwrap();
+        drop((gateway, udp));
     }
 
     #[tokio::test]

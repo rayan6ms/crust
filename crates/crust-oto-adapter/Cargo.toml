@@ -6,16 +6,19 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+experimental-audio-worker = ["oto/experimental-audio-worker"]
+
 [dependencies]
 crust = { path = "../crust" }
 futures-util.workspace = true
-oto = { git = "https://github.com/rayan6ms/oto", rev = "e205f9a3f44be36fab2fa3cd48ef113cbb0f4d1f" }
+oto = { git = "https://github.com/rayan6ms/oto", rev = "e7dd06679ffc5eff980e0f564d460f2923747d8c" }
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-oto = { git = "https://github.com/rayan6ms/oto", rev = "e205f9a3f44be36fab2fa3cd48ef113cbb0f4d1f", features = ["testkit"] }
-oto-testkit = { git = "https://github.com/rayan6ms/oto", rev = "e205f9a3f44be36fab2fa3cd48ef113cbb0f4d1f" }
+oto = { git = "https://github.com/rayan6ms/oto", rev = "e7dd06679ffc5eff980e0f564d460f2923747d8c", features = ["testkit"] }
+oto-testkit = { git = "https://github.com/rayan6ms/oto", rev = "e7dd06679ffc5eff980e0f564d460f2923747d8c" }
 serde_json.workspace = true
 stats_alloc = "0.1.10"
