@@ -12,13 +12,13 @@ experimental-audio-worker = ["oto/experimental-audio-worker"]
 [dependencies]
 crust = { path = "../crust" }
 futures-util.workspace = true
-oto = { git = "https://github.com/rayan6ms/oto", rev = "e7dd06679ffc5eff980e0f564d460f2923747d8c" }
+oto = { git = "https://github.com/rayan6ms/oto", rev = "9f955bd6daf1cd1f5a7d053a8e753b74d7942ef3" }
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-oto = { git = "https://github.com/rayan6ms/oto", rev = "e7dd06679ffc5eff980e0f564d460f2923747d8c", features = ["testkit"] }
-oto-testkit = { git = "https://github.com/rayan6ms/oto", rev = "e7dd06679ffc5eff980e0f564d460f2923747d8c" }
+oto = { git = "https://github.com/rayan6ms/oto", rev = "9f955bd6daf1cd1f5a7d053a8e753b74d7942ef3", features = ["testkit"] }
+oto-testkit = { git = "https://github.com/rayan6ms/oto", rev = "9f955bd6daf1cd1f5a7d053a8e753b74d7942ef3" }
 serde_json.workspace = true
 stats_alloc = "0.1.10"

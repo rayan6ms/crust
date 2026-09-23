@@ -690,6 +690,34 @@ impl OtoVoiceConnection {
                 event = events.recv() => event,
             };
             match event {
+                Ok(oto::ConnectionEvent::DaveRecovery {
+                    generation,
+                    attempt,
+                    context,
+                }) => {
+                    tracing::warn!(
+                        connection_generation = generation.get(),
+                        attempt,
+                        ?context,
+                        "DAVE readiness recovery: fresh encrypted handshake"
+                    );
+                }
+                Ok(oto::ConnectionEvent::DaveControlProcessed {
+                    generation,
+                    opcode,
+                    transition_id,
+                    epoch,
+                    replies,
+                }) => {
+                    tracing::info!(
+                        connection_generation = generation.get(),
+                        opcode,
+                        ?transition_id,
+                        ?epoch,
+                        replies,
+                        "DAVE control processed and replies written"
+                    );
+                }
                 Ok(oto::ConnectionEvent::DaveStateChanged {
                     generation,
                     opcode,
