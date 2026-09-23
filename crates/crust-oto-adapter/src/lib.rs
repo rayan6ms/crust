@@ -690,6 +690,16 @@ impl OtoVoiceConnection {
                 event = events.recv() => event,
             };
             match event {
+                Ok(oto::ConnectionEvent::DaveWaitingForMembers {
+                    generation,
+                    timeout_seconds,
+                }) => {
+                    tracing::info!(
+                        connection_generation = generation.get(),
+                        timeout_seconds,
+                        "DAVE readiness waiting for listener in empty room"
+                    );
+                }
                 Ok(oto::ConnectionEvent::DaveRecovery {
                     generation,
                     attempt,

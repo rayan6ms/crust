@@ -1,3 +1,9 @@
+## September 23: DAVE recovery integration
+
+- [x] Pin bounded recovery and empty-room readiness handling in Oto; preserve player/audio ownership during temporary voice phases.
+- [x] Export sanitized control/reply, waiting-for-listener and retry diagnostics.
+- [ ] Finish adapter regression and Oracle receiver qualification in Raydio.
+
 # Current task: Raydio finite-source stutters
 
 - [x] Reproduce the 90–130 ms periodic source-read stalls at 20 ms paced delivery.

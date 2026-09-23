@@ -144,3 +144,8 @@ these samples. This demonstrates preservation of unchanged audio processing;
 it is not proof of live transport quality or an explanation of the six-hour
 network incidents. Workspace tests: 152 passed, four existing manual benchmarks
 ignored. Raydio retains full comparison evidence and handles Oracle validation.
+
+
+## 2026-09-23: preserve playback across bounded DAVE readiness recovery
+
+Pinned Oto now distinguishes gateway readiness expiry from owner-response expiry, retains the audio attachment through at most two fresh encrypted handshakes per voice credential generation, and waits up to 120 seconds for a listener in a confirmed empty room. Media remains gated on encrypted readiness. Incremental membership is accumulated with a total bound. Crust exports redacted recovery attempts, empty-room wait bounds and completed control/reply metadata. It does not turn these temporary phase changes into WebSocketClosedEvent or replace the source; terminal exhaustion remains visible. Oracle qualification is tracked in Raydio's dave-recovery-20260923 evidence.
