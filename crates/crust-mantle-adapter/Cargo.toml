@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+experimental-audio-worker = []
+
 [dependencies]
 base64.workspace = true
 crust = { path = "../crust" }
