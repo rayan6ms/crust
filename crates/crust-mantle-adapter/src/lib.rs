@@ -222,6 +222,20 @@ impl RealMantleAdapter {
         planner: RoutePlanner,
         settings: MantleAdapterOptions,
     ) -> Result<Self, AdapterError> {
+        Self::with_options_and_authentication(
+            planner,
+            settings,
+            YoutubeAuthentication::default(),
+        )
+    }
+
+    /// Creates the production adapter with explicit YouTube authentication material.
+    /// Secrets remain owned by the caller and are never included in adapter diagnostics.
+    pub fn with_options_and_authentication(
+        planner: RoutePlanner,
+        settings: MantleAdapterOptions,
+        authentication: YoutubeAuthentication,
+    ) -> Result<Self, AdapterError> {
         if settings.staging_max_bytes > 64 * 1024 * 1024 {
             return Err(invalid_operation("source staging ceiling exceeds 64 MiB"));
         }
@@ -235,7 +249,7 @@ impl RealMantleAdapter {
             },
             ..YoutubeSourceOptions::default()
         };
-        let mut adapter = Self::new(planner, options, YoutubeAuthentication::default())?;
+        let mut adapter = Self::new(planner, options, authentication)?;
         Arc::get_mut(&mut adapter.inner)
             .expect("new adapter is uniquely owned")
             .staging_max_bytes = settings.staging_max_bytes;
