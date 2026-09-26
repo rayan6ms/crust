@@ -1761,6 +1761,7 @@ fn map_playback_source_outcome(kind: YoutubePlaybackErrorKind) -> RouteOutcome {
 fn map_youtube_error(kind: YoutubeErrorKind) -> AdapterError {
     match kind {
         YoutubeErrorKind::Cancelled => cancelled(),
+        YoutubeErrorKind::LoginRequired => youtube_authentication_required(),
         _ => load_failed(),
     }
 }
@@ -1771,6 +1772,9 @@ fn map_playback_error(error: YoutubePlaybackError) -> AdapterError {
         | YoutubePlaybackErrorKind::Source(YoutubeErrorKind::Cancelled) => cancelled(),
         YoutubePlaybackErrorKind::InvalidOptions | YoutubePlaybackErrorKind::IncompatibleFormat => {
             invalid_operation("Mantle rejected the playback operation")
+        }
+        YoutubePlaybackErrorKind::Source(YoutubeErrorKind::LoginRequired) => {
+            youtube_authentication_required()
         }
         _ => load_failed(),
     }
@@ -1801,6 +1805,13 @@ const fn load_failed() -> AdapterError {
     AdapterError::new(
         AdapterErrorKind::LoadFailed,
         "Mantle source or playback failed",
+    )
+}
+
+const fn youtube_authentication_required() -> AdapterError {
+    AdapterError::new(
+        AdapterErrorKind::LoadFailed,
+        "YouTube rejected playback authentication or this server's egress",
     )
 }
 
@@ -1980,6 +1991,15 @@ fn decode_fixture_track(encoded: &EncodedTrack) -> Result<MediaTrack, AdapterErr
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn youtube_login_failures_keep_a_diagnostic_message() {
+        let error = super::map_youtube_error(YoutubeErrorKind::LoginRequired);
+        assert_eq!(
+            error.message,
+            "YouTube rejected playback authentication or this server's egress"
+        );
+    }
+
     #[tokio::test]
     async fn player_churn_reaps_dead_allocations() {
         let adapter = RealMantleAdapter::with_defaults(RoutePlanner::disabled()).unwrap();
