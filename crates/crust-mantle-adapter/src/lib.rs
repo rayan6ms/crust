@@ -1668,6 +1668,7 @@ fn open_playback(
         ) {
             Ok(formats) => formats,
             Err(error) => {
+                tracing::warn!(client_attempts = skipped_clients.len(), kind = ?error.kind(), "YouTube playback discovery exhausted");
                 route_policy.report_source(map_youtube_source_outcome(error.kind()));
                 return Err(last_error
                     .map(map_playback_error)
@@ -1725,6 +1726,7 @@ fn open_playback(
                 return Ok(session);
             }
             Err(error) => {
+                tracing::warn!(client = ?client, kind = ?error.kind(), "YouTube media handoff failed; trying another client");
                 route_policy.report_source(map_playback_source_outcome(error.kind()));
                 last_error = Some(error);
                 if skipped_clients.contains(&client) {

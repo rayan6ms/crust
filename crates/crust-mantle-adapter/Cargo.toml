@@ -20,6 +20,7 @@ microfft = { version = "0.6.0", default-features = false, features = ["size-1024
 micromath = "2.1.0"
 tokio.workspace = true
 tokio-util.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 crust-testkit = { path = "../crust-testkit" }
