@@ -222,11 +222,7 @@ impl RealMantleAdapter {
         planner: RoutePlanner,
         settings: MantleAdapterOptions,
     ) -> Result<Self, AdapterError> {
-        Self::with_options_and_authentication(
-            planner,
-            settings,
-            YoutubeAuthentication::default(),
-        )
+        Self::with_options_and_authentication(planner, settings, YoutubeAuthentication::default())
     }
 
     /// Creates the production adapter with explicit YouTube authentication material.
@@ -1659,66 +1655,88 @@ fn open_playback(
         return Err(invalid_track());
     };
     let media_cancel = MediaCancellation::linked(move || cancellation.is_cancelled());
-    let formats = manager
-        .discover_playback_formats(&track.info.identifier, &media_cancel)
-        .map_err(|error| {
-            route_policy.report_source(map_youtube_source_outcome(error.kind()));
-            map_youtube_error(error.kind())
-        })?;
-    let opened = if formats.selected().kind() == Some(YoutubePlaybackFormatKind::HlsMpegTsAac) {
-        let session = if route_policy.planner.is_enabled() {
-            manager.open_selected_live_playback_routed(
-                &formats,
-                YoutubeLivePlaybackOptions::default(),
-                media_cancel,
-                route_policy.clone(),
-            )
-        } else {
-            manager.open_selected_live_playback(
-                &formats,
-                YoutubeLivePlaybackOptions::default(),
-                media_cancel,
-            )
+    let mut skipped_clients = Vec::new();
+    let mut last_error = None;
+    // A client can return valid metadata while its signed media URL is rejected at the first
+    // range request. Retry discovery with that client excluded so the next configured client can
+    // provide a playable URL. The source manager's bounded client list keeps this finite.
+    loop {
+        let formats = match manager.discover_playback_formats_skipping(
+            &track.info.identifier,
+            &media_cancel,
+            &skipped_clients,
+        ) {
+            Ok(formats) => formats,
+            Err(error) => {
+                route_policy.report_source(map_youtube_source_outcome(error.kind()));
+                return Err(last_error
+                    .map(map_playback_error)
+                    .unwrap_or_else(|| map_youtube_error(error.kind())));
+            }
         };
-        session.map(|session| PlaybackSession::Live {
-            session: Box::new(session),
-            now: Duration::ZERO,
-        })
-    } else {
-        let session = if route_policy.planner.is_enabled() {
-            manager.open_selected_playback_routed(
-                &formats,
-                HttpRangeOptions {
-                    staging_max_bytes,
-                    ..HttpRangeOptions::default()
-                },
-                MediaLimits::default(),
-                media_cancel,
-                route_policy.clone(),
-            )
+        let client = formats.client();
+        let opened = if formats.selected().kind() == Some(YoutubePlaybackFormatKind::HlsMpegTsAac) {
+            let session = if route_policy.planner.is_enabled() {
+                manager.open_selected_live_playback_routed(
+                    &formats,
+                    YoutubeLivePlaybackOptions::default(),
+                    media_cancel.clone(),
+                    route_policy.clone(),
+                )
+            } else {
+                manager.open_selected_live_playback(
+                    &formats,
+                    YoutubeLivePlaybackOptions::default(),
+                    media_cancel.clone(),
+                )
+            };
+            session.map(|session| PlaybackSession::Live {
+                session: Box::new(session),
+                now: Duration::ZERO,
+            })
         } else {
-            manager.open_selected_playback(
-                &formats,
-                HttpRangeOptions {
-                    staging_max_bytes,
-                    ..HttpRangeOptions::default()
-                },
-                MediaLimits::default(),
-                media_cancel,
-            )
+            let session = if route_policy.planner.is_enabled() {
+                manager.open_selected_playback_routed(
+                    &formats,
+                    HttpRangeOptions {
+                        staging_max_bytes,
+                        ..HttpRangeOptions::default()
+                    },
+                    MediaLimits::default(),
+                    media_cancel.clone(),
+                    route_policy.clone(),
+                )
+            } else {
+                manager.open_selected_playback(
+                    &formats,
+                    HttpRangeOptions {
+                        staging_max_bytes,
+                        ..HttpRangeOptions::default()
+                    },
+                    MediaLimits::default(),
+                    media_cancel.clone(),
+                )
+            };
+            session.map(PlaybackSession::Finite)
         };
-        session.map(PlaybackSession::Finite)
-    };
-    match opened {
-        Ok(session) => {
-            route_policy.report_source(RouteOutcome::SourceSuccess);
-            Ok(session)
-        }
-        Err(error) => {
-            route_policy.report_source(map_playback_source_outcome(error.kind()));
-            Err(map_playback_error(error))
+        match opened {
+            Ok(session) => {
+                route_policy.report_source(RouteOutcome::SourceSuccess);
+                return Ok(session);
+            }
+            Err(error) => {
+                route_policy.report_source(map_playback_source_outcome(error.kind()));
+                last_error = Some(error);
+                if skipped_clients.contains(&client) {
+                    break;
+                }
+                skipped_clients.push(client);
+            }
         }
     }
+    Err(map_playback_error(
+        last_error.expect("playback attempt must produce an error"),
+    ))
 }
 
 fn map_youtube_source_outcome(kind: YoutubeErrorKind) -> RouteOutcome {
