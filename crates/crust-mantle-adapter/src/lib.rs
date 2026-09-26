@@ -1668,7 +1668,7 @@ fn open_playback(
         ) {
             Ok(formats) => formats,
             Err(error) => {
-                tracing::warn!(client_attempts = skipped_clients.len(), kind = ?error.kind(), "YouTube playback discovery exhausted");
+                tracing::warn!(client_attempts = error.attempts(), skipped_clients = skipped_clients.len(), kind = ?error.kind(), "YouTube playback discovery exhausted");
                 route_policy.report_source(map_youtube_source_outcome(error.kind()));
                 return Err(last_error
                     .map(map_playback_error)
