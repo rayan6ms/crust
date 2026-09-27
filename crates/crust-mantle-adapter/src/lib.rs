@@ -25,9 +25,9 @@ use mantle_core::{
 use mantle_media::{
     HttpRangeOptions, MediaCancellation, MediaLimits, OutboundRoute, OutboundRouteContext,
     OutboundRouteOutcome, OutboundRoutePolicy, RemoteHttpOptions, StagedPlaybackInput,
-    YoutubeAudioSourceManager, YoutubeAuthentication, YoutubeErrorKind, YoutubeLivePlaybackOptions,
-    YoutubeLivePlaybackPoll, YoutubeLivePlaybackSession, YoutubePlaybackError,
-    YoutubePlaybackErrorKind, YoutubePlaybackFormatKind, YoutubePlaybackMode,
+    YoutubeAudioSourceManager, YoutubeAuthentication, YoutubeCipherResolver, YoutubeErrorKind,
+    YoutubeLivePlaybackOptions, YoutubeLivePlaybackPoll, YoutubeLivePlaybackSession,
+    YoutubePlaybackError, YoutubePlaybackErrorKind, YoutubePlaybackFormatKind, YoutubePlaybackMode,
     YoutubePlaybackSession, YoutubeSourceItem, YoutubeSourceOptions, YoutubeSourceTrack,
 };
 use tokio::sync::{mpsc, oneshot};
@@ -232,6 +232,21 @@ impl RealMantleAdapter {
         settings: MantleAdapterOptions,
         authentication: YoutubeAuthentication,
     ) -> Result<Self, AdapterError> {
+        Self::with_options_authentication_and_cipher_resolver(
+            planner,
+            settings,
+            authentication,
+            None,
+        )
+    }
+
+    /// Creates the production adapter with an optional bounded cipher subprocess fallback.
+    pub fn with_options_authentication_and_cipher_resolver(
+        planner: RoutePlanner,
+        settings: MantleAdapterOptions,
+        authentication: YoutubeAuthentication,
+        cipher_resolver: Option<Arc<dyn YoutubeCipherResolver>>,
+    ) -> Result<Self, AdapterError> {
         if settings.staging_max_bytes > 64 * 1024 * 1024 {
             return Err(invalid_operation("source staging ceiling exceeds 64 MiB"));
         }
@@ -245,7 +260,8 @@ impl RealMantleAdapter {
             },
             ..YoutubeSourceOptions::default()
         };
-        let mut adapter = Self::new(planner, options, authentication)?;
+        let mut adapter =
+            Self::new_with_cipher_resolver(planner, options, authentication, cipher_resolver)?;
         Arc::get_mut(&mut adapter.inner)
             .expect("new adapter is uniquely owned")
             .staging_max_bytes = settings.staging_max_bytes;
@@ -258,14 +274,31 @@ impl RealMantleAdapter {
         options: YoutubeSourceOptions,
         authentication: YoutubeAuthentication,
     ) -> Result<Self, AdapterError> {
+        Self::new_with_cipher_resolver(planner, options, authentication, None)
+    }
+
+    /// Creates a YouTube manager with an optional cipher resolver and registers its source.
+    pub fn new_with_cipher_resolver(
+        planner: RoutePlanner,
+        options: YoutubeSourceOptions,
+        authentication: YoutubeAuthentication,
+        cipher_resolver: Option<Arc<dyn YoutubeCipherResolver>>,
+    ) -> Result<Self, AdapterError> {
         let route_policy = Arc::new(CrustOutboundRoutePolicy::new(planner));
         // Routed clients intentionally cannot reuse a connection across route changes.
         // A disabled planner needs the ordinary pooled client, not a no-op policy.
         let manager = if route_policy.planner.is_enabled() {
-            YoutubeAudioSourceManager::with_route_policy(
+            YoutubeAudioSourceManager::with_route_policy_and_cipher_resolver(
                 options,
                 authentication,
                 route_policy.clone(),
+                cipher_resolver,
+            )
+        } else if let Some(cipher_resolver) = cipher_resolver {
+            YoutubeAudioSourceManager::with_cipher_resolver(
+                options,
+                authentication,
+                cipher_resolver,
             )
         } else {
             YoutubeAudioSourceManager::new(options, authentication)
