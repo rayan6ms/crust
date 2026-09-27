@@ -1677,7 +1677,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 [[package]]
 name = "mantle-audio"
 version = "0.0.0"
-source = "git+https://github.com/rayan6ms/mantle?rev=6bd9302#6bd93029924c66bae0196df4f635472ca7a8a8d2"
+source = "git+https://github.com/rayan6ms/mantle?rev=890559c#890559c0caa0999ddc41a0c5c651410c1c1d2ac5"
 dependencies = [
  "mantle-opus",
  "rtrb",
@@ -1687,12 +1687,12 @@ dependencies = [
 [[package]]
 name = "mantle-core"
 version = "0.0.0"
-source = "git+https://github.com/rayan6ms/mantle?rev=6bd9302#6bd93029924c66bae0196df4f635472ca7a8a8d2"
+source = "git+https://github.com/rayan6ms/mantle?rev=890559c#890559c0caa0999ddc41a0c5c651410c1c1d2ac5"
 
 [[package]]
 name = "mantle-media"
 version = "0.0.0"
-source = "git+https://github.com/rayan6ms/mantle?rev=6bd9302#6bd93029924c66bae0196df4f635472ca7a8a8d2"
+source = "git+https://github.com/rayan6ms/mantle?rev=890559c#890559c0caa0999ddc41a0c5c651410c1c1d2ac5"
 dependencies = [
  "aes 0.9.2",
  "cbc",
@@ -1714,7 +1714,7 @@ dependencies = [
 [[package]]
 name = "mantle-opus"
 version = "0.0.0"
-source = "git+https://github.com/rayan6ms/mantle?rev=6bd9302#6bd93029924c66bae0196df4f635472ca7a8a8d2"
+source = "git+https://github.com/rayan6ms/mantle?rev=890559c#890559c0caa0999ddc41a0c5c651410c1c1d2ac5"
 dependencies = [
  "opus-head-sys",
 ]
@@ -1722,7 +1722,7 @@ dependencies = [
 [[package]]
 name = "mantle-symphonia-isomp4"
 version = "0.6.1"
-source = "git+https://github.com/rayan6ms/mantle?rev=6bd9302#6bd93029924c66bae0196df4f635472ca7a8a8d2"
+source = "git+https://github.com/rayan6ms/mantle?rev=890559c#890559c0caa0999ddc41a0c5c651410c1c1d2ac5"
 dependencies = [
  "log",
  "symphonia-common",
@@ -1733,7 +1733,7 @@ dependencies = [
 [[package]]
 name = "mantle-xaac"
 version = "0.0.0"
-source = "git+https://github.com/rayan6ms/mantle?rev=6bd9302#6bd93029924c66bae0196df4f635472ca7a8a8d2"
+source = "git+https://github.com/rayan6ms/mantle?rev=890559c#890559c0caa0999ddc41a0c5c651410c1c1d2ac5"
 
 [[package]]
 name = "matchers"
