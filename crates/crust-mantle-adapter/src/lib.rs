@@ -1776,10 +1776,13 @@ fn open_playback(
 
 fn map_youtube_source_outcome(kind: YoutubeErrorKind) -> RouteOutcome {
     match kind {
-        YoutubeErrorKind::RateLimited => RouteOutcome::SourceRateLimited,
-        YoutubeErrorKind::Unavailable | YoutubeErrorKind::LoginRequired => {
-            RouteOutcome::SourceUnavailable
+        // YouTube's LOGIN_REQUIRED response is also used for datacenter/IP
+        // bot challenges. Treat it like a rate limit so an enabled route
+        // planner retires that egress and tries the next configured route.
+        YoutubeErrorKind::RateLimited | YoutubeErrorKind::LoginRequired => {
+            RouteOutcome::SourceRateLimited
         }
+        YoutubeErrorKind::Unavailable => RouteOutcome::SourceUnavailable,
         _ => RouteOutcome::SourceFailure,
     }
 }
@@ -1788,6 +1791,25 @@ fn map_playback_source_outcome(kind: YoutubePlaybackErrorKind) -> RouteOutcome {
     match kind {
         YoutubePlaybackErrorKind::Source(kind) => map_youtube_source_outcome(kind),
         _ => RouteOutcome::SourceFailure,
+    }
+}
+
+#[cfg(test)]
+mod route_outcome_tests {
+    use super::*;
+
+    #[test]
+    fn youtube_login_challenge_retires_the_selected_route() {
+        assert_eq!(
+            map_youtube_source_outcome(YoutubeErrorKind::LoginRequired),
+            RouteOutcome::SourceRateLimited
+        );
+        assert_eq!(
+            map_playback_source_outcome(YoutubePlaybackErrorKind::Source(
+                YoutubeErrorKind::LoginRequired
+            )),
+            RouteOutcome::SourceRateLimited
+        );
     }
 }
 
