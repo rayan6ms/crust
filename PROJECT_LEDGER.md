@@ -11,8 +11,15 @@ bitrate, gain or worker changes accompany this integration.
 Mantle 7c7762d includes exact-packet gated-WebM tests, bounded SOCKS deadlines,
 and the patched Rustls/WebPKI dependency closure. All 33 adapter/filter tests
 pass (two pre-existing manual tests ignored), plus all-target Clippy with warnings
-denied. Oracle HTTPS/home-proxy startup and receiver qualification remain pending
-in Raydio; deterministic prefix latency does not prove downstream loss reduction.
+denied. Live command-to-first-send improves from 6.745 to 3.713 s (44.95%),
+with 279.813 ms prefix staging; PSS median rises about 0.398 MiB. The downloader
+completes after playback begins, and cached repeats retain intact RTP timelines.
+Receiver quality is not a clean pass: first-sample concealment rises from 79.6875
+to 247.75 ms with four scheduling gaps/24% VM steal; the recheck has 34.742% steal
+and a 14.767 s receiver ICE outage while Oracle continues sending normally.
+Source poll times remain microseconds, with no source underruns/overruns or send
+failures. Full attribution limits are in Raydio's progressive-buffering report;
+these observations do not establish a downstream-loss fix.
 
 # Dependency lifecycle audit resolved (2026-09-10)
 
