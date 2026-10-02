@@ -160,3 +160,11 @@ ordinary validation/deciphering. The successful playback timing event now uses
 metrics without enabling unrelated source/HTTP logs. No audio pacing, encoding,
 queue or worker change is involved. Live comparison evidence is in Raydio's
 `docs/PLAYBACK-STARTUP-2026-10-02.md`.
+
+The next Mantle pin `601eea7a372b54026beb5646004efd6662969d3c` passes finite
+YouTube metadata length to the range reader. Objects within the existing staging
+ceiling now use a single validated full range. Complete staging still precedes
+playback; source deadlines, exact-byte recovery and origin-independent repeat
+remain intact. This removes another startup round trip without changing steady
+audio processing. The controlled 4 MiB fixture went from two requests / 71.390 ms
+to one / 50.263 ms. Live startup numbers remain Raydio's deployment qualification.
