@@ -4,7 +4,7 @@ use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -1688,12 +1688,14 @@ fn open_playback(
         return Err(invalid_track());
     };
     let media_cancel = MediaCancellation::linked(move || cancellation.is_cancelled());
+    let started = Instant::now();
     let mut skipped_clients = Vec::new();
     let mut last_error = None;
     // A client can return valid metadata while its signed media URL is rejected at the first
     // range request. Retry discovery with that client excluded so the next configured client can
     // provide a playable URL. The source manager's bounded client list keeps this finite.
     loop {
+        let discovery_started = Instant::now();
         let formats = match manager.discover_playback_formats_skipping(
             &track.info.identifier,
             &media_cancel,
@@ -1708,7 +1710,9 @@ fn open_playback(
                     .unwrap_or_else(|| map_youtube_error(error.kind())));
             }
         };
+        let discovery_ms = discovery_started.elapsed().as_secs_f64() * 1000.0;
         let client = formats.client();
+        let handoff_started = Instant::now();
         let opened = if formats.selected().kind() == Some(YoutubePlaybackFormatKind::HlsMpegTsAac) {
             let session = if route_policy.planner.is_enabled() {
                 manager.open_selected_live_playback_routed(
@@ -1755,11 +1759,12 @@ fn open_playback(
         };
         match opened {
             Ok(session) => {
+                tracing::info!(client = ?client, discovery_ms, handoff_ms = handoff_started.elapsed().as_secs_f64() * 1000.0, total_ms = started.elapsed().as_secs_f64() * 1000.0, failed_handoffs = skipped_clients.len(), "YouTube playback prepared");
                 route_policy.report_source(RouteOutcome::SourceSuccess);
                 return Ok(session);
             }
             Err(error) => {
-                tracing::warn!(client = ?client, kind = ?error.kind(), "YouTube media handoff failed; trying another client");
+                tracing::warn!(client = ?client, kind = ?error.kind(), discovery_ms, handoff_ms = handoff_started.elapsed().as_secs_f64() * 1000.0, "YouTube media handoff failed; trying another client");
                 route_policy.report_source(map_playback_source_outcome(error.kind()));
                 last_error = Some(error);
                 if skipped_clients.contains(&client) {
