@@ -168,3 +168,12 @@ playback; source deadlines, exact-byte recovery and origin-independent repeat
 remain intact. This removes another startup round trip without changing steady
 audio processing. The controlled 4 MiB fixture went from two requests / 71.390 ms
 to one / 50.263 ms. Live startup numbers remain Raydio's deployment qualification.
+
+Mantle `775d64f85912bfcf96814ff404144300f34cb635` finalizes consumed range
+bodies and shares the source manager's existing non-routed pool with finite
+media when transport policies match. It fixes a reproduced keep-alive failure
+(three connections instead of one) without changing audio packets or buffering.
+The disabled-planner constructor already uses the ordinary pooled manager;
+enabled route planning retains its independent no-reuse transport. Adapter
+tests pass (32, two existing manual benchmarks excluded); live comparison is
+tracked in Raydio's `docs/PLAYBACK-STARTUP-POOL-2026-10-02.md`.
