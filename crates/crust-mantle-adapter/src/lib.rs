@@ -1759,7 +1759,7 @@ fn open_playback(
         };
         match opened {
             Ok(session) => {
-                tracing::info!(client = ?client, discovery_ms, handoff_ms = handoff_started.elapsed().as_secs_f64() * 1000.0, total_ms = started.elapsed().as_secs_f64() * 1000.0, failed_handoffs = skipped_clients.len(), "YouTube playback prepared");
+                tracing::info!(target: "crust_mantle_adapter::startup", client = ?client, discovery_ms, handoff_ms = handoff_started.elapsed().as_secs_f64() * 1000.0, total_ms = started.elapsed().as_secs_f64() * 1000.0, failed_handoffs = skipped_clients.len(), "YouTube playback prepared");
                 route_policy.report_source(RouteOutcome::SourceSuccess);
                 return Ok(session);
             }

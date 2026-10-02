@@ -149,3 +149,14 @@ ignored. Raydio retains full comparison evidence and handles Oracle validation.
 ## 2026-09-23: preserve playback across bounded DAVE readiness recovery
 
 Pinned Oto now distinguishes gateway readiness expiry from owner-response expiry, retains the audio attachment through at most two fresh encrypted handshakes per voice credential generation, and waits up to 120 seconds for a listener in a confirmed empty room. Media remains gated on encrypted readiness. Incremental membership is accumulated with a total bound. Crust exports redacted recovery attempts, empty-room wait bounds and completed control/reply metadata. It does not turn these temporary phase changes into WebSocketClosedEvent or replace the source; terminal exhaustion remains visible. Oracle qualification is tracked in Raydio's dave-recovery-20260923 evidence.
+
+## 2026-10-02: preserve resolved Companion URLs and expose startup timing
+
+Mantle `4bdb224ca6b32b6e6640c8cd7a4c7d72da114a52` fixes double deciphering
+of already resolved Companion URLs. The previous first Web-labelled handoff
+failed before media I/O and triggered a slower fallback. Raw client URLs retain
+ordinary validation/deciphering. The successful playback timing event now uses
+`crust_mantle_adapter::startup`, so consumers can enable credential-free startup
+metrics without enabling unrelated source/HTTP logs. No audio pacing, encoding,
+queue or worker change is involved. Live comparison evidence is in Raydio's
+`docs/PLAYBACK-STARTUP-2026-10-02.md`.
