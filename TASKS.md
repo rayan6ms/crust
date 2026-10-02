@@ -1,3 +1,10 @@
+## October 2: progressive finite-source integration
+
+- [x] Validate the opt-in prefix and propagate it to ordinary/routed source opens.
+- [x] Pin Mantle's bounded cache, demux/seek regressions and proxy deadline repair.
+- [x] Pass 33 adapter/filter tests and all-target Clippy with warnings denied.
+- [ ] Qualify actual HTTPS/home-proxy startup and receiver continuity in Raydio.
+
 ## September 23: DAVE recovery integration
 
 - [x] Pin bounded recovery and empty-room readiness handling in Oto; preserve player/audio ownership during temporary voice phases.

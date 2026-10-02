@@ -53,6 +53,8 @@ pub struct MantleAdapterOptions {
     /// Stage compressed objects up to this size; zero disables it, maximum 64 MiB.
     /// Larger objects and live sources continue streaming.
     pub staging_max_bytes: u64,
+    /// Optional initial compressed prefix; zero keeps complete staging.
+    pub progressive_buffer_bytes: u64,
     pub allow_youtube_search: bool,
     pub max_playlist_pages: usize,
     pub connect_timeout: Duration,
@@ -63,6 +65,7 @@ impl Default for MantleAdapterOptions {
     fn default() -> Self {
         Self {
             staging_max_bytes: 0,
+            progressive_buffer_bytes: 0,
             allow_youtube_search: true,
             max_playlist_pages: 6,
             connect_timeout: Duration::from_secs(10),
@@ -184,6 +187,7 @@ impl SourceManager<YoutubeSourceItem> for SharedYoutubeManager {
 
 struct AdapterInner {
     staging_max_bytes: u64,
+    progressive_buffer_bytes: u64,
     manager: Arc<YoutubeAudioSourceManager>,
     registry: Arc<SourceRegistry<YoutubeSourceItem>>,
     route_policy: Arc<CrustOutboundRoutePolicy>,
@@ -250,6 +254,14 @@ impl RealMantleAdapter {
         if settings.staging_max_bytes > 64 * 1024 * 1024 {
             return Err(invalid_operation("source staging ceiling exceeds 64 MiB"));
         }
+        if settings.progressive_buffer_bytes != 0
+            && (!(16 * 1024..=1024 * 1024).contains(&settings.progressive_buffer_bytes)
+                || settings.progressive_buffer_bytes > settings.staging_max_bytes)
+        {
+            return Err(invalid_operation(
+                "progressive prefix must fit the staging bound and be 16 KiB..1 MiB",
+            ));
+        }
         let options = YoutubeSourceOptions {
             allow_search: settings.allow_youtube_search,
             max_playlist_pages: settings.max_playlist_pages,
@@ -262,9 +274,9 @@ impl RealMantleAdapter {
         };
         let mut adapter =
             Self::new_with_cipher_resolver(planner, options, authentication, cipher_resolver)?;
-        Arc::get_mut(&mut adapter.inner)
-            .expect("new adapter is uniquely owned")
-            .staging_max_bytes = settings.staging_max_bytes;
+        let inner = Arc::get_mut(&mut adapter.inner).expect("new adapter is uniquely owned");
+        inner.staging_max_bytes = settings.staging_max_bytes;
+        inner.progressive_buffer_bytes = settings.progressive_buffer_bytes;
         Ok(adapter)
     }
 
@@ -313,6 +325,7 @@ impl RealMantleAdapter {
         Ok(Self {
             inner: Arc::new(AdapterInner {
                 staging_max_bytes: 0,
+                progressive_buffer_bytes: 0,
                 manager,
                 registry: Arc::new(registry),
                 route_policy,
@@ -433,6 +446,7 @@ impl MantleAdapter for RealMantleAdapter {
                 Arc::clone(&inner.registry),
                 Arc::clone(&inner.route_policy),
                 inner.staging_max_bytes,
+                inner.progressive_buffer_bytes,
                 inner.shutdown.child_token(),
             );
             let mut tracked = inner
@@ -859,6 +873,7 @@ struct PlayerActor {
     discard_read: bool,
     media_cancellation: Option<CancellationToken>,
     staging_max_bytes: u64,
+    progressive_buffer_bytes: u64,
     completed_input: Option<(EncodedTrack, CompletedInput)>,
     manager: Arc<YoutubeAudioSourceManager>,
     registry: Arc<SourceRegistry<YoutubeSourceItem>>,
@@ -1248,6 +1263,7 @@ impl PlayerActor {
         let encoded = track.encoded.clone();
         let completed = self.completed_input.take();
         let staging_max_bytes = self.staging_max_bytes;
+        let progressive_buffer_bytes = self.progressive_buffer_bytes;
         let media_cancellation = cancellation.child_token();
         let opening_guard = media_cancellation.clone().drop_guard();
         let cancellation_for_open = media_cancellation.clone();
@@ -1267,6 +1283,7 @@ impl PlayerActor {
                 encoded,
                 cancellation_for_open,
                 staging_max_bytes,
+                progressive_buffer_bytes,
             )
         })
         .await
@@ -1437,6 +1454,7 @@ impl RealMantlePlayer {
         registry: Arc<SourceRegistry<YoutubeSourceItem>>,
         route_policy: Arc<CrustOutboundRoutePolicy>,
         staging_max_bytes: u64,
+        progressive_buffer_bytes: u64,
         shutdown: CancellationToken,
     ) -> Arc<Self> {
         let (commands, receiver) = mpsc::channel(PLAYER_COMMAND_CAPACITY);
@@ -1446,6 +1464,7 @@ impl RealMantlePlayer {
             discard_read: false,
             media_cancellation: None,
             staging_max_bytes,
+            progressive_buffer_bytes,
             completed_input: None,
             manager,
             registry,
@@ -1672,6 +1691,7 @@ fn open_playback(
     encoded: EncodedTrack,
     cancellation: CancellationToken,
     staging_max_bytes: u64,
+    progressive_buffer_bytes: u64,
 ) -> Result<PlaybackSession, AdapterError> {
     #[cfg(test)]
     if let Ok(track) = decode_fixture_track(&encoded) {
@@ -1738,6 +1758,7 @@ fn open_playback(
                     &formats,
                     HttpRangeOptions {
                         staging_max_bytes,
+                        progressive_buffer_bytes,
                         ..HttpRangeOptions::default()
                     },
                     MediaLimits::default(),
@@ -1749,6 +1770,7 @@ fn open_playback(
                     &formats,
                     HttpRangeOptions {
                         staging_max_bytes,
+                        progressive_buffer_bytes,
                         ..HttpRangeOptions::default()
                     },
                     MediaLimits::default(),
@@ -2051,6 +2073,48 @@ fn decode_fixture_track(encoded: &EncodedTrack) -> Result<MediaTrack, AdapterErr
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn progressive_options_are_bounded_and_reach_the_player() {
+        for (ceiling, prefix) in [
+            (0, 16 * 1024),
+            (16 * 1024 * 1024, 1),
+            (16 * 1024 * 1024, 1024 * 1024 + 1),
+        ] {
+            assert!(
+                RealMantleAdapter::with_options(
+                    RoutePlanner::disabled(),
+                    MantleAdapterOptions {
+                        staging_max_bytes: ceiling,
+                        progressive_buffer_bytes: prefix,
+                        ..Default::default()
+                    }
+                )
+                .is_err()
+            );
+        }
+        let adapter = RealMantleAdapter::with_options(
+            RoutePlanner::disabled(),
+            MantleAdapterOptions {
+                staging_max_bytes: 16 * 1024 * 1024,
+                progressive_buffer_bytes: 256 * 1024,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(adapter.inner.progressive_buffer_bytes, 256 * 1024);
+        let player = RealMantlePlayer::new(
+            Arc::clone(&adapter.inner.manager),
+            Arc::clone(&adapter.inner.registry),
+            Arc::clone(&adapter.inner.route_policy),
+            adapter.inner.staging_max_bytes,
+            adapter.inner.progressive_buffer_bytes,
+            CancellationToken::new(),
+        );
+        // Creation uses the same validated options as production; no source
+        // work is submitted by this configuration regression.
+        player.shutdown().await.unwrap();
+    }
+
     #[test]
     fn youtube_login_failures_keep_a_diagnostic_message() {
         let error = super::map_youtube_error(YoutubeErrorKind::LoginRequired);
@@ -2267,6 +2331,7 @@ mod tests {
             discard_read: false,
             media_cancellation: None,
             staging_max_bytes: 0,
+            progressive_buffer_bytes: 0,
             completed_input: None,
             manager: Arc::clone(&adapter.inner.manager),
             registry: Arc::clone(&adapter.inner.registry),

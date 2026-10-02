@@ -1,3 +1,19 @@
+# October 2: bounded progressive finite-source integration
+
+The unchanged Raydio baseline spent 4.716 s staging a 4.17 MB source before
+playback. The adapter now passes a validated optional 16 KiB..1 MiB prefix
+through both ordinary and routed openers, fitting the existing staging ceiling.
+Zero remains complete staging; library defaults remain opt-in. Mantle owns the
+bounded downloader/cache, cancellation, retry validation and transactional seek.
+Completed repeats still reuse cached compressed bytes. No voice pacing, codec,
+bitrate, gain or worker changes accompany this integration.
+
+Mantle 7c7762d includes exact-packet gated-WebM tests, bounded SOCKS deadlines,
+and the patched Rustls/WebPKI dependency closure. All 33 adapter/filter tests
+pass (two pre-existing manual tests ignored), plus all-target Clippy with warnings
+denied. Oracle HTTPS/home-proxy startup and receiver qualification remain pending
+in Raydio; deterministic prefix latency does not prove downstream loss reduction.
+
 # Dependency lifecycle audit resolved (2026-09-10)
 
 Finite source reads remain owned by the actor, but a pending NextFrame no longer
