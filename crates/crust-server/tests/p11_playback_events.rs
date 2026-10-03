@@ -260,7 +260,120 @@ async fn json_request(app: &Router, request: Request<Body>) -> (StatusCode, Valu
     let response = app.clone().oneshot(request).await.unwrap();
     let status = response.status();
     let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-    (status, serde_json::from_slice(&body).unwrap())
+    (
+        status,
+        if body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&body).unwrap()
+        },
+    )
+}
+
+#[tokio::test]
+async fn speculative_preparation_is_authenticated_validated_and_leaves_playback_unchanged() {
+    let mantle = Arc::new(FakeMantle::default());
+    let voice = Arc::new(FakeVoiceBackend::new(32, 2));
+    let harness = Harness::new(mantle, Arc::clone(&voice), Duration::from_secs(30)).await;
+    let (mut socket, session_id) = open_session(harness.address, "300000000000000898").await;
+    let player_path = format!("/v4/sessions/{session_id}/players/800000000000000898");
+    let prepare_path =
+        format!("/crust/v1/sessions/{session_id}/players/800000000000000898/prepare");
+    let make = |body: Value| {
+        Request::post(&prepare_path)
+            .header("authorization", "test-password")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    assert_eq!(
+        json_request(&harness.app, make(json!({"encoded":null})))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    let (status, before) = json_request(
+        &harness.app,
+        patch(
+            &player_path,
+            json!({
+                "track":{"identifier":"fixture:prepared"}, "voice":voice_state("900000000000000898")
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(next_json(&mut socket).await["type"], "TrackStartEvent");
+    assert_eq!(next_json(&mut socket).await["op"], "playerUpdate");
+    for bad in [
+        json!({}),
+        json!({"encoded":true}),
+        json!({"encoded":""}),
+        json!({"encoded":"invalid"}),
+        json!({"encoded":null,"extra":1}),
+    ] {
+        assert_eq!(
+            json_request(&harness.app, make(bad)).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let unauthorized = Request::post(&prepare_path)
+        .header("content-type", "application/json")
+        .body(Body::from("{\"encoded\":null}"))
+        .unwrap();
+    assert_eq!(
+        json_request(&harness.app, unauthorized).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    for _ in 0..20 {
+        assert_eq!(
+            json_request(
+                &harness.app,
+                make(json!({"encoded":before["track"]["encoded"]}))
+            )
+            .await
+            .0,
+            StatusCode::ACCEPTED
+        );
+    }
+    assert_eq!(
+        json_request(&harness.app, make(json!({"encoded":null})))
+            .await
+            .0,
+        StatusCode::ACCEPTED
+    );
+    let connection = voice.latest_connection().unwrap();
+    assert_eq!(
+        connection.pull_frame().await.unwrap().unwrap().sequence(),
+        0
+    );
+    let (_, after) = json_request(
+        &harness.app,
+        Request::get(&player_path)
+            .header("authorization", "test-password")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(after["track"]["encoded"], before["track"]["encoded"]);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), next_json(&mut socket))
+            .await
+            .is_err(),
+        "preparation must not publish playback lifecycle events"
+    );
+    assert_eq!(
+        json_request(&harness.app, delete(&player_path)).await.0,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        json_request(&harness.app, make(json!({"encoded":null})))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    socket.close(None).await.unwrap();
+    harness.stop().await;
 }
 
 async fn next_json(socket: &mut Socket) -> Value {

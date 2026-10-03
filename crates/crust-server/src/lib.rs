@@ -372,6 +372,10 @@ fn router(state: Arc<AppState>) -> Router {
         )
         .route("/v4/routeplanner/free/all", post(route_planner_free_all))
         .route("/crust/v1/info", get(crust_info))
+        .route(
+            "/crust/v1/sessions/{session_id}/players/{guild_id}/prepare",
+            post(prepare_player),
+        )
         .route("/v4/loadtracks", get(load_tracks))
         .route("/v4/decodetrack", get(decode_track))
         .route("/v4/decodetracks", post(decode_tracks))
@@ -1764,6 +1768,134 @@ async fn get_player(
     match player.snapshot().await {
         Ok(value) => Json(value).into_response(),
         Err(error) => player_error(error, uri.path()),
+    }
+}
+
+async fn prepare_player(
+    State(state): State<Arc<AppState>>,
+    Path((session_id, guild_id)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    let path = request.uri().path().to_owned();
+    let guild_id = match canonical_guild_id(&guild_id) {
+        Ok(id) => id,
+        Err(message) => return protocol_error(StatusCode::BAD_REQUEST, message, &path, false),
+    };
+    if !request_has_json_content_type(&request) {
+        return protocol_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Content-Type must be application/json",
+            &path,
+            false,
+        );
+    }
+    state.sessions.cleanup_expired();
+    let Some(session) = state.sessions.session(&session_id) else {
+        return protocol_error(StatusCode::NOT_FOUND, "Session not found", &path, false);
+    };
+    let Some(owned) = session.player(&guild_id) else {
+        return protocol_error(StatusCode::NOT_FOUND, "Player not found", &path, false);
+    };
+    let Some(player) = concrete_player(&owned) else {
+        return protocol_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Invalid player owner",
+            &path,
+            false,
+        );
+    };
+    let bytes = match axum::body::to_bytes(
+        request.into_body(),
+        state.limits.max_request_body_bytes.get(),
+    )
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return protocol_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Request body exceeds the configured limit",
+                &path,
+                false,
+            );
+        }
+    };
+    let mut body: Value = match parse_bounded_json(&bytes, JsonPolicy::from(&state.limits)) {
+        Ok(body) => body,
+        Err(_) => {
+            return protocol_error(
+                StatusCode::BAD_REQUEST,
+                "Invalid preparation request",
+                &path,
+                false,
+            );
+        }
+    };
+    let Some(object) = body
+        .as_object_mut()
+        .filter(|object| object.len() == 1 && object.contains_key("encoded"))
+    else {
+        return protocol_error(
+            StatusCode::BAD_REQUEST,
+            "Expected encoded track or null",
+            &path,
+            false,
+        );
+    };
+    let track = match object.remove("encoded").expect("validated field") {
+        Value::Null => None,
+        Value::String(encoded) if !encoded.is_empty() && encoded.len() <= 16 * 1024 => {
+            let Some(adapter) = &state.adapter else {
+                return protocol_error(
+                    StatusCode::BAD_REQUEST,
+                    "Media adapter unavailable",
+                    &path,
+                    false,
+                );
+            };
+            let track = match adapter
+                .decode(EncodedTrack::new(encoded), CancellationToken::new())
+                .await
+            {
+                Ok(track) => track,
+                Err(_) => {
+                    return protocol_error(
+                        StatusCode::BAD_REQUEST,
+                        "Invalid encoded track",
+                        &path,
+                        false,
+                    );
+                }
+            };
+            if validate_media_track(&track, JsonPolicy::from(&state.limits)).is_err()
+                || track.metadata.stream
+            {
+                return protocol_error(
+                    StatusCode::BAD_REQUEST,
+                    "Preparation requires a bounded finite track",
+                    &path,
+                    false,
+                );
+            }
+            Some(track)
+        }
+        _ => {
+            return protocol_error(
+                StatusCode::BAD_REQUEST,
+                "Expected encoded track or null",
+                &path,
+                false,
+            );
+        }
+    };
+    let admission = PlayerLoadAdmission::new(
+        Arc::clone(&state.load_requests),
+        Arc::clone(&state.source_requests),
+        Arc::clone(&state.outbound_connections),
+    );
+    match player.prepare(track, admission).await {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(error) => player_error(error, &path),
     }
 }
 

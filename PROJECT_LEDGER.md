@@ -200,3 +200,28 @@ The disabled-planner constructor already uses the ordinary pooled manager;
 enabled route planning retains its independent no-reuse transport. Adapter
 tests pass (32, two existing manual benchmarks excluded); live comparison is
 tracked in Raydio's `docs/PLAYBACK-STARTUP-POOL-2026-10-02.md`.
+# October 3: bounded speculative successor preparation
+
+The player accepts one finite successor through the authenticated Crust-specific
+`POST /crust/v1/sessions/{session}/players/{guild}/prepare` extension, with exactly
+`{"encoded": <encoded track or null>}`. HTTP 202 acknowledges intent rather than
+readiness. Existing Lavalink player PATCH behavior is unchanged.
+
+Mantle's actor owns one speculative opener and one prepared session. Replacement
+coalesces to the latest identity, cancels and joins old work, and disposes of stale
+sessions on the blocking worker. Opening never blocks current frames or controls.
+Current gain/filters are applied on adoption, sequences reset normally, and source
+failure falls back to ordinary Play. Natural EOF preserves the successor; explicit
+Stop and shutdown cancel it. Speculation owns shared load/source permits while
+opening and an outbound permit until disposal/adoption; request completion or
+cancellation cannot release live source admission early. No additional dependency,
+codec, bitrate, audio worker or pacing changes are introduced.
+
+Offline tests preserve every synthetic packet across natural EOF/adoption and
+cover source failures, cancelled controls, 100 coalesced replacements, prompt frame
+and Stop delivery during a slow opener, source admission/recovery, HTTP validation,
+authentication and lifecycle isolation. A 200 ms deterministic source opener
+measures 202.103 ms cold versus 0.083 ms prepared. All adapter and server targets
+and warnings-denied Clippy pass. Real Oracle transition evidence is recorded in
+Raydio's next-track preparation report; synthetic timing alone is not a claim of
+gapless playback or six-hour qualification.

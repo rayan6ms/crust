@@ -451,6 +451,14 @@ impl FakePlayer {
 }
 
 impl MantlePlayer for FakePlayer {
+    fn prepare(
+        &self,
+        _track: Option<MediaTrack>,
+        cancellation: CancellationToken,
+        _admission: Option<Arc<dyn crust::media::PreparationAdmission>>,
+    ) -> AdapterFuture<'_, Result<(), AdapterError>> {
+        Box::pin(async move { self.check(&cancellation) })
+    }
     fn play(
         &self,
         track: MediaTrack,

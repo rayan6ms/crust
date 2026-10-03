@@ -772,6 +772,12 @@ enum PlayerFramePoll {
 }
 
 enum PlayerCommand {
+    Prepare {
+        track: Option<Box<MediaTrack>>,
+        cancellation: CancellationToken,
+        admission: Option<Arc<dyn crust::media::PreparationAdmission>>,
+        reply: oneshot::Sender<Result<(), AdapterError>>,
+    },
     Play {
         track: Box<MediaTrack>,
         cancellation: CancellationToken,
@@ -813,7 +819,12 @@ enum PlayerCommand {
 impl PlayerCommand {
     fn abandoned(&self) -> bool {
         match self {
-            Self::Play {
+            Self::Prepare {
+                cancellation,
+                reply,
+                ..
+            }
+            | Self::Play {
                 cancellation,
                 reply,
                 ..
@@ -846,7 +857,8 @@ impl PlayerCommand {
 
     fn reject(self, error: AdapterError) {
         match self {
-            Self::Play { reply, .. }
+            Self::Prepare { reply, .. }
+            | Self::Play { reply, .. }
             | Self::Pause { reply, .. }
             | Self::Seek { reply, .. }
             | Self::Stop { reply, .. }
@@ -868,6 +880,7 @@ impl PlayerCommand {
 }
 
 struct PlayerActor {
+    preparation: Preparation,
     pending_frame: Option<oneshot::Sender<Result<PlayerFramePoll, AdapterError>>>,
     deferred_controls: VecDeque<(tokio::time::Instant, PlayerCommand)>,
     discard_read: bool,
@@ -901,6 +914,86 @@ struct BufferedFrame {
 }
 
 type ReadResult = (PlaybackSession, Result<BufferedFrame, AdapterError>);
+
+struct PreparedPlayback {
+    encoded: EncodedTrack,
+    cancellation: CancellationToken,
+    session: PlaybackSession,
+    // Retain network admission until cancellation/disposal or active adoption.
+    _connection: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+/// One opener, one desired identity and one prepared decoder. Replacements
+/// cancel and join the old opener before starting another; obsolete sessions
+/// are dropped on that same blocking worker, never on the frame actor.
+#[derive(Default)]
+struct Preparation {
+    admission: Option<Arc<dyn crust::media::PreparationAdmission>>,
+    desired: Option<EncodedTrack>,
+    attempted: bool,
+    cancellation: Option<CancellationToken>,
+    opening: Option<JoinHandle<Option<PreparedPlayback>>>,
+    ready: Option<PreparedPlayback>,
+    retired: Option<PreparedPlayback>,
+}
+
+impl Preparation {
+    fn set(&mut self, encoded: Option<EncodedTrack>, parent: &CancellationToken) {
+        if self.desired == encoded {
+            return;
+        }
+        if let Some(token) = self.cancellation.take() {
+            token.cancel();
+        }
+        debug_assert!(self.ready.is_none() || self.retired.is_none());
+        if let Some(ready) = self.ready.take() {
+            self.retired = Some(ready);
+        }
+        self.desired = encoded;
+        self.attempted = false;
+        self.cancellation = self.desired.as_ref().map(|_| parent.child_token());
+    }
+
+    fn accept(&mut self, result: Result<Option<PreparedPlayback>, tokio::task::JoinError>) {
+        match result {
+            Ok(Some(prepared))
+                if !prepared.cancellation.is_cancelled()
+                    && self.desired.as_ref() == Some(&prepared.encoded) =>
+            {
+                tracing::info!(target: "crust_mantle_adapter::preparation", "next track ready");
+                self.ready = Some(prepared);
+            }
+            Ok(Some(prepared)) => self.retired = Some(prepared),
+            Ok(None) => {}
+            Err(_) => {
+                tracing::warn!(target: "crust_mantle_adapter::preparation", "next track preparation worker failed")
+            }
+        }
+    }
+
+    fn take(&mut self, encoded: &EncodedTrack) -> Option<PreparedPlayback> {
+        if self
+            .ready
+            .as_ref()
+            .is_some_and(|ready| &ready.encoded == encoded && !ready.cancellation.is_cancelled())
+        {
+            self.desired = None;
+            // This token is adopted by active playback, so do not cancel it.
+            self.cancellation = None;
+            self.ready.take()
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for Preparation {
+    fn drop(&mut self) {
+        if let Some(token) = &self.cancellation {
+            token.cancel();
+        }
+    }
+}
 
 struct FilterUpdate {
     deadline: tokio::time::Instant,
@@ -950,6 +1043,7 @@ impl PlayerActor {
                 .chain(self.pending_filters.front().map(|update| update.deadline))
                 .min();
             self.start_read_ahead();
+            self.start_preparation();
             tokio::select! {
                 biased;
                 () = async {
@@ -976,11 +1070,95 @@ impl PlayerActor {
                     self.accept_read(result);
                     self.apply_pending_filters().await;
                 }
+                result = async { self.preparation.opening.as_mut().expect("guarded preparation").await }, if self.preparation.opening.is_some() => {
+                    self.preparation.opening = None;
+                    self.preparation.accept(result);
+                }
             }
         }
         self.settle_read().await;
+        self.finish_preparation().await;
         self.session = None;
         self.status = PlayerStatus::Shutdown;
+    }
+
+    fn start_preparation(&mut self) {
+        if self.preparation.opening.is_some() {
+            return;
+        }
+        let target = if !self.preparation.attempted {
+            self.preparation
+                .desired
+                .clone()
+                .zip(self.preparation.cancellation.clone())
+        } else {
+            None
+        };
+        let retired = self.preparation.retired.take();
+        if target.is_none() && retired.is_none() {
+            return;
+        }
+        self.preparation.attempted |= target.is_some();
+        let manager = Arc::clone(&self.manager);
+        let registry = Arc::clone(&self.registry);
+        let policy = Arc::clone(&self.route_policy);
+        let staging = self.staging_max_bytes;
+        let progressive = self.progressive_buffer_bytes;
+        let admission = self.preparation.admission.clone();
+        self.preparation.opening = Some(tokio::task::spawn_blocking(move || {
+            drop(retired);
+            let (encoded, cancellation) = target?;
+            let resources = match admission
+                .map(|admission| admission.try_acquire())
+                .transpose()
+            {
+                Ok(resources) => resources,
+                Err(_) => {
+                    tracing::warn!(target: "crust_mantle_adapter::preparation", "next-track preparation capacity reached; using normal playback");
+                    return None;
+                }
+            };
+            let started = Instant::now();
+            match open_playback(
+                manager,
+                registry,
+                policy,
+                encoded.clone(),
+                cancellation.clone(),
+                staging,
+                progressive,
+            ) {
+                Ok(session) if !cancellation.is_cancelled() => {
+                    tracing::info!(target: "crust_mantle_adapter::preparation", elapsed_ms = started.elapsed().as_secs_f64() * 1000.0, "next track opened");
+                    Some(PreparedPlayback {
+                        encoded,
+                        cancellation,
+                        session,
+                        // Load/source slots are released after discovery/open;
+                        // the live downloader retains its connection slot.
+                        _connection: resources.map(|resources| resources.connection),
+                    })
+                }
+                Ok(_) => None,
+                Err(error) => {
+                    if !cancellation.is_cancelled() {
+                        tracing::warn!(target: "crust_mantle_adapter::preparation", kind = ?error.kind, "next track preparation failed; normal playback remains available");
+                    }
+                    None
+                }
+            }
+        }));
+    }
+
+    async fn finish_preparation(&mut self) {
+        self.preparation.set(None, &CancellationToken::new());
+        if let Some(opening) = self.preparation.opening.take() {
+            self.preparation.accept(opening.await);
+        }
+        self.start_preparation();
+        if let Some(opening) = self.preparation.opening.take() {
+            self.preparation.accept(opening.await);
+        }
     }
 
     fn start_read_ahead(&mut self) {
@@ -1101,6 +1279,19 @@ impl PlayerActor {
             return;
         }
         match command {
+            PlayerCommand::Prepare {
+                track,
+                cancellation,
+                admission,
+                reply,
+            } => {
+                self.preparation.admission = admission;
+                let encoded = track
+                    .filter(|track| !track.metadata.stream)
+                    .map(|track| track.encoded.clone());
+                self.preparation.set(encoded, &cancellation);
+                let _ = reply.send(Ok(()));
+            }
             PlayerCommand::Play {
                 track,
                 cancellation,
@@ -1222,6 +1413,7 @@ impl PlayerActor {
                 let _ = reply.send(Ok(self.events.pop_front()));
             }
             PlayerCommand::Shutdown { reply } => {
+                self.preparation.set(None, &CancellationToken::new());
                 if let Some(frame) = self.pending_frame.take() {
                     let _ = frame.send(Err(shutdown()));
                 }
@@ -1257,6 +1449,20 @@ impl PlayerActor {
             return Err(overloaded());
         }
         self.settle_read().await;
+        // If an opener has already completed, consume it before the actor's
+        // select branch runs. An unfinished speculative request never blocks
+        // an explicit Play: it is cancelled and normal loading remains valid.
+        if self
+            .preparation
+            .opening
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
+            let opening = self.preparation.opening.take().expect("finished opener");
+            self.preparation.accept(opening.await);
+        }
+        let prepared = self.preparation.take(&track.encoded);
+        self.preparation.set(None, &CancellationToken::new());
         let manager = Arc::clone(&self.manager);
         let registry = Arc::clone(&self.registry);
         let policy = Arc::clone(&self.route_policy);
@@ -1264,12 +1470,19 @@ impl PlayerActor {
         let completed = self.completed_input.take();
         let staging_max_bytes = self.staging_max_bytes;
         let progressive_buffer_bytes = self.progressive_buffer_bytes;
-        let media_cancellation = cancellation.child_token();
+        let media_cancellation = prepared.as_ref().map_or_else(
+            || cancellation.child_token(),
+            |prepared| prepared.cancellation.clone(),
+        );
         let opening_guard = media_cancellation.clone().drop_guard();
         let cancellation_for_open = media_cancellation.clone();
         let mut session = tokio::task::spawn_blocking(move || {
             if cancellation_for_open.is_cancelled() {
                 return Err(cancelled());
+            }
+            if let Some(prepared) = prepared {
+                tracing::info!(target: "crust_mantle_adapter::preparation", "prepared next track consumed");
+                return Ok(prepared.session);
             }
             if let Some((previous, input)) = completed
                 && previous == encoded
@@ -1338,6 +1551,9 @@ impl PlayerActor {
     fn stop(&mut self, reason: TrackEndReason) -> Result<(), AdapterError> {
         if self.track.is_some() && self.events.len() == PLAYER_EVENT_CAPACITY {
             return Err(overloaded());
+        }
+        if !matches!(reason, TrackEndReason::Finished) {
+            self.preparation.set(None, &CancellationToken::new());
         }
         if let Some(cancellation) = self.media_cancellation.take() {
             cancellation.cancel();
@@ -1459,6 +1675,7 @@ impl RealMantlePlayer {
     ) -> Arc<Self> {
         let (commands, receiver) = mpsc::channel(PLAYER_COMMAND_CAPACITY);
         let actor = PlayerActor {
+            preparation: Preparation::default(),
             pending_frame: None,
             deferred_controls: VecDeque::new(),
             discard_read: false,
@@ -1550,6 +1767,22 @@ impl Drop for RealMantlePlayer {
 }
 
 impl MantlePlayer for RealMantlePlayer {
+    fn prepare(
+        &self,
+        track: Option<MediaTrack>,
+        cancellation: CancellationToken,
+        admission: Option<Arc<dyn crust::media::PreparationAdmission>>,
+    ) -> AdapterFuture<'_, Result<(), AdapterError>> {
+        Box::pin(async move {
+            self.request(Some(&cancellation), |reply| PlayerCommand::Prepare {
+                track: track.map(Box::new),
+                cancellation: cancellation.clone(),
+                admission,
+                reply,
+            })
+            .await
+        })
+    }
     fn play(
         &self,
         track: MediaTrack,
@@ -1695,6 +1928,18 @@ fn open_playback(
 ) -> Result<PlaybackSession, AdapterError> {
     #[cfg(test)]
     if let Ok(track) = decode_fixture_track(&encoded) {
+        if track
+            .metadata
+            .identifier
+            .starts_with("fixture:prepare-slow")
+        {
+            for _ in 0..20 {
+                if cancellation.is_cancelled() {
+                    return Err(cancelled());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
         return FixtureSession::new(&track.metadata)
             .map(Box::new)
             .map(PlaybackSession::Fixture);
@@ -2326,6 +2571,7 @@ mod tests {
         let track = fixture_track("fixture:buffered").unwrap();
         let session = FixtureSession::new(&track.metadata).unwrap();
         PlayerActor {
+            preparation: Preparation::default(),
             pending_frame: None,
             deferred_controls: VecDeque::new(),
             discard_read: false,
@@ -2361,6 +2607,271 @@ mod tests {
         // consuming the completed input, not the regular source opener.
         track.encoded = EncodedTrack::new("requires-completed-input");
         actor
+    }
+
+    async fn drain_preparation(actor: &mut PlayerActor) {
+        actor.start_preparation();
+        if let Some(opening) = actor.preparation.opening.take() {
+            actor.preparation.accept(opening.await);
+        }
+    }
+
+    struct TestPreparationAdmission {
+        load: Arc<tokio::sync::Semaphore>,
+        source: Arc<tokio::sync::Semaphore>,
+        connection: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl crust::media::PreparationAdmission for TestPreparationAdmission {
+        fn try_acquire(&self) -> Result<crust::media::PreparationResources, AdapterError> {
+            Ok(crust::media::PreparationResources {
+                load: self
+                    .load
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| overloaded())?,
+                source: self
+                    .source
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| overloaded())?,
+                connection: self
+                    .connection
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| overloaded())?,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn speculative_admission_is_owned_until_source_cleanup_and_recovers() {
+        let admission = Arc::new(TestPreparationAdmission {
+            load: Arc::new(tokio::sync::Semaphore::new(1)),
+            source: Arc::new(tokio::sync::Semaphore::new(1)),
+            connection: Arc::new(tokio::sync::Semaphore::new(1)),
+        });
+        let mut actor = buffered_fixture_actor();
+        actor.preparation.admission = Some(admission.clone());
+        let next = fixture_track("fixture:prepare-slow-next").unwrap();
+        actor
+            .preparation
+            .set(Some(next.encoded.clone()), &CancellationToken::new());
+        actor.start_preparation();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while admission.load.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(admission.connection.available_permits(), 0);
+        drain_preparation(&mut actor).await;
+        assert_eq!(admission.load.available_permits(), 1);
+        assert_eq!(admission.source.available_permits(), 1);
+        assert_eq!(admission.connection.available_permits(), 0);
+        actor.preparation.set(None, &CancellationToken::new());
+        assert_eq!(
+            admission.connection.available_permits(),
+            0,
+            "cancellation alone must not free a live source slot"
+        );
+        drain_preparation(&mut actor).await;
+        assert_eq!(admission.connection.available_permits(), 1);
+        let held = admission.connection.clone().acquire_owned().await.unwrap();
+        actor
+            .preparation
+            .set(Some(next.encoded), &CancellationToken::new());
+        drain_preparation(&mut actor).await;
+        assert!(actor.preparation.ready.is_none());
+        assert_eq!(admission.load.available_permits(), 1);
+        assert_eq!(admission.source.available_permits(), 1);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn prepared_natural_handoff_preserves_every_frame_and_current_filters() {
+        let mut actor = buffered_fixture_actor();
+        let next = fixture_track("fixture:prepare-slow-next").unwrap();
+        // Reference cold playback establishes the same source/frame contract.
+        let cold_start = Instant::now();
+        let mut reference = buffered_fixture_actor();
+        reference
+            .play(next.clone(), CancellationToken::new())
+            .await
+            .unwrap();
+        let cold_ms = cold_start.elapsed().as_secs_f64() * 1000.0;
+        actor
+            .preparation
+            .set(Some(next.encoded.clone()), &CancellationToken::new());
+        drain_preparation(&mut actor).await;
+        // Preparation must not publish start/end or replace the old track.
+        assert_eq!(
+            actor.track.as_ref().unwrap().metadata.identifier,
+            "fixture:buffered"
+        );
+        assert!(actor.events.is_empty());
+        for _ in 0..16 {
+            assert!(matches!(
+                actor.next_frame().await.unwrap(),
+                PlayerFramePoll::Frame(_)
+            ));
+        }
+        assert!(matches!(
+            actor.next_frame().await.unwrap(),
+            PlayerFramePoll::Ended
+        ));
+        assert!(
+            actor.preparation.ready.is_some(),
+            "natural EOF must retain successor"
+        );
+        actor.filters.player_volume = Some(70);
+        let warm_start = Instant::now();
+        actor
+            .play(next.clone(), CancellationToken::new())
+            .await
+            .unwrap();
+        let warm_ms = warm_start.elapsed().as_secs_f64() * 1000.0;
+        assert!(actor.preparation.ready.is_none());
+        assert_eq!(actor.processing, ProcessingMode::Pcm);
+        for sequence in 0..16 {
+            let PlayerFramePoll::Frame(actual) = actor.next_frame().await.unwrap() else {
+                panic!("missing prepared frame");
+            };
+            let PlayerFramePoll::Frame(expected) = reference.next_frame().await.unwrap() else {
+                panic!("missing reference frame");
+            };
+            assert_eq!(actual.sequence, sequence);
+            assert_eq!(actual.payload, expected.payload);
+        }
+        assert!(matches!(
+            actor.next_frame().await.unwrap(),
+            PlayerFramePoll::Ended
+        ));
+        assert!(cold_ms >= 190.0);
+        // Report actual measurements; avoid a fragile wall-clock performance
+        // threshold in CI. Consumption is proved by the prepared slot above.
+        eprintln!("natural fixture handoff cold_ms={cold_ms:.3} prepared_ms={warm_ms:.3}");
+    }
+
+    #[tokio::test]
+    async fn preparation_replacement_coalesces_and_never_replaces_playing_audio() {
+        let mut actor = buffered_fixture_actor();
+        let parent = CancellationToken::new();
+        let first = fixture_track("fixture:prepare-slow-first").unwrap();
+        let latest = fixture_track("fixture:latest").unwrap();
+        actor.preparation.set(Some(first.encoded.clone()), &parent);
+        actor.start_preparation();
+        let old_token = actor.preparation.cancellation.clone().unwrap();
+        for _ in 0..100 {
+            actor.preparation.set(Some(first.encoded.clone()), &parent);
+            actor.preparation.set(Some(latest.encoded.clone()), &parent);
+            actor.start_preparation();
+            assert!(actor.preparation.opening.is_some());
+        }
+        assert!(old_token.is_cancelled());
+        drain_preparation(&mut actor).await;
+        drain_preparation(&mut actor).await;
+        assert_eq!(
+            actor.preparation.ready.as_ref().unwrap().encoded,
+            latest.encoded
+        );
+        assert_eq!(
+            actor.track.as_ref().unwrap().metadata.identifier,
+            "fixture:buffered"
+        );
+        let PlayerFramePoll::Frame(frame) = actor.next_frame().await.unwrap() else {
+            panic!("current audio lost");
+        };
+        assert_eq!(frame.sequence, 0);
+        actor.stop(TrackEndReason::Stopped).unwrap();
+        assert!(actor.preparation.ready.is_none());
+        actor.finish_preparation().await;
+        assert!(actor.preparation.opening.is_none());
+        assert!(actor.preparation.retired.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_or_cancelled_preparation_leaves_normal_playback_available() {
+        let mut actor = buffered_fixture_actor();
+        let parent = CancellationToken::new();
+        actor
+            .preparation
+            .set(Some(EncodedTrack::new("invalid")), &parent);
+        drain_preparation(&mut actor).await;
+        assert!(actor.preparation.ready.is_none());
+        assert!(actor.events.is_empty());
+        let next = fixture_track("fixture:next").unwrap();
+        actor.preparation.set(Some(next.encoded.clone()), &parent);
+        drain_preparation(&mut actor).await;
+        let token = CancellationToken::new();
+        token.cancel();
+        assert!(actor.play(next.clone(), token).await.is_err());
+        assert!(
+            actor.preparation.ready.is_some(),
+            "abandoned Play must preserve preparation"
+        );
+        actor.preparation.set(None, &parent);
+        drain_preparation(&mut actor).await;
+        actor.play(next, CancellationToken::new()).await.unwrap();
+        assert_eq!(
+            actor.track.as_ref().unwrap().metadata.identifier,
+            "fixture:next"
+        );
+    }
+
+    #[tokio::test]
+    async fn preparing_a_slow_source_does_not_block_frame_or_stop_delivery() {
+        let actor = buffered_fixture_actor();
+        let (commands, receiver) = mpsc::channel(PLAYER_COMMAND_CAPACITY);
+        let task = tokio::spawn(actor.run(receiver));
+        let (reply, accepted) = oneshot::channel();
+        commands
+            .send(PlayerCommand::Prepare {
+                track: Some(Box::new(
+                    fixture_track("fixture:prepare-slow-next").unwrap(),
+                )),
+                cancellation: CancellationToken::new(),
+                admission: None,
+                reply,
+            })
+            .await
+            .unwrap();
+        accepted.await.unwrap().unwrap();
+        let (reply, frame) = oneshot::channel();
+        commands
+            .send(PlayerCommand::NextFrame { reply })
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_millis(100), frame)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, PlayerFramePoll::Frame(_)));
+        let (reply, stopped) = oneshot::channel();
+        commands
+            .send(PlayerCommand::Stop {
+                cancellation: CancellationToken::new(),
+                reply,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_millis(100), stopped)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let (reply, stopped) = oneshot::channel();
+        commands
+            .send(PlayerCommand::Shutdown { reply })
+            .await
+            .unwrap();
+        stopped.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

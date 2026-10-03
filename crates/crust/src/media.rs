@@ -16,6 +16,18 @@ use crate::voice::OpusPacket;
 pub type AdapterFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub type JsonObject = BTreeMap<String, Value>;
 
+/// Admission travels with speculative work, so cancelling an HTTP request
+/// cannot release its resources while an owned blocking opener is unwinding.
+pub struct PreparationResources {
+    pub load: tokio::sync::OwnedSemaphorePermit,
+    pub source: tokio::sync::OwnedSemaphorePermit,
+    pub connection: tokio::sync::OwnedSemaphorePermit,
+}
+
+pub trait PreparationAdmission: Send + Sync {
+    fn try_acquire(&self) -> Result<PreparationResources, AdapterError>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EncodedTrack(String);
 
@@ -179,6 +191,23 @@ impl std::error::Error for AdapterError {}
 /// Pull-based frame and event delivery keeps the adapter boundary bounded: one
 /// item is returned per caller request, and no hidden Crust queue is implied.
 pub trait MantlePlayer: Send + Sync {
+    /// Accepts one speculative finite track without changing current playback.
+    /// `None` cancels it. Implementations must coalesce replacements and bound
+    /// workers/storage; success acknowledges intent, not source readiness.
+    fn prepare(
+        &self,
+        _track: Option<MediaTrack>,
+        _cancellation: CancellationToken,
+        _admission: Option<Arc<dyn PreparationAdmission>>,
+    ) -> AdapterFuture<'_, Result<(), AdapterError>> {
+        Box::pin(async {
+            Err(AdapterError::new(
+                AdapterErrorKind::InvalidOperation,
+                "track preparation is not supported",
+            ))
+        })
+    }
+
     fn play(
         &self,
         track: MediaTrack,

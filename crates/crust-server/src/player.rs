@@ -14,8 +14,9 @@ use crust::filters::{
     Karaoke as RuntimeKaraoke, Modulation, Timescale as RuntimeTimescale,
 };
 use crust::media::{
-    AdapterErrorKind, EncodedTrack, LoadOutcome, LoadRequest, MantleAdapter, MantlePlayer,
-    MediaEvent, MediaTrack, PlayerStatus, SourceRoute, TrackEndReason,
+    AdapterError, AdapterErrorKind, EncodedTrack, LoadOutcome, LoadRequest, MantleAdapter,
+    MantlePlayer, MediaEvent, MediaTrack, PlayerStatus, PreparationAdmission, PreparationResources,
+    SourceRoute, TrackEndReason,
 };
 use crust::voice::{
     TimedOpusFrame, VoiceBackend, VoiceClose, VoiceConnection, VoiceConnectionInfo, VoiceError,
@@ -130,6 +131,20 @@ struct PlayerLoadPermits {
     _load: OwnedSemaphorePermit,
     _source: OwnedSemaphorePermit,
     outbound: Option<OwnedSemaphorePermit>,
+}
+
+impl PreparationAdmission for PlayerLoadAdmission {
+    fn try_acquire(&self) -> Result<PreparationResources, AdapterError> {
+        let mut permits = self.try_acquire().map_err(|_| {
+            AdapterError::new(AdapterErrorKind::Overloaded, "preparation capacity reached")
+        })?;
+        let connection = permits.take_outbound();
+        Ok(PreparationResources {
+            load: permits._load,
+            source: permits._source,
+            connection,
+        })
+    }
 }
 
 impl PlayerLoadPermits {
@@ -432,6 +447,28 @@ impl PlayerHandle {
             reply,
         })?;
         response.await.map_err(|_| PlayerError::NotFound)?
+    }
+
+    pub(crate) async fn prepare(
+        &self,
+        track: Option<MediaTrack>,
+        admission: PlayerLoadAdmission,
+    ) -> Result<(), PlayerError> {
+        let mantle = {
+            let state = self.inner.state.lock().await;
+            if state.destroyed || self.inner.cancellation.is_cancelled() {
+                return Err(PlayerError::NotFound);
+            }
+            state.mantle.clone().ok_or(PlayerError::NotFound)?
+        };
+        mantle
+            .prepare(
+                track,
+                self.inner.cancellation.child_token(),
+                Some(Arc::new(admission)),
+            )
+            .await
+            .map_err(map_adapter_error)
     }
 
     pub async fn snapshot(&self) -> Result<Value, PlayerError> {
