@@ -1,3 +1,19 @@
+# Voice-event audit repairs (2026-10-04)
+
+Oto subscriber lag now reconciles durable readiness/recovery or retained close
+reason; it no longer terminates the monitor silently. Generic Overloaded errors
+use bounded snapshot/backoff recovery with cancellation and a terminal event
+after exhaustion. Real Oto ring-capacity-two overflow across four generations
+recovers readiness and an explicit close; the server also observes 4014 after lag.
+
+The source Notify waiter is constructed before checking durable failure,
+closing the deterministic missed-notification interleaving. A real attached,
+paused adapter delivers SourceFailed without subsequent gateway activity and
+still respects cancellation. No Oto revision, packet pacing or transport
+policy is changed. Original findings and live qualification are retained in
+Raydio docs/AUDIO-NETWORK-SEARCH-AUDIT-2026-10-04.md and
+docs/deep-audit-fixes-20261004/. Actual Oracle ring overflow was not observed.
+
 # October 2: bounded progressive finite-source integration
 
 The unchanged Raydio baseline spent 4.716 s staging a 4.17 MB source before

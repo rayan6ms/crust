@@ -12,9 +12,9 @@ experimental-audio-worker = []
 [dependencies]
 base64.workspace = true
 crust = { path = "../crust" }
-mantle-audio = { git = "https://github.com/rayan6ms/mantle", rev = "c241f9104810cca1a868fc7238ba94cd8567a92e" }
-mantle-core = { git = "https://github.com/rayan6ms/mantle", rev = "c241f9104810cca1a868fc7238ba94cd8567a92e" }
-mantle-media = { git = "https://github.com/rayan6ms/mantle", rev = "c241f9104810cca1a868fc7238ba94cd8567a92e" }
+mantle-audio = { git = "https://github.com/rayan6ms/mantle", rev = "87c2eaf08bace355f7696cec4676eea8885fab9a" }
+mantle-core = { git = "https://github.com/rayan6ms/mantle", rev = "87c2eaf08bace355f7696cec4676eea8885fab9a" }
+mantle-media = { git = "https://github.com/rayan6ms/mantle", rev = "87c2eaf08bace355f7696cec4676eea8885fab9a" }
 serde_json.workspace = true
 microfft = { version = "0.6.0", default-features = false, features = ["size-1024"] }
 micromath = "2.1.0"

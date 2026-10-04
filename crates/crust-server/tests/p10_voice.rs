@@ -650,3 +650,147 @@ async fn asynchronous_frame_failure_publishes_exception_and_load_failed_end() {
     socket.close(None).await.unwrap();
     harness.stop().await;
 }
+
+struct AuditLagBackend {
+    inner: Arc<FakeVoiceBackend>,
+    fail: bool,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+struct AuditLagConnection {
+    inner: Arc<dyn VoiceConnection>,
+    fail: std::sync::atomic::AtomicBool,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl VoiceBackend for AuditLagBackend {
+    fn connect(
+        &self,
+        info: VoiceConnectionInfo,
+        cancellation: CancellationToken,
+    ) -> VoiceFuture<'_, Result<Arc<dyn VoiceConnection>, VoiceError>> {
+        Box::pin(async move {
+            let inner = self.inner.connect(info, cancellation).await?;
+            Ok(Arc::new(AuditLagConnection {
+                inner,
+                fail: std::sync::atomic::AtomicBool::new(self.fail),
+                calls: self.calls.clone(),
+            }) as Arc<dyn VoiceConnection>)
+        })
+    }
+    fn shutdown(&self) -> VoiceFuture<'_, Result<(), VoiceError>> {
+        self.inner.shutdown()
+    }
+}
+impl VoiceConnection for AuditLagConnection {
+    fn update(
+        &self,
+        info: VoiceConnectionInfo,
+        cancellation: CancellationToken,
+    ) -> VoiceFuture<'_, Result<(), VoiceError>> {
+        self.inner.update(info, cancellation)
+    }
+    fn set_source(
+        &self,
+        source: Arc<dyn crust::voice::VoiceFrameSource>,
+        cancellation: CancellationToken,
+    ) -> VoiceFuture<'_, Result<(), VoiceError>> {
+        self.inner.set_source(source, cancellation)
+    }
+    fn stop_audio(&self) -> VoiceFuture<'_, Result<(), VoiceError>> {
+        self.inner.stop_audio()
+    }
+    fn snapshot(&self) -> VoiceFuture<'_, Result<crust::voice::VoiceSnapshot, VoiceError>> {
+        self.inner.snapshot()
+    }
+    fn next_event(
+        &self,
+        cancellation: CancellationToken,
+    ) -> VoiceFuture<'_, Result<Option<crust::voice::VoiceEvent>, VoiceError>> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.fail.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            Box::pin(async {
+                Err(VoiceError::new(
+                    VoiceErrorKind::Overloaded,
+                    "voice event subscriber lagged",
+                ))
+            })
+        } else {
+            self.inner.next_event(cancellation)
+        }
+    }
+    fn disconnect(&self) -> VoiceFuture<'_, Result<(), VoiceError>> {
+        self.inner.disconnect()
+    }
+    fn shutdown(&self) -> VoiceFuture<'_, Result<(), VoiceError>> {
+        self.inner.shutdown()
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lagged_event_monitor_recovers_and_observes_close() {
+    for fail in [false, true] {
+        let mantle = Arc::new(FakeMantle::default());
+        let voice = Arc::new(FakeVoiceBackend::new(64, 4));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wrapped = Arc::new(AuditLagBackend {
+            inner: voice.clone(),
+            fail,
+            calls: calls.clone(),
+        });
+        let mut config = ServerConfig::default()
+            .with_password("test-password")
+            .unwrap();
+        config.listen_address = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        config.port = 0;
+        config.player_executor_shards = 1;
+        config.player_command_capacity = 16;
+        let server = CrustServer::bind_with_backends(config, mantle, wrapped)
+            .await
+            .unwrap();
+        let address = server.local_address().unwrap();
+        let app = server.router();
+        let shutdown = CancellationToken::new();
+        let task_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move { server.serve(task_shutdown).await });
+        let harness = Harness {
+            app,
+            address,
+            shutdown,
+            task,
+        };
+        let (mut socket, session_id) = open_session(harness.address, "300000000000000999").await;
+        let path = format!("/v4/sessions/{session_id}/players/800000000000000999");
+        let (status,_)=patch_json(&harness.app,&path,json!({"track":{"identifier":"fixture:short"},"voice":{"token":"test-token","endpoint":"voice.example.invalid","sessionId":"test-session","channelId":"900000000000000999"}})).await;
+        assert_eq!(status, StatusCode::OK);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        voice
+            .latest_connection()
+            .unwrap()
+            .try_push_event(crust::voice::VoiceEvent::Closed(crust::voice::VoiceClose {
+                code: 4014,
+                reason: Arc::from("audit close"),
+                by_remote: true,
+            }))
+            .unwrap();
+        let close_observed = tokio::time::timeout(std::time::Duration::from_millis(350), async {
+            loop {
+                let value = socket.next().await.unwrap().unwrap().into_text().unwrap();
+                let value: Value = serde_json::from_str(&value).unwrap();
+                if value["type"] == "WebSocketClosedEvent" {
+                    break;
+                }
+            }
+        })
+        .await
+        .is_ok();
+        eprintln!(
+            "AUDIT monitor: injected_lag={fail}, close_observed={close_observed}, next_event_calls={}",
+            calls.load(std::sync::atomic::Ordering::Relaxed)
+        );
+        assert!(close_observed);
+        if fail {
+            assert!(calls.load(std::sync::atomic::Ordering::Relaxed) >= 2);
+        }
+        drop(socket);
+        harness.stop().await;
+    }
+}

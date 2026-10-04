@@ -521,11 +521,63 @@ impl PlayerHandle {
         let task_connection = Arc::clone(&connection);
         let task = tokio::spawn(async move {
             let mut connected = false;
+            let mut lag_retries = 0_u8;
             loop {
                 let event = tokio::select! {
                     biased;
                     () = task_cancellation.cancelled() => return,
                     event = task_connection.next_event(task_cancellation.clone()) => event,
+                };
+                let event = match event {
+                    Err(error) if error.kind == VoiceErrorKind::Overloaded && lag_retries < 8 => {
+                        lag_retries += 1;
+                        tracing::warn!(
+                            attempt = lag_retries,
+                            "voice monitor lagged; reconciling snapshot"
+                        );
+                        // Generic backends must also recover. Oto reconciles
+                        // its richer durable close metadata inside the adapter.
+                        let state = tokio::select! {
+                            biased;
+                            () = task_cancellation.cancelled() => return,
+                            state = tokio::time::timeout(Duration::from_secs(1), task_connection.snapshot()) => state,
+                        };
+                        tokio::select! {
+                            biased;
+                            () = task_cancellation.cancelled() => return,
+                            () = tokio::time::sleep(Duration::from_millis(25)) => {}
+                        }
+                        match state {
+                            Ok(Ok(state)) if state.phase != crust::voice::VoicePhase::Closed => {
+                                Ok(Some(VoiceEvent::PhaseChanged(state.phase)))
+                            }
+                            _ => Ok(Some(VoiceEvent::Closed(VoiceClose {
+                                code: 0,
+                                reason: Arc::from("voice event recovery failed"),
+                                by_remote: false,
+                            }))),
+                        }
+                    }
+                    Err(error) => {
+                        if task_cancellation.is_cancelled() {
+                            return;
+                        }
+                        tracing::warn!(kind = ?error.kind, "voice monitor failed; closing playback");
+                        Ok(Some(VoiceEvent::Closed(VoiceClose {
+                            code: 0,
+                            reason: Arc::from("voice event monitor failed"),
+                            by_remote: false,
+                        })))
+                    }
+                    Ok(None) => Ok(Some(VoiceEvent::Closed(VoiceClose {
+                        code: 0,
+                        reason: Arc::from("voice event stream ended"),
+                        by_remote: false,
+                    }))),
+                    event => {
+                        lag_retries = 0;
+                        event
+                    }
                 };
                 match event {
                     Ok(Some(VoiceEvent::Closed(close))) => {

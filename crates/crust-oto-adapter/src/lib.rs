@@ -673,9 +673,13 @@ impl OtoVoiceConnection {
                     AudioSlot::Idle | AudioSlot::Busy | AudioSlot::Closed => None,
                 }
             };
+            // Construct the waiter before checking the durable predicate.
+            // notify_waiters can run on the producer thread before select's
+            // first poll; creating Notified inside this async block loses it.
+            let source_wait = shared.as_ref().map(|shared| shared.changed.notified());
             let source_changed = async {
-                match &shared {
-                    Some(shared) => shared.changed.notified().await,
+                match source_wait {
+                    Some(wait) => wait.await,
                     None => std::future::pending().await,
                 }
             };
@@ -775,10 +779,16 @@ impl OtoVoiceConnection {
                     | oto::ConnectionEvent::AudioChanged { .. },
                 ) => {}
                 Ok(_) => {}
-                Err(oto::EventReceiveError::Lagged { .. }) => {
-                    return Err(overloaded_error("voice event subscriber lagged"));
+                Err(oto::EventReceiveError::Lagged { skipped }) => {
+                    tracing::warn!(
+                        skipped,
+                        "voice subscriber lagged; reconciling durable state"
+                    );
+                    return Ok(Some(reconcile_connection_event(&self.connection.state())));
                 }
-                Err(oto::EventReceiveError::Closed) => return Ok(None),
+                Err(oto::EventReceiveError::Closed) => {
+                    return Ok(Some(reconcile_connection_event(&self.connection.state())));
+                }
             }
         }
     }
@@ -1131,6 +1141,23 @@ fn map_close(reason: oto::CloseReason) -> VoiceClose {
             reason: Arc::from("voice connection closed"),
             by_remote: false,
         },
+    }
+}
+
+fn reconcile_connection_event(state: &oto::ConnectionSnapshot) -> VoiceEvent {
+    if matches!(
+        state.phase(),
+        oto::ConnectionPhase::Closed | oto::ConnectionPhase::Failed
+    ) {
+        VoiceEvent::Closed(map_close(
+            state
+                .close_reason()
+                .unwrap_or(oto::CloseReason::TerminalFailure),
+        ))
+    } else {
+        // NeedsFreshVoiceInfo remains recoverable even when the failure event
+        // itself was lost. Ready snapshots also rearm deferred source startup.
+        VoiceEvent::PhaseChanged(map_phase(state.phase()))
     }
 }
 
@@ -1983,6 +2010,117 @@ mod tests {
         udp.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn real_event_ring_lag_reconciles_ready_and_retained_close() {
+        let (gateway, udp) = peer(FakeVoiceGatewayConfig::local()).await;
+        let oto = Oto::builder()
+            .resource_limits(oto::ResourceLimits::default().with_event_capacity(2))
+            .test_tls_config(gateway.tls().client_config())
+            .build()
+            .unwrap();
+        let backend = OtoVoiceBackend::new(oto, 1, 1);
+        let connection = backend
+            .connect(voice_info(&gateway, 3), CancellationToken::new())
+            .await
+            .unwrap();
+        let concrete = backend.inner.connections.lock().unwrap()[0]
+            .upgrade()
+            .unwrap();
+        // Deliberately leave the subscriber unread across several complete
+        // connection generations. This overflows the real Oto broadcast ring.
+        for _ in 0..4 {
+            concrete
+                .connection
+                .replace_voice_info(into_oto_info(voice_info(&gateway, 3)))
+                .await
+                .unwrap();
+            eventually(|| concrete.connection.state().phase() == oto::ConnectionPhase::Connected)
+                .await;
+        }
+        let event = connection
+            .next_event(CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(matches!(
+            event,
+            Some(VoiceEvent::PhaseChanged(VoicePhase::Connected))
+        ));
+        assert!(concrete.connection.state().stats().event_lagged() > 0);
+        // Lose the transient Closed event too; the durable final reason must
+        // still be exposed rather than leaving the monitor alive but blind.
+        concrete.connection.shutdown().await.unwrap();
+        let event = connection
+            .next_event(CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(matches!(
+            event,
+            Some(VoiceEvent::Closed(VoiceClose {
+                code: 1000,
+                by_remote: false,
+                ..
+            }))
+        ));
+        backend.shutdown().await.unwrap();
+        gateway.shutdown().await.unwrap();
+        udp.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn paused_source_failure_wakes_event_delivery_without_gateway_activity() {
+        let (gateway, udp) = peer(FakeVoiceGatewayConfig::local()).await;
+        let oto = Oto::builder()
+            .test_tls_config(gateway.tls().client_config())
+            .build()
+            .unwrap();
+        let backend = OtoVoiceBackend::new(oto, 1, 1);
+        let connection = backend
+            .connect(voice_info(&gateway, 3), CancellationToken::new())
+            .await
+            .unwrap();
+        connection
+            .set_source(Arc::new(PendingSource), CancellationToken::new())
+            .await
+            .unwrap();
+        connection.set_paused(true).await.unwrap();
+        let concrete = backend.inner.connections.lock().unwrap()[0]
+            .upgrade()
+            .unwrap();
+        let shared = match &*concrete.audio.lock().unwrap() {
+            AudioSlot::Attached(binding) => binding.shared.clone(),
+            _ => panic!("attached paused source"),
+        };
+        {
+            let mut events = concrete.events.lock().await;
+            while events.recv().now_or_never().is_some() {}
+        }
+        let waiter = {
+            let connection = connection.clone();
+            tokio::spawn(async move { connection.next_event(CancellationToken::new()).await })
+        };
+        tokio::task::yield_now().await;
+        shared.fail(VoiceError::new(
+            VoiceErrorKind::Protocol,
+            "synthetic paused failure",
+        ));
+        let event = tokio::time::timeout(Duration::from_millis(250), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(event, Some(VoiceEvent::SourceFailed(_))));
+        assert_eq!(connection.snapshot().await.unwrap().counters.sent, 0);
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert_eq!(
+            connection.next_event(cancelled).await.unwrap_err().kind,
+            VoiceErrorKind::Cancelled
+        );
+        backend.shutdown().await.unwrap();
+        gateway.shutdown().await.unwrap();
+        udp.shutdown().await.unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn terminal_audio_failure_is_reported_instead_of_leaving_a_playing_zombie() {
         struct InvalidFrame;
@@ -2342,5 +2480,41 @@ mod tests {
             active_threads, baseline_threads,
             "active bridges add no OS threads"
         );
+    }
+}
+
+#[cfg(test)]
+mod audit_notify_interleaving {
+    use super::*;
+    use futures_util::FutureExt;
+    #[tokio::test]
+    async fn source_wait_registration_precedes_durable_failure_check() {
+        let (frames, _reader) = oto::frame_channel();
+        let shared = Arc::new(BridgeShared {
+            backlog: frames.backlog(),
+            changed: Notify::new(),
+            state: AtomicU8::new(BRIDGE_RUNNING),
+            failure: Mutex::new(None),
+        });
+        // This is the current next_event order. A producer on another runtime
+        // thread can publish between the snapshot check and the select poll.
+        let registered = shared.changed.notified();
+        let deferred = registered;
+        assert!(shared.take_failure().is_none());
+        shared.fail(VoiceError::new(VoiceErrorKind::Protocol, "audit failure"));
+        tokio::pin!(deferred);
+        let missed = futures_util::poll!(&mut deferred).is_pending();
+        let retained = shared.failure.lock().unwrap().is_some();
+
+        assert!(shared.take_failure().is_some());
+        // Eager construction is a control, not an implementation change.
+        let eager = shared.changed.notified();
+        assert!(shared.take_failure().is_none());
+        shared.fail(VoiceError::new(VoiceErrorKind::Protocol, "control failure"));
+        let eager_ready = eager.now_or_never().is_some();
+        eprintln!(
+            "AUDIT notify: deferred_notification_missed={missed}, failure_retained={retained}, eager_wait_ready={eager_ready}"
+        );
+        assert!(!missed && retained && eager_ready);
     }
 }
