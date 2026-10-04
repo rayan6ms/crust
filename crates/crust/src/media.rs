@@ -16,7 +16,7 @@ use crate::voice::OpusPacket;
 pub type AdapterFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub type JsonObject = BTreeMap<String, Value>;
 
-/// Admission travels with speculative work, so cancelling an HTTP request
+/// Admission travels with source-opening work, so cancelling an HTTP request
 /// cannot release its resources while an owned blocking opener is unwinding.
 pub struct PreparationResources {
     pub load: tokio::sync::OwnedSemaphorePermit,
@@ -213,6 +213,23 @@ pub trait MantlePlayer: Send + Sync {
         track: MediaTrack,
         cancellation: CancellationToken,
     ) -> AdapterFuture<'_, Result<(), AdapterError>>;
+
+    /// Cold opening uses the same admission as search/preparation. Adapters
+    /// with offline prepared/cache paths may acquire only when opening a source.
+    /// A returned connection lease is retained by the server for legacy players;
+    /// source-owning adapters retain it internally until disposal instead.
+    fn play_admitted(
+        &self,
+        track: MediaTrack,
+        cancellation: CancellationToken,
+        admission: Arc<dyn PreparationAdmission>,
+    ) -> AdapterFuture<'_, Result<Option<tokio::sync::OwnedSemaphorePermit>, AdapterError>> {
+        Box::pin(async move {
+            let resources = admission.try_acquire()?;
+            self.play(track, cancellation).await?;
+            Ok(Some(resources.connection))
+        })
+    }
 
     fn pause(
         &self,

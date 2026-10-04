@@ -65,6 +65,14 @@ Crust does not load Lavalink Java or Kotlin plugins. Important differences:
 - Native process telemetry uses Linux probes; other platforms report zero
   when those probes are unavailable.
 
+Crust also offers authenticated successor preparation at
+`POST /crust/v1/sessions/{session}/players/{guild}/prepare`. A 202 response
+acknowledges one bounded intent, not readiness. Cold playback and preparation
+share source-opening admission; prepared adoption and completed replay stay
+offline. Player GET and `playerUpdate` include a `crust` observation with current
+`userData` and the last terminal event's `userData`/reason, allowing callers to
+correlate progress and confirm completion even after a missed event.
+
 Run the checked-in tests and quality checks with:
 
 ```sh

@@ -351,3 +351,74 @@ async fn player_identifier_loads_share_source_and_outbound_admission_and_recover
     socket.close(None).await.unwrap();
     harness.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encoded_play_obeys_saturated_load_and_source_admission_and_recovers() {
+    let mut configured = config();
+    configured.max_concurrent_loads = 1;
+    configured.max_concurrent_source_requests = 1;
+    configured.max_outbound_connections = 3;
+    let fake = Arc::new(FakeMantle::default());
+    fake.hold_loads();
+    let harness = Harness::with_adapter(configured, fake.clone()).await;
+    let (mut socket, session) = open_session(harness.address, "300000000000001705").await;
+    let held_app = harness.app.clone();
+    let held = tokio::spawn(async move {
+        response(
+            &held_app,
+            authorized(
+                "GET",
+                "/v4/loadtracks?identifier=fixture%3Aheld",
+                Body::empty(),
+            ),
+        )
+        .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while fake.active_loads() != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        response(
+            &harness.app,
+            authorized(
+                "GET",
+                "/v4/loadtracks?identifier=fixture%3Adenied",
+                Body::empty()
+            )
+        )
+        .await
+        .0,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let path = format!("/v4/sessions/{session}/players/1730");
+    let played = response(
+        &harness.app,
+        authorized(
+            "PATCH",
+            &path,
+            r#"{"track":{"encoded":"fake-v1:fixture:cold-play"}}"#,
+        ),
+    )
+    .await;
+    assert_eq!(played.0, StatusCode::SERVICE_UNAVAILABLE);
+
+    fake.release_loads();
+    assert_eq!(held.await.unwrap().0, StatusCode::OK);
+    let retry = response(
+        &harness.app,
+        authorized(
+            "PATCH",
+            &path,
+            r#"{"track":{"encoded":"fake-v1:fixture:cold-play"}}"#,
+        ),
+    )
+    .await;
+    assert_eq!(retry.0, StatusCode::OK);
+    assert_eq!(retry.1["track"]["info"]["identifier"], "fixture:cold-play");
+    socket.close(None).await.unwrap();
+    harness.stop().await;
+}

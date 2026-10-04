@@ -225,3 +225,28 @@ measures 202.103 ms cold versus 0.083 ms prepared. All adapter and server target
 and warnings-denied Clippy pass. Real Oracle transition evidence is recorded in
 Raydio's next-track preparation report; synthetic timing alone is not a claim of
 gapless playback or six-hour qualification.
+
+# October 3: playback audit admission and watchdog observation repairs
+
+Encoded Play now delegates cold/warm admission to the Mantle actor through
+`MantlePlayer::play_admitted`. Cold source opening uses search/preparation's
+load/source/outbound budgets; offline cache replay and prepared adoption do not
+consume another source slot. Identifier discovery releases its completed permits
+before opening, avoiding nested acquisition with a one-slot limit. Replacement
+requires a separate connection while its old source remains alive. Overload and
+error leave the current source intact. Prepared adoption transfers its connection
+lease instead of dropping it; detached blocking read/control results retain that
+lease until decoder/downloader disposal. Cancellation, Stop and error restore slots.
+
+Player GET and playerUpdate carry a compact `crust` observation extension with
+current `userData` and the last terminal event's `userData`/reason. Raydio uses it
+for generation-safe progress and verified missing-EOF recovery; a timer alone
+cannot claim natural completion. Terminal metadata is retained before event
+publication so it remains inspectable when event delivery fails.
+
+Tests cover saturated cold HTTP Play/retry, actual adapter cold/ready/cache paths,
+replacement bounds, cancellation/error recovery, prepared-lease transfer and
+abandoned blocking-reader ownership. Existing frame/order/filter goldens and all
+adapter/server targets pass; all-target warnings-denied Clippy passes. Mantle is
+pinned to its tested playlist/cancellable single-flight repair. No codec, gain,
+bitrate, sender pacing or experimental-worker selection is changed.

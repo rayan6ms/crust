@@ -119,12 +119,6 @@ impl PlayerLoadAdmission {
             outbound: Some(outbound),
         })
     }
-
-    fn try_acquire_outbound(&self) -> Result<OwnedSemaphorePermit, PlayerError> {
-        Arc::clone(&self.outbound_connections)
-            .try_acquire_owned()
-            .map_err(|_| PlayerError::Overloaded)
-    }
 }
 
 struct PlayerLoadPermits {
@@ -204,6 +198,7 @@ struct PlayerInner {
     stats: Mutex<SessionPlayerStats>,
     state: tokio::sync::Mutex<PlayerState>,
     cached_update: Mutex<Arc<str>>,
+    last_terminal: Mutex<Option<Value>>,
     cancellation: CancellationToken,
     voice_monitor: Mutex<Option<VoiceMonitor>>,
     track_stuck_threshold: Duration,
@@ -408,6 +403,7 @@ impl PlayerHandle {
                 stats: Mutex::new(SessionPlayerStats::default()),
                 state: tokio::sync::Mutex::new(PlayerState::default()),
                 cached_update: Mutex::new(cached_update),
+                last_terminal: Mutex::new(None),
                 cancellation: CancellationToken::new(),
                 voice_monitor: Mutex::new(None),
                 track_stuck_threshold,
@@ -1127,11 +1123,6 @@ async fn apply_update(
                 drain_events(handle, session, &state.mantle, &user_data, None, None).await?;
             }
             TrackRequest::Encoded(encoded) => {
-                let outbound = if state.outbound_connection.is_none() {
-                    Some(services.load_admission.try_acquire_outbound()?)
-                } else {
-                    None
-                };
                 let adapter = services
                     .adapter
                     .as_ref()
@@ -1145,17 +1136,23 @@ async fn apply_update(
                     .map_err(map_adapter_error)?;
                 validate_media_track(&track, services.json_policy)
                     .map_err(|_| PlayerError::Media("source pluginInfo exceeds resource limits"))?;
-                play_track(handle, session, &mut state, track, user_data, &update).await?;
-                if let Some(outbound) = outbound {
-                    state.outbound_connection = Some(outbound);
-                }
+                play_track(
+                    handle,
+                    session,
+                    &mut state,
+                    track,
+                    user_data,
+                    &update,
+                    &services.load_admission,
+                )
+                .await?;
             }
             TrackRequest::Identifier(identifier) => {
                 let adapter = services
                     .adapter
                     .as_ref()
                     .ok_or(PlayerError::Invalid("identifier loading is not configured"))?;
-                let mut load_permits = services.load_admission.try_acquire()?;
+                let load_permits = services.load_admission.try_acquire()?;
                 let loaded = adapter
                     .load(
                         LoadRequest {
@@ -1179,10 +1176,19 @@ async fn apply_update(
                 };
                 validate_media_track(&track, services.json_policy)
                     .map_err(|_| PlayerError::Media("source pluginInfo exceeds resource limits"))?;
-                play_track(handle, session, &mut state, track, user_data, &update).await?;
-                if state.outbound_connection.is_none() {
-                    state.outbound_connection = Some(load_permits.take_outbound());
-                }
+                // Discovery has finished. The opener acquires its own permits
+                // after selecting an offline/cold path, without nested admission.
+                drop(load_permits);
+                play_track(
+                    handle,
+                    session,
+                    &mut state,
+                    track,
+                    user_data,
+                    &update,
+                    &services.load_admission,
+                )
+                .await?;
             }
         }
     }
@@ -1812,6 +1818,7 @@ async fn play_track(
     track: MediaTrack,
     user_data: Option<JsonObject>,
     update: &PlayerUpdate,
+    admission: &PlayerLoadAdmission,
 ) -> Result<(), PlayerError> {
     let paused = match update.paused {
         PatchField::Value(value) => value,
@@ -1824,10 +1831,15 @@ async fn play_track(
     let previous_user_data = state.track.as_ref().map(|track| track.user_data.clone());
     let user_data = user_data.unwrap_or_default();
     if let Some(mantle) = &state.mantle {
-        mantle
-            .play(track.clone(), handle.inner.cancellation.child_token())
+        let connection = mantle
+            .play_admitted(
+                track.clone(),
+                handle.inner.cancellation.child_token(),
+                Arc::new(admission.clone()),
+            )
             .await
             .map_err(map_adapter_error)?;
+        state.outbound_connection = connection;
         if position > 0 {
             mantle
                 .seek(position, handle.inner.cancellation.child_token())
@@ -1900,6 +1912,14 @@ async fn drain_events(
         } else {
             user_data
         };
+        if let MediaEvent::TrackEnd { reason, .. } = &event {
+            *handle
+                .inner
+                .last_terminal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(json!({"userData":event_user_data,"reason":end_reason_name(*reason)}));
+        }
         let payload =
             Arc::from(event_value(&handle.inner.guild_id, event, event_user_data).to_string());
         session
@@ -2080,7 +2100,8 @@ async fn snapshot(handle: &PlayerHandle) -> Result<Value, PlayerError> {
     if let Some(snapshot) = mantle_snapshot {
         apply_mantle_snapshot(&mut state, snapshot);
     }
-    let value = player_value(&handle.inner.guild_id, &state, voice_snapshot.as_ref());
+    let mut value = player_value(&handle.inner.guild_id, &state, voice_snapshot.as_ref());
+    value["crust"] = playback_observation(handle, &state);
     cache_update(handle, &state, voice_snapshot.as_ref());
     Ok(value)
 }
@@ -2272,6 +2293,7 @@ fn cache_update(
         json!({
             "op": "playerUpdate",
             "guildId": handle.inner.guild_id,
+            "crust": playback_observation(handle, state),
             "state": {
                 "time": timestamp_ms(),
                 "position": state.position_ms,
@@ -2286,6 +2308,23 @@ fn cache_update(
         .cached_update
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = update;
+}
+
+fn playback_observation(handle: &PlayerHandle, state: &PlayerState) -> Value {
+    json!({
+        "userData":state.track.as_ref().map(|track| &track.user_data),
+        "terminal":handle.inner.last_terminal.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
+    })
+}
+
+fn end_reason_name(reason: TrackEndReason) -> &'static str {
+    match reason {
+        TrackEndReason::Finished => "finished",
+        TrackEndReason::LoadFailed => "loadFailed",
+        TrackEndReason::Stopped => "stopped",
+        TrackEndReason::Replaced => "replaced",
+        TrackEndReason::Cleanup => "cleanup",
+    }
 }
 
 fn default_player_state() -> Value {

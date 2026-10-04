@@ -781,6 +781,7 @@ enum PlayerCommand {
     Play {
         track: Box<MediaTrack>,
         cancellation: CancellationToken,
+        admission: Option<Arc<dyn crust::media::PreparationAdmission>>,
         reply: oneshot::Sender<Result<(), AdapterError>>,
     },
     Pause {
@@ -892,6 +893,7 @@ struct PlayerActor {
     registry: Arc<SourceRegistry<YoutubeSourceItem>>,
     route_policy: Arc<CrustOutboundRoutePolicy>,
     session: Option<PlaybackSession>,
+    connection: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     track: Option<MediaTrack>,
     status: PlayerStatus,
     paused: bool,
@@ -913,7 +915,17 @@ struct BufferedFrame {
     source_position: Option<Duration>,
 }
 
-type ReadResult = (PlaybackSession, Result<BufferedFrame, AdapterError>);
+type ReadResult = (
+    PlaybackSession,
+    Result<BufferedFrame, AdapterError>,
+    Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+);
+
+struct OpenedPlayback {
+    // Field drop order keeps admission until media/downloader disposal finishes.
+    session: PlaybackSession,
+    connection: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+}
 
 struct PreparedPlayback {
     encoded: EncodedTrack,
@@ -1175,12 +1187,13 @@ impl PlayerActor {
             return;
         }
         let mut session = self.session.take().expect("active finite session");
+        let connection = self.connection.clone();
         self.reading = Some(tokio::task::spawn_blocking(move || {
             let result = session.read_frame().map(|poll| BufferedFrame {
                 poll,
                 source_position: session.source_media_position(),
             });
-            (session, result)
+            (session, result, connection)
         }));
     }
 
@@ -1189,7 +1202,7 @@ impl PlayerActor {
             return;
         }
         let frame = match result {
-            Ok((session, frame)) => {
+            Ok((session, frame, _connection)) => {
                 self.session = Some(session);
                 frame
             }
@@ -1295,9 +1308,12 @@ impl PlayerActor {
             PlayerCommand::Play {
                 track,
                 cancellation,
+                admission,
                 reply,
             } => {
-                let result = self.play(*track, cancellation).await;
+                let result = self
+                    .play_with_admission(*track, cancellation, admission)
+                    .await;
                 let _ = reply.send(result);
             }
             PlayerCommand::Pause { paused, reply, .. } => {
@@ -1437,10 +1453,20 @@ impl PlayerActor {
         }
     }
 
+    #[cfg(test)]
     async fn play(
         &mut self,
         track: MediaTrack,
         cancellation: CancellationToken,
+    ) -> Result<(), AdapterError> {
+        self.play_with_admission(track, cancellation, None).await
+    }
+
+    async fn play_with_admission(
+        &mut self,
+        track: MediaTrack,
+        cancellation: CancellationToken,
+        admission: Option<Arc<dyn crust::media::PreparationAdmission>>,
     ) -> Result<(), AdapterError> {
         if cancellation.is_cancelled() {
             return Err(cancelled());
@@ -1463,6 +1489,9 @@ impl PlayerActor {
         }
         let prepared = self.preparation.take(&track.encoded);
         self.preparation.set(None, &CancellationToken::new());
+        // Reap a cancelled speculative opener before competing for its source
+        // slots. No additional opener may escape the shared resource ceiling.
+        self.finish_preparation().await;
         let manager = Arc::clone(&self.manager);
         let registry = Arc::clone(&self.registry);
         let policy = Arc::clone(&self.route_policy);
@@ -1476,20 +1505,21 @@ impl PlayerActor {
         );
         let opening_guard = media_cancellation.clone().drop_guard();
         let cancellation_for_open = media_cancellation.clone();
-        let mut session = tokio::task::spawn_blocking(move || {
+        let mut opened = tokio::task::spawn_blocking(move || {
             if cancellation_for_open.is_cancelled() {
                 return Err(cancelled());
             }
             if let Some(prepared) = prepared {
                 tracing::info!(target: "crust_mantle_adapter::preparation", "prepared next track consumed");
-                return Ok(prepared.session);
+                return Ok(OpenedPlayback { session: prepared.session, connection: prepared._connection.map(Arc::new) });
             }
             if let Some((previous, input)) = completed
                 && previous == encoded
             {
-                return input.open(cancellation_for_open);
+                return input.open(cancellation_for_open).map(|session| OpenedPlayback { session, connection: None });
             }
-            open_playback(
+            let resources = admission.map(|admission| admission.try_acquire()).transpose()?;
+            let session = open_playback(
                 manager,
                 registry,
                 policy,
@@ -1497,14 +1527,15 @@ impl PlayerActor {
                 cancellation_for_open,
                 staging_max_bytes,
                 progressive_buffer_bytes,
-            )
+            )?;
+            Ok(OpenedPlayback { session, connection: resources.map(|resources| Arc::new(resources.connection)) })
         })
         .await
         .map_err(|_| invalid_operation("Mantle playback worker failed"))??;
         if cancellation.is_cancelled() {
             return Err(cancelled());
         }
-        session.set_filters(&self.filters)?;
+        opened.session.set_filters(&self.filters)?;
         if cancellation.is_cancelled() {
             return Err(cancelled());
         }
@@ -1535,12 +1566,13 @@ impl PlayerActor {
         }
         self.clear_read_ahead();
         self.buffered.reserve(MEDIA_READ_AHEAD_FRAMES);
-        self.processing = session.mode();
+        self.processing = opened.session.mode();
         if let Some(previous) = self.media_cancellation.replace(media_cancellation) {
             previous.cancel();
         }
         opening_guard.disarm();
-        self.session = Some(session);
+        self.session = Some(opened.session);
+        self.connection = opened.connection;
         self.paused = false;
         self.status = PlayerStatus::Playing;
         self.position = Duration::ZERO;
@@ -1572,6 +1604,7 @@ impl PlayerActor {
                 .filter(|track| track.metadata.identifier == "fixture:staged")
                 .map(|track| CompletedInput::Fixture(Box::new(track.metadata.clone()))),
         });
+        self.connection = None;
         self.completed_input =
             if matches!(reason, TrackEndReason::Finished) && self.staging_max_bytes != 0 {
                 self.track
@@ -1647,9 +1680,10 @@ impl PlayerActor {
             .session
             .take()
             .ok_or_else(|| invalid_operation("no active track"))?;
-        let (session, result) = tokio::task::spawn_blocking(move || {
+        let connection = self.connection.clone();
+        let (session, result, _connection) = tokio::task::spawn_blocking(move || {
             let result = operation(&mut session);
-            (session, result)
+            (session, result, connection)
         })
         .await
         .map_err(|_| invalid_operation("Mantle playback worker failed"))?;
@@ -1687,6 +1721,7 @@ impl RealMantlePlayer {
             registry,
             route_policy,
             session: None,
+            connection: None,
             track: None,
             status: PlayerStatus::Idle,
             paused: false,
@@ -1793,9 +1828,28 @@ impl MantlePlayer for RealMantlePlayer {
             self.request(Some(&cancellation), |reply| PlayerCommand::Play {
                 track: Box::new(track),
                 cancellation: command_cancellation,
+                admission: None,
                 reply,
             })
             .await
+        })
+    }
+
+    fn play_admitted(
+        &self,
+        track: MediaTrack,
+        cancellation: CancellationToken,
+        admission: Arc<dyn crust::media::PreparationAdmission>,
+    ) -> AdapterFuture<'_, Result<Option<tokio::sync::OwnedSemaphorePermit>, AdapterError>> {
+        Box::pin(async move {
+            self.request(Some(&cancellation), |reply| PlayerCommand::Play {
+                track: Box::new(track),
+                cancellation: cancellation.clone(),
+                admission: Some(admission),
+                reply,
+            })
+            .await?;
+            Ok(None)
         })
     }
 
@@ -2393,7 +2447,7 @@ mod tests {
         let (release, wait) = oneshot::channel();
         actor.reading = Some(tokio::spawn(async move {
             wait.await.unwrap();
-            (session, Err(load_failed()))
+            (session, Err(load_failed()), None)
         }));
         let (reply, result) = oneshot::channel();
         tokio::time::timeout(
@@ -2420,7 +2474,7 @@ mod tests {
         let (release, wait) = oneshot::channel();
         actor.reading = Some(tokio::spawn(async move {
             wait.await.unwrap();
-            (session, Err(load_failed()))
+            (session, Err(load_failed()), None)
         }));
         let (commands, receiver) = mpsc::channel(PLAYER_COMMAND_CAPACITY);
         let task = tokio::spawn(actor.run(receiver));
@@ -2463,7 +2517,7 @@ mod tests {
         let (release, wait) = oneshot::channel();
         actor.reading = Some(tokio::spawn(async move {
             wait.await.unwrap();
-            (session, Err(load_failed()))
+            (session, Err(load_failed()), None)
         }));
         let (commands, receiver) = mpsc::channel(PLAYER_COMMAND_CAPACITY);
         let task = tokio::spawn(actor.run(receiver));
@@ -2583,6 +2637,7 @@ mod tests {
             registry: Arc::clone(&adapter.inner.registry),
             route_policy: Arc::clone(&adapter.inner.route_policy),
             session: Some(PlaybackSession::Fixture(Box::new(session))),
+            connection: None,
             track: Some(track),
             status: PlayerStatus::Playing,
             paused: false,
@@ -2687,6 +2742,166 @@ mod tests {
         assert_eq!(admission.load.available_permits(), 1);
         assert_eq!(admission.source.available_permits(), 1);
         drop(held);
+    }
+
+    #[tokio::test]
+    async fn cold_play_is_admitted_and_offline_repeat_bypasses_source_slots() {
+        let admission = Arc::new(TestPreparationAdmission {
+            load: Arc::new(tokio::sync::Semaphore::new(1)),
+            source: Arc::new(tokio::sync::Semaphore::new(1)),
+            connection: Arc::new(tokio::sync::Semaphore::new(1)),
+        });
+        let mut actor = buffered_fixture_actor();
+        let next = fixture_track("fixture:next").unwrap();
+        let held = admission.source.clone().try_acquire_owned().unwrap();
+        assert_eq!(
+            actor
+                .play_with_admission(
+                    next.clone(),
+                    CancellationToken::new(),
+                    Some(admission.clone())
+                )
+                .await,
+            Err(overloaded())
+        );
+        assert_eq!(
+            actor.track.as_ref().unwrap().metadata.identifier,
+            "fixture:buffered"
+        );
+        assert_eq!(admission.load.available_permits(), 1);
+        assert_eq!(admission.connection.available_permits(), 1);
+        drop(held);
+        actor
+            .play_with_admission(next, CancellationToken::new(), Some(admission.clone()))
+            .await
+            .unwrap();
+        assert_eq!(admission.load.available_permits(), 1);
+        assert_eq!(admission.source.available_permits(), 1);
+        assert_eq!(admission.connection.available_permits(), 0);
+        let replacement = fixture_track("fixture:replacement").unwrap();
+        assert_eq!(
+            actor
+                .play_with_admission(
+                    replacement,
+                    CancellationToken::new(),
+                    Some(admission.clone())
+                )
+                .await,
+            Err(overloaded()),
+            "replacement cannot reuse a lease while the old source is alive"
+        );
+        actor.stop(TrackEndReason::Stopped).unwrap();
+        assert_eq!(admission.connection.available_permits(), 1);
+
+        let mut actor = staged_fixture_actor();
+        let repeated = actor.track.clone().unwrap();
+        actor.stop(TrackEndReason::Finished).unwrap();
+        let _held = crust::media::PreparationAdmission::try_acquire(admission.as_ref()).unwrap();
+        actor
+            .play_with_admission(repeated, CancellationToken::new(), Some(admission))
+            .await
+            .unwrap();
+        assert!(actor.connection.is_none(), "completed replay stays offline");
+    }
+
+    #[tokio::test]
+    async fn prepared_adoption_transfers_its_connection_and_recovers_on_stop() {
+        let admission = Arc::new(TestPreparationAdmission {
+            load: Arc::new(tokio::sync::Semaphore::new(1)),
+            source: Arc::new(tokio::sync::Semaphore::new(1)),
+            connection: Arc::new(tokio::sync::Semaphore::new(1)),
+        });
+        let mut actor = buffered_fixture_actor();
+        actor.preparation.admission = Some(admission.clone());
+        let next = fixture_track("fixture:next").unwrap();
+        actor
+            .preparation
+            .set(Some(next.encoded.clone()), &CancellationToken::new());
+        drain_preparation(&mut actor).await;
+        let _load = admission.load.clone().try_acquire_owned().unwrap();
+        let _source = admission.source.clone().try_acquire_owned().unwrap();
+        actor
+            .play_with_admission(next, CancellationToken::new(), Some(admission.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            admission.connection.available_permits(),
+            0,
+            "adoption keeps the live connection lease"
+        );
+        actor.stop(TrackEndReason::Stopped).unwrap();
+        assert_eq!(admission.connection.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn cold_open_error_cancellation_and_abandoned_read_return_permits() {
+        let admission = Arc::new(TestPreparationAdmission {
+            load: Arc::new(tokio::sync::Semaphore::new(1)),
+            source: Arc::new(tokio::sync::Semaphore::new(1)),
+            connection: Arc::new(tokio::sync::Semaphore::new(1)),
+        });
+        let mut actor = buffered_fixture_actor();
+        let mut bad = fixture_track("fixture:bad").unwrap();
+        bad.encoded = EncodedTrack::new("invalid");
+        assert!(
+            actor
+                .play_with_admission(bad, CancellationToken::new(), Some(admission.clone()))
+                .await
+                .is_err()
+        );
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+        let cancellation = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cancel.cancel();
+        });
+        assert_eq!(
+            actor
+                .play_with_admission(
+                    fixture_track("fixture:prepare-slow-next").unwrap(),
+                    token,
+                    Some(admission.clone())
+                )
+                .await,
+            Err(cancelled())
+        );
+        cancellation.await.unwrap();
+        assert_eq!(admission.load.available_permits(), 1);
+        assert_eq!(admission.source.available_permits(), 1);
+        assert_eq!(admission.connection.available_permits(), 1);
+
+        actor
+            .play_with_admission(
+                fixture_track("fixture:next").unwrap(),
+                CancellationToken::new(),
+                Some(admission.clone()),
+            )
+            .await
+            .unwrap();
+        let session = actor.session.take().unwrap();
+        let connection = actor.connection.clone();
+        let (entered, started) = oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        actor.reading = Some(tokio::task::spawn_blocking(move || {
+            entered.send(()).unwrap();
+            wait.recv().unwrap();
+            (session, Err(load_failed()), connection)
+        }));
+        started.await.unwrap();
+        drop(actor);
+        assert_eq!(
+            admission.connection.available_permits(),
+            0,
+            "an abandoned blocking reader still owns its source lease"
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while admission.connection.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -3053,7 +3268,7 @@ mod tests {
         let (release, wait) = oneshot::channel();
         actor.reading = Some(tokio::spawn(async move {
             let _ = wait.await;
-            (session, Err(load_failed()))
+            (session, Err(load_failed()), None)
         }));
         // No timer advances and the pending read cannot finish. Existing frames
         // and pause acknowledgements must still be available immediately.
@@ -3109,7 +3324,7 @@ mod tests {
         let (release, wait) = oneshot::channel();
         actor.reading = Some(tokio::spawn(async move {
             let _ = wait.await;
-            (session, Err(load_failed()))
+            (session, Err(load_failed()), None)
         }));
         let (reply, mut response) = oneshot::channel();
         actor
@@ -3166,7 +3381,7 @@ mod tests {
         let (release, wait) = oneshot::channel();
         actor.reading = Some(tokio::spawn(async move {
             let _ = wait.await;
-            (session, Err(load_failed()))
+            (session, Err(load_failed()), None)
         }));
         use std::future::Future;
         use std::task::{Context, Poll, Waker};
